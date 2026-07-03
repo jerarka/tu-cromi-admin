@@ -9,6 +9,8 @@ const { breadcrumbs = [] } = defineProps<{
 
 <template>
     <AppLayout :breadcrumbs="breadcrumbs">
-        <slot />
+        <div class="px-6 py-4">
+            <slot />
+        </div>
     </AppLayout>
 </template>
