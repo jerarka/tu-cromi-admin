@@ -30,21 +30,32 @@ const search = ref(props.filters.search ?? '');
 const sense = ref(props.filters.sense ?? '');
 
 function applyFilters(): void {
-    router.get('/lines', {
-        search: search.value || undefined,
-        sense: sense.value || undefined,
-    }, {
-        preserveState: true,
-        replace: true,
-    });
+    router.get(
+        '/lines',
+        {
+            search: search.value || undefined,
+            sense: sense.value || undefined,
+        },
+        {
+            preserveState: true,
+            replace: true,
+        },
+    );
 }
 
 function visitPage(url: string | null): void {
-    if (!url) return;
-    router.get(url, {}, {
-        preserveState: true,
-        replace: true,
-    });
+    if (!url) {
+        return;
+    }
+
+    router.get(
+        url,
+        {},
+        {
+            preserveState: true,
+            replace: true,
+        },
+    );
 }
 
 const page = usePage();
@@ -86,7 +97,7 @@ const senseLabel = (sense: string): string => {
             <select
                 id="sense"
                 v-model="sense"
-                class="border-input h-9 w-40 rounded-md border bg-transparent px-3 py-1 text-sm shadow-xs"
+                class="h-9 w-40 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
                 @change="applyFilters"
             >
                 <option value="">All</option>
@@ -95,7 +106,14 @@ const senseLabel = (sense: string): string => {
             </select>
         </div>
 
-        <Button variant="secondary" @click="search = ''; sense = ''; applyFilters()">
+        <Button
+            variant="secondary"
+            @click="
+                search = '';
+                sense = '';
+                applyFilters();
+            "
+        >
             Reset
         </Button>
     </div>
@@ -158,7 +176,10 @@ const senseLabel = (sense: string): string => {
                     </td>
                 </tr>
                 <tr v-if="lines.data.length === 0">
-                    <td colspan="8" class="px-4 py-8 text-center text-muted-foreground">
+                    <td
+                        colspan="8"
+                        class="px-4 py-8 text-center text-muted-foreground"
+                    >
                         No lines found.
                     </td>
                 </tr>
@@ -167,7 +188,10 @@ const senseLabel = (sense: string): string => {
     </div>
 
     <!-- Pagination -->
-    <div v-if="lines.last_page > 1" class="mt-4 flex items-center justify-between">
+    <div
+        v-if="lines.last_page > 1"
+        class="mt-4 flex items-center justify-between"
+    >
         <p class="text-sm text-muted-foreground">
             Showing {{ lines.from }}–{{ lines.to }} of {{ lines.total }}
         </p>

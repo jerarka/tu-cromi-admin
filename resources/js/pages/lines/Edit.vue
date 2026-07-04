@@ -15,13 +15,14 @@ const props = defineProps<{
 }>();
 
 const geoJsonText = ref(
-    props.line.geo_json
-        ? JSON.stringify(props.line.geo_json, null, 2)
-        : '',
+    props.line.geo_json ? JSON.stringify(props.line.geo_json, null, 2) : '',
 );
 
 const parsedGeoJson = computed(() => {
-    if (!geoJsonText.value) return null;
+    if (!geoJsonText.value) {
+        return null;
+    }
+
     try {
         return JSON.parse(geoJsonText.value) as NonNullable<Line['geo_json']>;
     } catch {
@@ -29,13 +30,31 @@ const parsedGeoJson = computed(() => {
     }
 });
 
+const isEditingMap = ref(false);
+const mode = ref<'move' | 'add' | 'delete'>('move');
+
 const geoJsonError = ref<string | null>(null);
+
+function toggleEditing(): void {
+    if (isEditingMap.value) {
+        mode.value = 'move';
+    }
+
+    isEditingMap.value = !isEditingMap.value;
+}
+
+function onMapUpdate(geoJson: NonNullable<Line['geo_json']>): void {
+    geoJsonText.value = JSON.stringify(geoJson, null, 2);
+    geoJsonError.value = null;
+}
 
 function validateGeoJson(): void {
     if (!geoJsonText.value) {
         geoJsonError.value = null;
+
         return;
     }
+
     try {
         JSON.parse(geoJsonText.value);
         geoJsonError.value = null;
@@ -45,7 +64,8 @@ function validateGeoJson(): void {
 }
 
 const pageTitle = computed(
-    () => `Edit: ${props.line.code} — ${props.line.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'}`,
+    () =>
+        `Edit: ${props.line.code} — ${props.line.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'}`,
 );
 </script>
 
@@ -67,12 +87,22 @@ const pageTitle = computed(
                 <!-- Read-only fields -->
                 <div class="grid gap-2">
                     <Label for="code">Code</Label>
-                    <Input id="code" :model-value="line.code" disabled class="opacity-60" />
+                    <Input
+                        id="code"
+                        :model-value="line.code"
+                        disabled
+                        class="opacity-60"
+                    />
                 </div>
 
                 <div class="grid gap-2">
                     <Label for="sense">Direction</Label>
-                    <Input id="sense" :model-value="line.sense" disabled class="opacity-60" />
+                    <Input
+                        id="sense"
+                        :model-value="line.sense"
+                        disabled
+                        class="opacity-60"
+                    />
                 </div>
 
                 <!-- Editable fields -->
@@ -122,13 +152,20 @@ const pageTitle = computed(
                     <textarea
                         id="geo_json"
                         name="geo_json"
-                        class="border-input h-40 w-full rounded-md border bg-transparent px-3 py-2 font-mono text-xs shadow-xs"
+                        class="h-80 w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs"
                         :value="geoJsonText"
-                        @input="geoJsonText = ($event.target as HTMLTextAreaElement).value; validateGeoJson()"
+                        @input="
+                            geoJsonText = ($event.target as HTMLTextAreaElement)
+                                .value;
+                            validateGeoJson();
+                        "
                         placeholder='{"type":"MultiLineString","coordinates":[[[...]]]}'
-                    />
+                    ></textarea>
                     <InputError :message="errors.geo_json" />
-                    <p v-if="geoJsonError" class="text-sm text-red-600 dark:text-red-500">
+                    <p
+                        v-if="geoJsonError"
+                        class="text-sm text-red-600 dark:text-red-500"
+                    >
                         {{ geoJsonError }}
                     </p>
                 </div>
@@ -139,11 +176,68 @@ const pageTitle = computed(
             </Form>
         </div>
 
-        <!-- Map preview -->
+        <!-- Map preview / editor -->
         <div class="space-y-4">
-            <Label>Route preview</Label>
-            <LineMap :geo-json="parsedGeoJson" />
-            <p v-if="!parsedGeoJson && geoJsonText" class="text-sm text-red-600 dark:text-red-500">
+            <div class="flex items-center justify-between">
+                <Label>Route preview</Label>
+                <Button
+                    v-if="parsedGeoJson"
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    @click="toggleEditing"
+                >
+                    {{ isEditingMap ? 'Finish editing' : 'Edit route on map' }}
+                </Button>
+            </div>
+            <div v-if="isEditingMap" class="flex flex-wrap gap-2">
+                <Button
+                    type="button"
+                    :variant="mode === 'move' ? 'default' : 'outline'"
+                    size="sm"
+                    @click="mode = 'move'"
+                >
+                    Move
+                </Button>
+                <Button
+                    type="button"
+                    :variant="mode === 'add' ? 'default' : 'outline'"
+                    size="sm"
+                    @click="mode = 'add'"
+                >
+                    Add vertex
+                </Button>
+                <Button
+                    type="button"
+                    :variant="mode === 'delete' ? 'default' : 'outline'"
+                    size="sm"
+                    @click="mode = 'delete'"
+                >
+                    Delete vertex
+                </Button>
+            </div>
+            <LineMap
+                :geo-json="parsedGeoJson"
+                :editable="isEditingMap"
+                :mode="mode"
+                @update:geo-json="onMapUpdate"
+            />
+            <p
+                v-if="isEditingMap"
+                class="text-sm text-blue-600 dark:text-blue-500"
+            >
+                <template v-if="mode === 'move'">
+                    Drag the white dots to adjust the route geometry.
+                </template>
+                <template v-else-if="mode === 'add'">
+                    Click on the route to add a new vertex.
+                </template>
+                <template v-else> Click a vertex to delete it. </template>
+            </p>
+            <p
+                v-if="!parsedGeoJson && geoJsonText"
+                class="text-sm text-red-600 dark:text-red-500"
+            >
                 Fix JSON errors to see the route on the map.
             </p>
         </div>

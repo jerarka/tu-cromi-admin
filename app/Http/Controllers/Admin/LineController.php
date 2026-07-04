@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\Line\UpdateLineRequest;
 use App\Models\Line;
 use Illuminate\Http\RedirectResponse;
+use Illuminate\Support\Facades\DB;
 use Inertia\Inertia;
 use Inertia\Response;
 
@@ -47,7 +48,21 @@ class LineController extends Controller
 
     public function update(UpdateLineRequest $request, Line $line): RedirectResponse
     {
-        $line->update($request->validated());
+        $data = $request->validated();
+        if (! empty($data['geo_json'])) {
+            $data['geo_json'] = json_decode($data['geo_json'], true);
+        }
+
+        $line->update($data);
+
+        if ($request->filled('geo_json')) {
+            DB::statement(
+                'UPDATE lines SET geom = ST_GeomFromGeoJSON(geo_json::text) WHERE id = ?',
+                [$line->id],
+            );
+        } elseif (array_key_exists('geo_json', $request->validated())) {
+            DB::statement('UPDATE lines SET geom = NULL WHERE id = ?', [$line->id]);
+        }
 
         Inertia::flash('toast', [
             'type' => 'success',
