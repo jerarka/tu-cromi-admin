@@ -74,6 +74,10 @@ class LineController extends Controller
 
         return Inertia::render('lines/Edit', [
             'line' => $line,
+            'nav' => [
+                'prev' => $this->adjacent($line, 'prev'),
+                'next' => $this->adjacent($line, 'next'),
+            ],
         ]);
     }
 
@@ -101,5 +105,35 @@ class LineController extends Controller
         ]);
 
         return to_route('lines.index');
+    }
+
+    /**
+     * Find the line immediately before or after the given line in index order.
+     *
+     * The ordering must mirror index() exactly (code, then sense) so that
+     * prev/next walk the same sequence the user sees in the table. Note that
+     * `code` is a string column, so this is a lexicographic sort
+     * ("1", "10", "100", "103", "104", "104 C", "105 rojo", ...).
+     *
+     * `sense` is stored as a string in the database but cast to the LineSense
+     * enum on the model, hence the ->value access here.
+     *
+     * Deliberately unpaginated: stepping from the last row of page 1 walks
+     * into the first row of page 2 without a discontinuity. (code, sense) is
+     * unique across all rows, so no tiebreaker column is required.
+     */
+    private function adjacent(Line $line, string $direction): ?Line
+    {
+        $ascending = $direction === 'next';
+
+        return Line::query()
+            ->whereRowValues(
+                ['code', 'sense'],
+                $ascending ? '>' : '<',
+                [$line->code, $line->sense->value]
+            )
+            ->orderBy('code', $ascending ? 'asc' : 'desc')
+            ->orderBy('sense', $ascending ? 'asc' : 'desc')
+            ->first(['id', 'code', 'sense']);
     }
 }

@@ -199,6 +199,9 @@ class LinesExportOffline extends Command
             'offline/meta.json' => 'application/json',
         ];
 
+        $spinner = $this->output->createProgressBar(0);
+        $spinner->setFormat(' %message% %cycle%');
+
         foreach ($files as $file) {
             try {
                 $r2->delete($file);
@@ -211,25 +214,36 @@ class LinesExportOffline extends Command
             $contents = Storage::get($file);
 
             if ($contents === null) {
+                $spinner->finish();
+                $this->newLine();
                 $this->error("Failed to read local file: {$file}");
 
                 return;
             }
 
+            $spinner->setMessage("Uploading {$file}...");
+            $spinner->advance();
+
             try {
                 $result = $r2->put($file, $contents, ['Content-Type' => $mimeTypes[$file]]);
 
                 if ($result === false) {
+                    $spinner->finish();
+                    $this->newLine();
                     $this->error("Failed to upload {$file} to R2 (put returned false). Check R2 credentials and bucket.");
 
                     return;
                 }
             } catch (\Throwable $e) {
+                $spinner->finish();
+                $this->newLine();
                 $this->error("Failed to upload {$file} to R2: {$e->getMessage()}");
 
                 return;
             }
 
+            $spinner->finish();
+            $this->newLine();
             $this->info("  Uploaded {$baseUrl}/{$file}");
         }
 

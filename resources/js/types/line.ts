@@ -20,6 +20,11 @@ export interface Line {
     parent_line?: Pick<Line, 'id' | 'code' | 'sense'> | null;
 }
 
+export interface LineNav {
+    prev: Pick<Line, 'id' | 'code' | 'sense'> | null;
+    next: Pick<Line, 'id' | 'code' | 'sense'> | null;
+}
+
 export interface LineFilters {
     search?: string;
     sense?: string;

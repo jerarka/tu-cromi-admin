@@ -22,6 +22,24 @@ let polyline: L.Polyline | null = null;
 let vertexMarkers: L.CircleMarker[] = [];
 let dragCoords: number[][][] | null = null;
 let skipNextFitBounds = false;
+let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * The map container is sized with clamp(400px, 60vh, 700px), so its height
+ * changes with the viewport. Leaflet caches the container size and will keep
+ * painting tiles at the stale dimensions until invalidateSize() is called,
+ * which shows up as grey gaps and misplaced markers. Debounced because
+ * invalidateSize() forces a layout read and resize fires rapidly.
+ */
+function handleWindowResize(): void {
+    if (resizeTimer) {
+        clearTimeout(resizeTimer);
+    }
+
+    resizeTimer = setTimeout(() => {
+        map?.invalidateSize();
+    }, 150);
+}
 
 function pointToSegmentDist(
     px: number,
@@ -354,7 +372,10 @@ function clearLayers(): void {
     clearVertexMarkers();
 }
 
-onMounted(renderMap);
+onMounted(() => {
+    renderMap();
+    window.addEventListener('resize', handleWindowResize);
+});
 watch(() => props.geoJson, renderMap, { deep: true });
 watch(
     () => props.mode,
@@ -402,6 +423,13 @@ watch(
 );
 
 onUnmounted(() => {
+    window.removeEventListener('resize', handleWindowResize);
+
+    if (resizeTimer) {
+        clearTimeout(resizeTimer);
+        resizeTimer = null;
+    }
+
     clearLayers();
 
     if (map) {
@@ -422,7 +450,7 @@ onUnmounted(() => {
         >
             <div
                 ref="mapContainer"
-                class="h-[400px] w-full rounded-md border"
+                class="h-[clamp(400px,60vh,700px)] w-full rounded-md border"
             />
         </div>
         <p

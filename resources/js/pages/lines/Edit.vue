@@ -1,5 +1,11 @@
 <script setup lang="ts">
-import { Form, Head } from '@inertiajs/vue3';
+import { Form, Head, router } from '@inertiajs/vue3';
+import {
+    ArrowLeft,
+    ArrowLeftRight,
+    ChevronLeft,
+    ChevronRight,
+} from '@lucide/vue';
 import { computed, ref } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
@@ -8,10 +14,12 @@ import LineMap from '@/components/lines/LineMap.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import type { Line } from '@/types/line';
+import lines from '@/routes/lines';
+import type { Line, LineNav } from '@/types/line';
 
 const props = defineProps<{
     line: Line;
+    nav: LineNav;
 }>();
 
 const geoJsonText = ref(
@@ -34,6 +42,22 @@ const isEditingMap = ref(false);
 const mode = ref<'move' | 'add' | 'delete'>('move');
 
 const geoJsonError = ref<string | null>(null);
+const isDirty = ref(false);
+
+function markDirty(): void {
+    isDirty.value = true;
+}
+
+function confirmDiscard(href: string): void {
+    if (
+        isDirty.value &&
+        !window.confirm('You have unsaved changes. Leave without saving?')
+    ) {
+        return;
+    }
+
+    router.get(href);
+}
 
 function toggleEditing(): void {
     if (isEditingMap.value) {
@@ -46,6 +70,7 @@ function toggleEditing(): void {
 function onMapUpdate(geoJson: NonNullable<Line['geo_json']>): void {
     geoJsonText.value = JSON.stringify(geoJson, null, 2);
     geoJsonError.value = null;
+    markDirty();
 }
 
 function validateGeoJson(): void {
@@ -71,6 +96,68 @@ const pageTitle = computed(
 
 <template>
     <Head :title="pageTitle" />
+    <div class="flex items-center justify-between">
+        <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            class="-ml-3"
+            @click="confirmDiscard(lines.index.url())"
+        >
+            <ArrowLeft class="size-4" />
+            Back to lines
+        </Button>
+
+        <div class="flex items-center gap-2">
+            <Button
+                v-if="props.line.parent_line"
+                type="button"
+                variant="secondary"
+                size="sm"
+                :title="`Switch to ${props.line.parent_line.code} (${props.line.parent_line.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'})`"
+                @click="
+                    confirmDiscard(
+                        lines.edit.url({ line: props.line.parent_line.id }),
+                    )
+                "
+            >
+                <ArrowLeftRight class="size-4" />
+                {{
+                    props.line.parent_line.sense === 'OUTBOUND'
+                        ? 'Ida'
+                        : 'Vuelta'
+                }}
+            </Button>
+
+            <Button
+                v-if="props.nav.prev"
+                type="button"
+                variant="outline"
+                size="sm"
+                :title="`Previous: ${props.nav.prev.code}`"
+                @click="
+                    confirmDiscard(lines.edit.url({ line: props.nav.prev!.id }))
+                "
+            >
+                <ChevronLeft class="size-4" />
+                Previous
+            </Button>
+
+            <Button
+                v-if="props.nav.next"
+                type="button"
+                variant="outline"
+                size="sm"
+                :title="`Next: ${props.nav.next.code}`"
+                @click="
+                    confirmDiscard(lines.edit.url({ line: props.nav.next!.id }))
+                "
+            >
+                Next
+                <ChevronRight class="size-4" />
+            </Button>
+        </div>
+    </div>
     <Heading
         :title="pageTitle"
         description="Update line name, color, syndicate, or route geometry"
@@ -81,11 +168,11 @@ const pageTitle = computed(
         <div>
             <Form
                 v-bind="LineController.update.form(line.id)"
-                class="space-y-6"
+                class="grid grid-cols-2 gap-4"
                 v-slot="{ errors, processing }"
             >
                 <!-- Read-only fields -->
-                <div class="grid gap-2">
+                <div class="grid gap-1">
                     <Label for="code">Code</Label>
                     <Input
                         id="code"
@@ -95,7 +182,7 @@ const pageTitle = computed(
                     />
                 </div>
 
-                <div class="grid gap-2">
+                <div class="grid gap-1">
                     <Label for="sense">Direction</Label>
                     <Input
                         id="sense"
@@ -106,48 +193,53 @@ const pageTitle = computed(
                 </div>
 
                 <!-- Editable fields -->
-                <div class="grid gap-2">
+                <div class="grid gap-1">
                     <Label for="name">Name</Label>
                     <Input
                         id="name"
                         name="name"
                         :default-value="line.name ?? ''"
                         placeholder="Line display name"
+                        @input="markDirty"
                     />
                     <InputError :message="errors.name" />
                 </div>
 
-                <div class="grid gap-2">
-                    <Label for="color">Color</Label>
-                    <div class="flex items-center gap-3">
-                        <Input
-                            id="color"
-                            name="color"
-                            :default-value="line.color ?? ''"
-                            placeholder="#3b82f6"
-                            class="w-32"
-                        />
-                        <span
-                            v-if="line.color"
-                            class="inline-block h-6 w-6 rounded"
-                            :style="{ backgroundColor: line.color }"
-                        />
+                <div class="grid grid-cols-2">
+                    <div class="grid gap-2">
+                        <Label for="color">Color</Label>
+                        <div class="flex items-center gap-3">
+                            <Input
+                                id="color"
+                                name="color"
+                                :default-value="line.color ?? ''"
+                                placeholder="#3b82f6"
+                                class="w-32"
+                                @input="markDirty"
+                            />
+                            <span
+                                v-if="line.color"
+                                class="inline-block h-6 w-6 rounded"
+                                :style="{ backgroundColor: line.color }"
+                            />
+                        </div>
+                        <InputError :message="errors.color" />
                     </div>
-                    <InputError :message="errors.color" />
+
+                    <div class="grid gap-2">
+                        <Label for="syndicate">Syndicate</Label>
+                        <Input
+                            id="syndicate"
+                            name="syndicate"
+                            :default-value="line.syndicate ?? ''"
+                            placeholder="Operating company"
+                            @input="markDirty"
+                        />
+                        <InputError :message="errors.syndicate" />
+                    </div>
                 </div>
 
-                <div class="grid gap-2">
-                    <Label for="syndicate">Syndicate</Label>
-                    <Input
-                        id="syndicate"
-                        name="syndicate"
-                        :default-value="line.syndicate ?? ''"
-                        placeholder="Operating company"
-                    />
-                    <InputError :message="errors.syndicate" />
-                </div>
-
-                <div class="grid gap-2">
+                <div class="grid gap-2 col-span-2">
                     <Label for="geo_json">Route geometry (GeoJSON)</Label>
                     <textarea
                         id="geo_json"
@@ -158,6 +250,7 @@ const pageTitle = computed(
                             geoJsonText = ($event.target as HTMLTextAreaElement)
                                 .value;
                             validateGeoJson();
+                            markDirty();
                         "
                         placeholder='{"type":"MultiLineString","coordinates":[[[...]]]}'
                     ></textarea>
@@ -172,6 +265,14 @@ const pageTitle = computed(
 
                 <div class="flex items-center gap-4">
                     <Button :disabled="processing">Save</Button>
+                    <Button
+                        type="button"
+                        variant="outline"
+                        :disabled="processing"
+                        @click="confirmDiscard(lines.index.url())"
+                    >
+                        Cancel
+                    </Button>
                 </div>
             </Form>
         </div>

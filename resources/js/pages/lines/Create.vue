@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { Form, Head } from '@inertiajs/vue3';
+import { Form, Head, router } from '@inertiajs/vue3';
+import { ArrowLeft } from '@lucide/vue';
 import { computed, ref } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
@@ -8,6 +9,7 @@ import LineMap from '@/components/lines/LineMap.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import lines from '@/routes/lines';
 import type { Line } from '@/types/line';
 
 const geoJsonText = ref('');
@@ -28,6 +30,22 @@ const isEditingMap = ref(false);
 const mode = ref<'move' | 'add' | 'delete'>('move');
 
 const geoJsonError = ref<string | null>(null);
+const isDirty = ref(false);
+
+function markDirty(): void {
+    isDirty.value = true;
+}
+
+function confirmDiscard(): void {
+    if (
+        isDirty.value &&
+        !window.confirm('You have unsaved changes. Leave without saving?')
+    ) {
+        return;
+    }
+
+    router.get(lines.index.url());
+}
 
 function toggleEditing(): void {
     if (isEditingMap.value) {
@@ -42,6 +60,7 @@ function toggleEditing(): void {
 function onMapUpdate(geoJson: NonNullable<Line['geo_json']>): void {
     geoJsonText.value = JSON.stringify(geoJson, null, 2);
     geoJsonError.value = null;
+    markDirty();
 }
 
 function validateGeoJson(): void {
@@ -62,6 +81,16 @@ function validateGeoJson(): void {
 
 <template>
     <Head title="Create Line" />
+    <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        class="-ml-3"
+        @click="confirmDiscard"
+    >
+        <ArrowLeft class="size-4" />
+        Back to lines
+    </Button>
     <Heading
         title="Create Line"
         description="Add a new transport line and its route geometry"
@@ -72,25 +101,27 @@ function validateGeoJson(): void {
         <div>
             <Form
                 v-bind="LineController.store.form()"
-                class="space-y-6"
+                class="grid grid-cols-2 gap-4"
                 v-slot="{ errors, processing }"
             >
-                <div class="grid gap-2">
+                <div class="grid gap-1">
                     <Label for="code">Code</Label>
                     <Input
                         id="code"
                         name="code"
                         placeholder="e.g. 1, 16 azul, 104 C"
+                        @input="markDirty"
                     />
                     <InputError :message="errors.code" />
                 </div>
 
-                <div class="grid gap-2">
+                <div class="grid gap-1">
                     <Label for="sense">Direction</Label>
                     <select
                         id="sense"
                         name="sense"
                         class="h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+                        @change="markDirty"
                     >
                         <option value="">Select direction...</option>
                         <option value="OUTBOUND">OUTBOUND (Ida)</option>
@@ -99,38 +130,43 @@ function validateGeoJson(): void {
                     <InputError :message="errors.sense" />
                 </div>
 
-                <div class="grid gap-2">
+                <div class="grid gap-1">
                     <Label for="name">Name</Label>
                     <Input
                         id="name"
                         name="name"
                         placeholder="Line display name"
+                        @input="markDirty"
                     />
                     <InputError :message="errors.name" />
                 </div>
 
-                <div class="grid gap-2">
-                    <Label for="color">Color</Label>
-                    <Input
-                        id="color"
-                        name="color"
-                        placeholder="#3b82f6"
-                        class="w-32"
-                    />
-                    <InputError :message="errors.color" />
+                <div class="grid grid-cols-2">
+                    <div class="grid gap-2">
+                        <Label for="color">Color</Label>
+                        <Input
+                            id="color"
+                            name="color"
+                            placeholder="#3b82f6"
+                            class="w-32"
+                            @input="markDirty"
+                        />
+                        <InputError :message="errors.color" />
+                    </div>
+
+                    <div class="grid gap-2">
+                        <Label for="syndicate">Syndicate</Label>
+                        <Input
+                            id="syndicate"
+                            name="syndicate"
+                            placeholder="Operating company"
+                            @input="markDirty"
+                        />
+                        <InputError :message="errors.syndicate" />
+                    </div>
                 </div>
 
-                <div class="grid gap-2">
-                    <Label for="syndicate">Syndicate</Label>
-                    <Input
-                        id="syndicate"
-                        name="syndicate"
-                        placeholder="Operating company"
-                    />
-                    <InputError :message="errors.syndicate" />
-                </div>
-
-                <div class="grid gap-2">
+                <div class="col-span-2 grid gap-2">
                     <Label for="geo_json">Route geometry (GeoJSON)</Label>
                     <textarea
                         id="geo_json"
@@ -141,6 +177,7 @@ function validateGeoJson(): void {
                             geoJsonText = ($event.target as HTMLTextAreaElement)
                                 .value;
                             validateGeoJson();
+                            markDirty();
                         "
                         placeholder='{"type":"MultiLineString","coordinates":[[[...]]]}'
                     ></textarea>
@@ -155,6 +192,14 @@ function validateGeoJson(): void {
 
                 <div class="flex items-center gap-4">
                     <Button :disabled="processing">Save</Button>
+                    <Button
+                        type="button"
+                        variant="outline"
+                        :disabled="processing"
+                        @click="confirmDiscard"
+                    >
+                        Cancel
+                    </Button>
                 </div>
             </Form>
         </div>
