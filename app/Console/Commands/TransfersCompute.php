@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Models\CommandExecution;
 use App\Models\Line;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -41,177 +42,220 @@ class TransfersCompute extends Command
     {
         $startTime = microtime(true);
 
-        DB::statement('CREATE EXTENSION IF NOT EXISTS postgis');
+        $execution = CommandExecution::create([
+            'command' => 'transfers:compute',
+            'started_at' => now(),
+            'status' => 'running',
+            'options' => $this->options(),
+        ]);
 
-        $limit = $this->option('limit') ? (int) $this->option('limit') : null;
-        $allLines = Line::count();
-        $this->info('Lines found: '.($limit ? "{$limit} of {$allLines}" : $allLines));
+        try {
+            DB::statement('CREATE EXTENSION IF NOT EXISTS postgis');
 
-        $this->info('Materializing route points...');
-        $this->materializePoints($limit);
+            $limit = $this->option('limit') ? (int) $this->option('limit') : null;
+            $allLines = Line::count();
+            $this->info('Lines found: '.($limit ? "{$limit} of {$allLines}" : $allLines));
 
-        // ── 1. Find candidate pairs (fast, PostGIS index only) ──────────
-        $candidatePairs = $this->findCandidatePairs($limit);
-        $totalPairs = count($candidatePairs);
-        $this->info("Candidate pairs: {$totalPairs}");
+            $this->info('Materializing route points...');
+            $this->materializePoints($limit);
 
-        if ($totalPairs === 0) {
+            // ── 1. Find candidate pairs (fast, PostGIS index only) ──────────
+            $candidatePairs = $this->findCandidatePairs($limit);
+            $totalPairs = count($candidatePairs);
+            $this->info("Candidate pairs: {$totalPairs}");
+
+            if ($totalPairs === 0) {
+                DB::statement('TRUNCATE TABLE line_transfers CASCADE');
+
+                $execution->update([
+                    'status' => 'completed',
+                    'finished_at' => now(),
+                    'duration_ms' => (int) ((microtime(true) - $startTime) * 1000),
+                    'result' => [
+                        'success' => true,
+                        'transfersCreated' => 0,
+                        'duration' => '0.0s',
+                    ],
+                ]);
+
+                $this->line(json_encode([
+                    'success' => true,
+                    'transfersCreated' => 0,
+                    'duration' => '0.0s',
+                ]) ?: '{}');
+
+                return self::SUCCESS;
+            }
+
+            // ── 2. Process pairs in batches with progress ───────────────────
+            $batchSize = max(1, (int) $this->option('batch'));
+            $processedPairs = 0;
+            $totalBatches = (int) ceil($totalPairs / $batchSize);
+
+            $this->createTempTransferTable();
+            $forwardCount = 0;
+
+            foreach (array_chunk($candidatePairs, $batchSize) as $batchIdx => $batch) {
+                $rows = $this->processPairBatch($batch);
+
+                if (! empty($rows)) {
+                    $forwardCount += count($rows);
+
+                    foreach (array_chunk($rows, 500) as $chunk) {
+                        DB::table('line_transfers_forward')->insert($chunk);
+                    }
+                }
+
+                unset($rows);
+
+                $processedPairs += count($batch);
+                $elapsed = microtime(true) - $startTime;
+                $fraction = $processedPairs / $totalPairs;
+                $estimatedTotal = $fraction > 0 ? $elapsed / $fraction : 0;
+                $remaining = max(0, $estimatedTotal - $elapsed);
+
+                $this->output->write(sprintf(
+                    "\rBatch %d/%d | pairs %d/%d | found %d transfers | elapsed %s | ETA %s      ",
+                    $batchIdx + 1,
+                    $totalBatches,
+                    $processedPairs,
+                    $totalPairs,
+                    $forwardCount,
+                    self::formatDuration($elapsed),
+                    self::formatDuration($remaining),
+                ));
+            }
+
+            $forwardCount = DB::table('line_transfers_forward')->count();
+            $this->newLine();
+            $this->info("Raw forward rows: {$forwardCount}");
+
+            // ── 3. Deduplicate forwards ─────────────────────────────────────
+            $cellSize = self::MIN_SEPARATION / 111320.0;
+
+            DB::statement('
+                CREATE TEMP TABLE line_transfers_deduped AS
+                SELECT DISTINCT ON (line_a_id, line_b_id, grid_a, grid_b)
+                    id,
+                    line_a_id, line_b_id,
+                    point_a_lng, point_a_lat, point_a_index,
+                    point_b_lng, point_b_lat, point_b_index,
+                    walk_distance
+                FROM (
+                    SELECT *,
+                        FLOOR(point_a_lat / :cell_size)::text || \',\' || FLOOR(point_a_lng / :cell_size)::text AS grid_a,
+                        FLOOR(point_b_lat / :cell_size)::text || \',\' || FLOOR(point_b_lng / :cell_size)::text AS grid_b
+                    FROM line_transfers_forward
+                ) sub
+                ORDER BY line_a_id, line_b_id, grid_a, grid_b, id
+            ', ['cell_size' => $cellSize]);
+
+            $forwardDeduped = DB::table('line_transfers_deduped')->count();
+            $this->info("After dedup: {$forwardDeduped} forward transfers");
+
+            // ── 4. Generate inverse transfers ───────────────────────────────
+            DB::statement('
+                CREATE TEMP TABLE line_transfers_inverse AS
+                SELECT
+                    row_number() OVER (ORDER BY id) AS id,
+                    line_b_id AS line_a_id,
+                    line_a_id AS line_b_id,
+                    point_b_lng AS point_a_lng,
+                    point_b_lat AS point_a_lat,
+                    point_b_index AS point_a_index,
+                    point_a_lng AS point_b_lng,
+                    point_a_lat AS point_b_lat,
+                    point_a_index AS point_b_index,
+                    walk_distance
+                FROM line_transfers_deduped
+            ');
+
+            // ── 5. Deduplicate inverses ─────────────────────────────────────
+            DB::statement('
+                CREATE TEMP TABLE line_transfers_inverse_deduped AS
+                SELECT DISTINCT ON (line_a_id, line_b_id, grid_a, grid_b)
+                    id,
+                    line_a_id, line_b_id,
+                    point_a_lng, point_a_lat, point_a_index,
+                    point_b_lng, point_b_lat, point_b_index,
+                    walk_distance
+                FROM (
+                    SELECT *,
+                        FLOOR(point_a_lat / :cell_size)::text || \',\' || FLOOR(point_a_lng / :cell_size)::text AS grid_a,
+                        FLOOR(point_b_lat / :cell_size)::text || \',\' || FLOOR(point_b_lng / :cell_size)::text AS grid_b
+                    FROM line_transfers_inverse
+                ) sub
+                ORDER BY line_a_id, line_b_id, grid_a, grid_b, id
+            ', ['cell_size' => $cellSize]);
+
+            // ── 6. Save ─────────────────────────────────────────────────────
+            $forwardFinalCount = DB::table('line_transfers_deduped')->count();
+            $inverseFinalCount = DB::table('line_transfers_inverse_deduped')->count();
+            $allCount = $forwardFinalCount + $inverseFinalCount;
+            $this->info("Total transfers to save: {$allCount}");
+
             DB::statement('TRUNCATE TABLE line_transfers CASCADE');
+
+            DB::statement('
+                INSERT INTO line_transfers
+                    (line_a_id, line_b_id,
+                     point_a_lng, point_a_lat, point_a_index,
+                     point_b_lng, point_b_lat, point_b_index,
+                     walk_distance)
+                SELECT
+                    line_a_id, line_b_id,
+                    point_a_lng, point_a_lat, point_a_index,
+                    point_b_lng, point_b_lat, point_b_index,
+                    walk_distance
+                FROM line_transfers_deduped
+            ');
+
+            DB::statement('
+                INSERT INTO line_transfers
+                    (line_a_id, line_b_id,
+                     point_a_lng, point_a_lat, point_a_index,
+                     point_b_lng, point_b_lat, point_b_index,
+                     walk_distance)
+                SELECT
+                    line_a_id, line_b_id,
+                    point_a_lng, point_a_lat, point_a_index,
+                    point_b_lng, point_b_lat, point_b_index,
+                    walk_distance
+                FROM line_transfers_inverse_deduped
+            ');
+
+            $duration = number_format(microtime(true) - $startTime, 1);
+
+            $execution->update([
+                'status' => 'completed',
+                'finished_at' => now(),
+                'duration_ms' => (int) ((microtime(true) - $startTime) * 1000),
+                'result' => [
+                    'success' => true,
+                    'transfersCreated' => $allCount,
+                    'duration' => "{$duration}s",
+                ],
+            ]);
+
             $this->line(json_encode([
                 'success' => true,
-                'transfersCreated' => 0,
-                'duration' => '0.0s',
+                'transfersCreated' => $allCount,
+                'duration' => "{$duration}s",
             ]) ?: '{}');
 
             return self::SUCCESS;
+        } catch (\Throwable $e) {
+            $execution->update([
+                'status' => 'failed',
+                'finished_at' => now(),
+                'duration_ms' => (int) ((microtime(true) - $startTime) * 1000),
+                'error' => $e->getMessage()."\n\n".$e->getTraceAsString(),
+            ]);
+
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
         }
-
-        // ── 2. Process pairs in batches with progress ───────────────────
-        $batchSize = max(1, (int) $this->option('batch'));
-        $processedPairs = 0;
-        $totalBatches = (int) ceil($totalPairs / $batchSize);
-
-        $this->createTempTransferTable();
-        $forwardCount = 0;
-
-        foreach (array_chunk($candidatePairs, $batchSize) as $batchIdx => $batch) {
-            $rows = $this->processPairBatch($batch);
-
-            if (! empty($rows)) {
-                $forwardCount += count($rows);
-
-                foreach (array_chunk($rows, 500) as $chunk) {
-                    DB::table('line_transfers_forward')->insert($chunk);
-                }
-            }
-
-            unset($rows);
-
-            $processedPairs += count($batch);
-            $elapsed = microtime(true) - $startTime;
-            $fraction = $processedPairs / $totalPairs;
-            $estimatedTotal = $fraction > 0 ? $elapsed / $fraction : 0;
-            $remaining = max(0, $estimatedTotal - $elapsed);
-
-            $this->output->write(sprintf(
-                "\rBatch %d/%d | pairs %d/%d | found %d transfers | elapsed %s | ETA %s      ",
-                $batchIdx + 1,
-                $totalBatches,
-                $processedPairs,
-                $totalPairs,
-                $forwardCount,
-                self::formatDuration($elapsed),
-                self::formatDuration($remaining),
-            ));
-        }
-
-        $forwardCount = DB::table('line_transfers_forward')->count();
-        $this->newLine();
-        $this->info("Raw forward rows: {$forwardCount}");
-
-        // ── 3. Deduplicate forwards ─────────────────────────────────────
-        $cellSize = self::MIN_SEPARATION / 111320.0;
-
-        DB::statement('
-            CREATE TEMP TABLE line_transfers_deduped AS
-            SELECT DISTINCT ON (line_a_id, line_b_id, grid_a, grid_b)
-                id,
-                line_a_id, line_b_id,
-                point_a_lng, point_a_lat, point_a_index,
-                point_b_lng, point_b_lat, point_b_index,
-                walk_distance
-            FROM (
-                SELECT *,
-                    FLOOR(point_a_lat / :cell_size)::text || \',\' || FLOOR(point_a_lng / :cell_size)::text AS grid_a,
-                    FLOOR(point_b_lat / :cell_size)::text || \',\' || FLOOR(point_b_lng / :cell_size)::text AS grid_b
-                FROM line_transfers_forward
-            ) sub
-            ORDER BY line_a_id, line_b_id, grid_a, grid_b, id
-        ', ['cell_size' => $cellSize]);
-
-        $forwardDeduped = DB::table('line_transfers_deduped')->count();
-        $this->info("After dedup: {$forwardDeduped} forward transfers");
-
-        // ── 4. Generate inverse transfers ───────────────────────────────
-        DB::statement('
-            CREATE TEMP TABLE line_transfers_inverse AS
-            SELECT
-                row_number() OVER (ORDER BY id) AS id,
-                line_b_id AS line_a_id,
-                line_a_id AS line_b_id,
-                point_b_lng AS point_a_lng,
-                point_b_lat AS point_a_lat,
-                point_b_index AS point_a_index,
-                point_a_lng AS point_b_lng,
-                point_a_lat AS point_b_lat,
-                point_a_index AS point_b_index,
-                walk_distance
-            FROM line_transfers_deduped
-        ');
-
-        // ── 5. Deduplicate inverses ─────────────────────────────────────
-        DB::statement('
-            CREATE TEMP TABLE line_transfers_inverse_deduped AS
-            SELECT DISTINCT ON (line_a_id, line_b_id, grid_a, grid_b)
-                id,
-                line_a_id, line_b_id,
-                point_a_lng, point_a_lat, point_a_index,
-                point_b_lng, point_b_lat, point_b_index,
-                walk_distance
-            FROM (
-                SELECT *,
-                    FLOOR(point_a_lat / :cell_size)::text || \',\' || FLOOR(point_a_lng / :cell_size)::text AS grid_a,
-                    FLOOR(point_b_lat / :cell_size)::text || \',\' || FLOOR(point_b_lng / :cell_size)::text AS grid_b
-                FROM line_transfers_inverse
-            ) sub
-            ORDER BY line_a_id, line_b_id, grid_a, grid_b, id
-        ', ['cell_size' => $cellSize]);
-
-        // ── 6. Save ─────────────────────────────────────────────────────
-        $forwardFinalCount = DB::table('line_transfers_deduped')->count();
-        $inverseFinalCount = DB::table('line_transfers_inverse_deduped')->count();
-        $allCount = $forwardFinalCount + $inverseFinalCount;
-        $this->info("Total transfers to save: {$allCount}");
-
-        DB::statement('TRUNCATE TABLE line_transfers CASCADE');
-
-        DB::statement('
-            INSERT INTO line_transfers
-                (line_a_id, line_b_id,
-                 point_a_lng, point_a_lat, point_a_index,
-                 point_b_lng, point_b_lat, point_b_index,
-                 walk_distance)
-            SELECT
-                line_a_id, line_b_id,
-                point_a_lng, point_a_lat, point_a_index,
-                point_b_lng, point_b_lat, point_b_index,
-                walk_distance
-            FROM line_transfers_deduped
-        ');
-
-        DB::statement('
-            INSERT INTO line_transfers
-                (line_a_id, line_b_id,
-                 point_a_lng, point_a_lat, point_a_index,
-                 point_b_lng, point_b_lat, point_b_index,
-                 walk_distance)
-            SELECT
-                line_a_id, line_b_id,
-                point_a_lng, point_a_lat, point_a_index,
-                point_b_lng, point_b_lat, point_b_index,
-                walk_distance
-            FROM line_transfers_inverse_deduped
-        ');
-
-        $duration = number_format(microtime(true) - $startTime, 1);
-
-        $this->line(json_encode([
-            'success' => true,
-            'transfersCreated' => $allCount,
-            'duration' => "{$duration}s",
-        ]) ?: '{}');
-
-        return self::SUCCESS;
     }
 
     /** @return list<array{line_a_id: int, line_b_id: int}> */

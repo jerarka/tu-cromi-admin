@@ -33,6 +33,7 @@ Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue 
 | Command | Purpose |
 |---|---|
 | `lines:import` | Import from GeoJSON (Santa Cruz data). `sentido=1` → OUTBOUND, other → RETURN. RETURN coordinates reversed. Links opposite lines by `code`. `--force` to truncate first, `--path=` for custom file. |
+| `lines:export-offline` | Export lines + transfers as gzip-compressed NDJSON for Flutter offline mode. `--data-version=N` (required), `--no-compress` for raw output, `--path=` for custom location. `--upload` pushes files to Cloudflare R2 (deletes old first, publishes public URLs). Requires `R2_*` env vars. |
 | `transfers:compute` | Precompute pedestrian transfers. Uses PostGIS (ST_DWithin 300m, KNN lateral join). Deduplicates via 100m spatial grid. **Can be slow (17min).** Use `--limit=N` to test with N lines first. |
 
 Both commands have class-level docblocks with algorithm details.

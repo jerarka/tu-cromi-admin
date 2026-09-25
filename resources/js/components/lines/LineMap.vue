@@ -94,7 +94,27 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
 
     const coordinates = props.geoJson?.coordinates;
 
-    if (!coordinates) {
+    if (!coordinates?.length) {
+        const pos: [number, number] = [e.latlng.lng, e.latlng.lat];
+        skipNextFitBounds = true;
+        emit('update:geoJson', {
+            type: 'MultiLineString' as const,
+            coordinates: [[pos]],
+        });
+
+        return;
+    }
+
+    if (coordinates.length === 1 && coordinates[0].length <= 1) {
+        const pos: [number, number] = [e.latlng.lng, e.latlng.lat];
+        const newCoords = structuredClone(coordinates);
+        newCoords[0].push(pos);
+        skipNextFitBounds = true;
+        emit('update:geoJson', {
+            type: 'MultiLineString' as const,
+            coordinates: newCoords,
+        });
+
         return;
     }
 
@@ -120,6 +140,7 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
 
     // Check if the click is close enough to the segment (within 300 meters)
     let closestProj: [number, number];
+
     if (t <= 0) {
         closestProj = [a[1], a[0]];
     } else if (t >= 1) {
@@ -127,6 +148,7 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
     } else {
         closestProj = [a[1] + t * dy, a[0] + t * dx];
     }
+
     const closestLatLng = L.latLng(closestProj[0], closestProj[1]);
     const distMeters = map.distance(e.latlng, closestLatLng);
 
@@ -138,6 +160,7 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
     const isTooCloseToVertex = coordinates.some((segment) =>
         segment.some((coord) => {
             const vertexLatLng = L.latLng(coord[1], coord[0]);
+
             return map!.distance(e.latlng, vertexLatLng) < 10;
         }),
     );
@@ -402,8 +425,17 @@ onUnmounted(() => {
                 class="h-[400px] w-full rounded-md border"
             />
         </div>
-        <p v-if="!geoJson" class="mt-2 text-sm text-muted-foreground">
+        <p
+            v-if="!geoJson && !editable"
+            class="mt-2 text-sm text-muted-foreground"
+        >
             No geometry data available.
+        </p>
+        <p
+            v-if="!geoJson && editable"
+            class="mt-2 text-sm text-muted-foreground"
+        >
+            Click on the map to start drawing the route.
         </p>
     </div>
 </template>

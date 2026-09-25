@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Line\StoreLineRequest;
 use App\Http\Requests\Line\UpdateLineRequest;
 use App\Models\Line;
 use Illuminate\Http\RedirectResponse;
@@ -35,6 +36,36 @@ class LineController extends Controller
                 'sense' => $sense,
             ],
         ]);
+    }
+
+    public function create(): Response
+    {
+        return Inertia::render('lines/Create');
+    }
+
+    public function store(StoreLineRequest $request): RedirectResponse
+    {
+        $data = $request->validated();
+
+        if (! empty($data['geo_json'])) {
+            $data['geo_json'] = json_decode($data['geo_json'], true);
+        }
+
+        $line = Line::create($data);
+
+        if ($request->filled('geo_json')) {
+            DB::statement(
+                'UPDATE lines SET geom = ST_GeomFromGeoJSON(geo_json::text) WHERE id = ?',
+                [$line->id],
+            );
+        }
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            'message' => __('Line created.'),
+        ]);
+
+        return to_route('lines.index');
     }
 
     public function edit(Line $line): Response

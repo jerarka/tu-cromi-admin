@@ -116,6 +116,12 @@ const senseLabel = (sense: string): string => {
         >
             Reset
         </Button>
+
+        <div class="ml-auto">
+            <Button as-child>
+                <Link href="/lines/create">Create</Link>
+            </Button>
+        </div>
     </div>
 
     <!-- Table -->
