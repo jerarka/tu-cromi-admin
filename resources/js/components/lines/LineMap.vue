@@ -624,113 +624,7 @@ function addVertexMarkers(
             );
 
             if (mode === 'move') {
-                let wasDragged = false;
-
-                // Seeded with the vertex's own position, not zero. The first
-                // mousemove computes its delta from here, and starting at the
-                // origin of the coordinate space would fling the selection
-                // across the map on the first frame of every drag.
-                let dropped: Position = [
-                    coords[segIdx][pointIdx][0],
-                    coords[segIdx][pointIdx][1],
-                ];
-
-                marker.on('mousedown', (e: L.LeafletMouseEvent) => {
-                    L.DomEvent.stopPropagation(e.originalEvent);
-
-                    // Shift belongs to the selection, which is handled on click.
-                    // Starting a drag here as well would mean a shift-click
-                    // both picks a range and nudges the route.
-                    if (e.originalEvent.shiftKey) {
-                        return;
-                    }
-
-                    // Grabbing a vertex that is already selected moves the
-                    // whole selection. Grabbing an unselected one collapses the
-                    // selection to it, which is what makes a plain drag always
-                    // do what the reviewer expects.
-                    if (!isSelected(ref)) {
-                        clearSelection();
-                        selection.value = [ref];
-                        refreshMarkerStyles();
-                    }
-
-                    const active = selection.value.length
-                        ? [...selection.value]
-                        : [ref];
-
-                    isDragging = true;
-
-                    if (!dragCoords) {
-                        dragCoords = structuredClone(coords);
-                    }
-
-                    wasDragged = false;
-                    map?.dragging.disable();
-
-                    const onMouseMove = (e: L.LeafletMouseEvent) => {
-                        if (!dragCoords) {
-                            return;
-                        }
-
-                        wasDragged = true;
-
-                        const next: Position = [e.latlng.lng, e.latlng.lat];
-                        const delta: Position = [
-                            next[0] - dropped[0],
-                            next[1] - dropped[1],
-                        ];
-
-                        if (delta[0] !== 0 || delta[1] !== 0) {
-                            dropped = next;
-                            dragCoords = applyDeltaToSelection(
-                                dragCoords,
-                                active,
-                                delta,
-                            );
-                            moveMarkers(active, delta);
-                            updatePolylinePath();
-                        }
-                    };
-
-                    const onMouseUp = (event: MouseEvent): void => {
-                        map?.off('mousemove', onMouseMove);
-                        map?.dragging.enable();
-                        document.removeEventListener('mouseup', onMouseUp);
-                        isDragging = false;
-
-                        if (!wasDragged || !dragCoords) {
-                            dragCoords = null;
-
-                            return;
-                        }
-
-                        // The drag ends here and is written down here, before
-                        // anything is asked of the network. Clearing dragCoords
-                        // first is what lets the next drag start immediately
-                        // and from the geometry this one produced, rather than
-                        // adopting the one still in flight.
-                        const dragged = dragCoords;
-
-                        dragCoords = null;
-
-                        const revision = commitDrop(dragged);
-
-                        // Alt suppresses the snap for this drop, so a stretch
-                        // of route can be placed deliberately off the centreline.
-                        void refineDropAfterSnap(
-                            dragged,
-                            active,
-                            ref,
-                            dropped,
-                            event.altKey,
-                            revision,
-                        );
-                    };
-
-                    map?.on('mousemove', onMouseMove);
-                    document.addEventListener('mouseup', onMouseUp);
-                });
+                beginVertexDrag(marker, ref, coords);
 
                 // Selection lives on click rather than mousedown. Leaflet only
                 // fires click when the pointer barely moved, which is exactly
@@ -770,6 +664,129 @@ function addVertexMarkers(
             vertexMarkers.push(marker);
             vertexMarkersByRef.set(vertexKey(ref), marker);
         });
+    });
+}
+
+/**
+ * Drag one vertex, carrying the rest of the selection with it.
+ *
+ * A named function rather than a closure at the bottom of the loop that builds
+ * the markers. It was ninety-six lines nested two forEach deep, which is deep
+ * enough that the drag lifecycle could not be read as a sequence, and it ended
+ * next to the click and delete handlers rather than next to the drop handling
+ * it exists to feed.
+ *
+ * It stays in this file. It reads a dozen pieces of the map's state — the drag
+ * coordinates, the selection, the marker styling, the polyline — and lifting it
+ * out would mean handing all of those across as arguments or wrapping them in a
+ * context object, which moves the code without clarifying it.
+ *
+ * The drag's own two flags are declared here rather than per marker, which is
+ * what they always were: they are reset on every mousedown, so they describe
+ * one drag, not one vertex. A vertex can be dragged any number of times, and
+ * the old scope only happened to be harmless.
+ */
+function beginVertexDrag(
+    marker: L.CircleMarker,
+    ref: VertexRef,
+    coords: Coordinates,
+): void {
+    marker.on('mousedown', (e: L.LeafletMouseEvent) => {
+        L.DomEvent.stopPropagation(e.originalEvent);
+
+        // Shift belongs to the selection, which is handled on click. Starting a
+        // drag here as well would mean a shift-click both picks a range and
+        // nudges the route.
+        if (e.originalEvent.shiftKey) {
+            return;
+        }
+
+        // Grabbing a vertex that is already selected moves the whole selection.
+        // Grabbing an unselected one collapses the selection to it, which is
+        // what makes a plain drag always do what the reviewer expects.
+        if (!isSelected(ref)) {
+            clearSelection();
+            selection.value = [ref];
+            refreshMarkerStyles();
+        }
+
+        const active = selection.value.length ? [...selection.value] : [ref];
+
+        // Seeded with the vertex's own position, not zero. The first mousemove
+        // computes its delta from here, and starting at the origin of the
+        // coordinate space would fling the selection across the map on the
+        // first frame of every drag.
+        let dropped: Position = [
+            coords[ref.segment][ref.index][0],
+            coords[ref.segment][ref.index][1],
+        ];
+        let wasDragged = false;
+
+        isDragging = true;
+
+        if (!dragCoords) {
+            dragCoords = structuredClone(coords);
+        }
+
+        map?.dragging.disable();
+
+        const onMouseMove = (e: L.LeafletMouseEvent): void => {
+            if (!dragCoords) {
+                return;
+            }
+
+            wasDragged = true;
+
+            const next: Position = [e.latlng.lng, e.latlng.lat];
+            const delta: Position = [
+                next[0] - dropped[0],
+                next[1] - dropped[1],
+            ];
+
+            if (delta[0] !== 0 || delta[1] !== 0) {
+                dropped = next;
+                dragCoords = applyDeltaToSelection(dragCoords, active, delta);
+                moveMarkers(active, delta);
+                updatePolylinePath();
+            }
+        };
+
+        const onMouseUp = (event: MouseEvent): void => {
+            map?.off('mousemove', onMouseMove);
+            map?.dragging.enable();
+            document.removeEventListener('mouseup', onMouseUp);
+            isDragging = false;
+
+            if (!wasDragged || !dragCoords) {
+                dragCoords = null;
+
+                return;
+            }
+
+            // The drag ends here and is written down here, before anything is
+            // asked of the network. Clearing dragCoords first is what lets the
+            // next drag start immediately and from the geometry this one
+            // produced, rather than adopting the one still in flight.
+            const dragged = dragCoords;
+
+            dragCoords = null;
+
+            const revision = commitDrop(dragged);
+
+            // Alt suppresses the snap for this drop, so a stretch of route can
+            // be placed deliberately off the centreline.
+            void refineDropAfterSnap(
+                dragged,
+                active,
+                ref,
+                dropped,
+                event.altKey,
+                revision,
+            );
+        };
+
+        map?.on('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
     });
 }
 
