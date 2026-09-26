@@ -162,8 +162,15 @@ class RoadsController extends Controller
             'lng' => (float) $street->lng,
             'name' => $street->name,
             'highway' => $street->highway,
-            'oneway' => (bool) $street->oneway,
             'distance_m' => (float) $street->distance_m,
+            // The raw OSM token, and deliberately not a boolean. The column
+            // holds 'no', 'forward' or 'backward', and the last two are both
+            // one-way but in opposite directions: cast to bool they collapse
+            // into each other and, worse, a two-way street comes back true
+            // because the string 'no' is truthy. On a domain whose whole
+            // vocabulary is outbound and return, that distinction is the one
+            // thing this field exists to carry.
+            'oneway' => $street->oneway,
             // How much of the moved selection is on this street, for the editor
             // to show. It is confirmation, not a decision: the reference point
             // alone decides whether a snap happens.

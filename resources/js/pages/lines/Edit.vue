@@ -326,8 +326,17 @@ onUnmounted(() => {
     document.removeEventListener('keydown', handleKeydown);
 });
 
-function onMapUpdate(geoJson: NonNullable<Line['geo_json']>): void {
-    history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
+function onMapUpdate(
+    geoJson: NonNullable<Line['geo_json']>,
+    meta?: { snap?: boolean },
+): void {
+    // A snap is the tool refining a move the reviewer already made, not a
+    // second move. Recording it would put "drag the vertex" and "pull it onto
+    // the street" in the history as separate steps, so the first undo would
+    // appear to do nothing and the second would take back the move itself.
+    if (!meta?.snap) {
+        history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
+    }
 
     geoJsonText.value = JSON.stringify(geoJson, null, 2);
     geoJsonError.value = null;

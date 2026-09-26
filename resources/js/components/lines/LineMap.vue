@@ -2,6 +2,7 @@
 import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
+import { consumePreserveToken } from '@/lib/mapView';
 import {
     applyDeltaToSelection,
     clampRange,
@@ -20,11 +21,12 @@ import {
 import type {
     Coordinates,
     Position,
-    SnapCandidate,
     SnapOptions,
     SnapPreset,
     VertexRef,
 } from '@/lib/routeEditing';
+import { snapLookupFromResponse, toWirePoints } from '@/lib/snapWire';
+import type { SnapLookup } from '@/lib/snapWire';
 import roads from '@/routes/roads';
 
 const props = defineProps<{
@@ -52,8 +54,35 @@ const props = defineProps<{
     preserveViewToken?: number;
 }>();
 
+/**
+ * A geometry change is confirmed the moment the mouse comes up, and the snap
+ * only refines it afterwards.
+ *
+ * Committing after the lookup instead would mean the route is not really
+ * written down until a network round trip finishes, and every other thing
+ * about that is worse than the wait: a drag that starts in the meantime clones
+ * geometry that is already stale, and a lookup that never returns leaves the
+ * edit uncommitted and the next drag working from the wrong vertices. This
+ * counter is what lets a late answer be recognised as late.
+ */
+let geometryRevision = 0;
+
+/**
+ * How long a street lookup may take before the drop is left unsnapped.
+ *
+ * The edit is already committed by the time this matters, so a timeout costs
+ * only the refinement. Without one, a request that hangs leaves nothing to
+ * distinguish "still thinking" from "never coming back", and the map is left
+ * in a state the reviewer cannot get out of without a reload.
+ */
+const SNAP_LOOKUP_TIMEOUT_MS = 3000;
+
 const emit = defineEmits<{
-    (e: 'update:geoJson', value: NonNullable<typeof props.geoJson>): void;
+    (
+        e: 'update:geoJson',
+        value: NonNullable<typeof props.geoJson>,
+        meta?: { snap?: boolean },
+    ): void;
 }>();
 
 /** The snap settings in force, or null when snapping is off. */
@@ -502,7 +531,9 @@ function renderMap(): void {
         addRouteDecorations(coordinates);
     }
 
-    if (skipNextFitBounds || consumePreserveToken()) {
+    const preserveView = consumePreserveView();
+
+    if (skipNextFitBounds || preserveView) {
         skipNextFitBounds = false;
     } else {
         map.fitBounds(polyline.getBounds().pad(0.1));
@@ -512,26 +543,21 @@ function renderMap(): void {
 /**
  * Whether the parent asked to keep the current view for exactly this change.
  *
- * Undo and redo rewrite the geometry, and every geometry change arrives here,
- * so the map refits after an undo the same way it refits after a drag — which
- * throws away the zoom and pan the reviewer had just chosen, at the exact
- * moment they are trying to check what the undo actually did.
- *
- * A flag cannot express "this once". Left set, it would still be set when the
- * reviewer moves to the next line, and that navigation is precisely the case
- * where the bounds should change. Counting the requests makes the one-shot
- * explicit and leaves the next real navigation free to reframe.
+ * Deliberately evaluated even when a drag already claimed this render, because
+ * the two are independent one-shots and skipping the evaluation on the short
+ * circuit leaves the counter to be spent by whichever change comes next. A
+ * reviewer debugging a missing or a duplicate refit would otherwise have to
+ * reason about two interleaved pieces of state to find out which one lied.
  */
-function consumePreserveToken(): boolean {
-    const token = props.preserveViewToken ?? 0;
+function consumePreserveView(): boolean {
+    const result = consumePreserveToken(
+        lastPreserveToken,
+        props.preserveViewToken ?? 0,
+    );
 
-    if (token === lastPreserveToken) {
-        return false;
-    }
+    lastPreserveToken = result.seen;
 
-    lastPreserveToken = token;
-
-    return true;
+    return result.preserve;
 }
 
 /**
@@ -693,14 +719,26 @@ function addVertexMarkers(
                             return;
                         }
 
+                        // The drag ends here and is written down here, before
+                        // anything is asked of the network. Clearing dragCoords
+                        // first is what lets the next drag start immediately
+                        // and from the geometry this one produced, rather than
+                        // adopting the one still in flight.
+                        const dragged = dragCoords;
+
+                        dragCoords = null;
+
+                        const revision = commitDrop(dragged);
+
                         // Alt suppresses the snap for this drop, so a stretch
                         // of route can be placed deliberately off the centreline.
-                        void settleDrag(
-                            dragCoords,
+                        void refineDropAfterSnap(
+                            dragged,
                             active,
                             ref,
                             dropped,
                             event.altKey,
+                            revision,
                         );
                     };
 
@@ -750,90 +788,97 @@ function addVertexMarkers(
 }
 
 /**
- * Finish a drag: snap the vertex onto the street it was dropped near, then
- * hand the geometry back.
+ * Write a finished drag down, and return the revision it was written at.
  *
- * The lookup happens after the drop, not during the move. A network round trip
- * on every mousemove would make dragging unusable, and the position the
- * reviewer actually chose is the one they released the mouse at.
- *
- * A failed or slow lookup is not allowed to lose the edit. The route is emitted
- * exactly as dragged and the snap is simply skipped, because losing a
- * deliberate move to a network hiccup is worse than leaving a vertex a metre
- * off the centreline.
+ * The revision is what the refinement below checks itself against. It changes
+ * on every geometry this component emits, so "has anything else happened since
+ * I asked" becomes a comparison instead of a guess.
  */
+function commitDrop(coordinates: Coordinates): number {
+    skipNextFitBounds = true;
+
+    // Cleared here rather than in the refinement, because a drop that ends up
+    // unsnapped still has to take the last drop's message down with it — and
+    // the refinement is precisely the path that does not run in that case.
+    announceSnap(null);
+    emit('update:geoJson', {
+        type: 'MultiLineString' as const,
+        coordinates,
+    });
+
+    return ++geometryRevision;
+}
+
 /**
- * Finish a drag: snap the drop onto the street it belongs to, then hand the
- * geometry back.
+ * Pull a committed drop onto a street centreline, if the street agrees.
  *
- * The coordinates arriving here are already where the drag left them, including
- * the grabbed vertex, so the only thing left to decide is the snap offset.
+ * The edit is already written by the time this runs, so everything here is
+ * optional: a failed, slow or stale lookup costs the refinement and nothing
+ * else. That is the whole reason the commit happens first — a drop the reviewer
+ * made deliberately is never traded away for a network result.
  *
- * The lookup happens after the drop, not during the move. A network round trip
- * on every mousemove would make dragging unusable, and the position the
- * reviewer actually chose is the one they released the mouse at.
- *
- * The whole selection is sampled, but the result is still applied as a rigid
- * offset. The reference vertex decides where the route should sit; the rest of
- * the selection follows it without reshaping, because a stretch of route being
+ * The whole selection is sampled, but the result is applied as a rigid offset.
+ * The reference vertex decides where the route should sit; the rest of the
+ * selection follows it without reshaping, because a stretch of route being
  * dragged across a block is one edit, not N. Sampling all of it is what makes
  * that offset trustworthy — it is how the street is chosen, and the choice is
  * made before the offset is computed.
- *
- * A failed or slow lookup is not allowed to lose the edit. The route is emitted
- * exactly as dragged and the snap is simply skipped, because losing a
- * deliberate move to a network hiccup is worse than leaving a vertex a metre
- * off the centreline.
  */
-async function settleDrag(
+async function refineDropAfterSnap(
     coordinates: Coordinates,
     active: VertexRef[],
     reference: VertexRef,
     dropped: Position,
     bypass: boolean,
+    revision: number,
 ): Promise<void> {
-    let settled = coordinates;
-    let label: string | null = null;
-    let offset: Position | null = null;
     const options = snapOptions.value;
 
     // Off never reaches the network: there is no threshold to argue about, so
     // asking the server for a street to ignore would be a request per drop
     // whose answer cannot change the outcome.
-    if (!bypass && options) {
-        const found = await lookupSnapStreets(
-            snapSample(coordinates, active, reference),
-            options,
-        );
-        const decision = decideSnap(found?.candidate ?? null, {
-            ...options,
-            bypass,
-        });
-
-        if (found && decision.apply && decision.position) {
-            offset = [
-                decision.position[0] - dropped[0],
-                decision.position[1] - dropped[1],
-            ];
-            settled = applyDeltaToSelection(settled, active, offset);
-            label = describeSnap(found);
-        }
+    if (bypass || !options) {
+        return;
     }
+
+    const found = await lookupSnapStreets(
+        snapSample(coordinates, active, reference),
+        options,
+    );
+
+    // A newer edit landed while this was in flight. Applying the offset now
+    // would drag geometry the reviewer has since moved again, by an amount
+    // derived from where it used to be — so the refinement is dropped and the
+    // route stays exactly where they last put it.
+    if (geometryRevision !== revision || !found) {
+        return;
+    }
+
+    const decision = decideSnap(found.candidate, { ...options, bypass });
+
+    if (!decision.apply || !decision.position) {
+        return;
+    }
+
+    const offset: Position = [
+        decision.position[0] - dropped[0],
+        decision.position[1] - dropped[1],
+    ];
 
     // The markers follow the snap rather than the raw drop, so the vertex the
     // reviewer sees is the one that was written.
-    if (offset) {
-        moveMarkers(active, offset);
-    }
-
-    dragCoords = null;
-    announceSnap(label);
+    moveMarkers(active, offset);
+    announceSnap(describeSnap(found));
     skipNextFitBounds = true;
-
-    emit('update:geoJson', {
-        type: 'MultiLineString' as const,
-        coordinates: settled,
-    });
+    emit(
+        'update:geoJson',
+        {
+            type: 'MultiLineString' as const,
+            coordinates: applyDeltaToSelection(coordinates, active, offset),
+        },
+        { snap: true },
+    );
+    geometryRevision += 1;
 }
 
 /**
@@ -855,22 +900,6 @@ function csrfToken(): string {
     }
 
     return decodeURIComponent(match.slice(prefix.length));
-}
-
-/**
- * What the lookup came back with: the decision-relevant pair, plus how much of
- * the moved selection is on the chosen street.
- *
- * The count is kept beside the candidate rather than inside it because it does
- * not take part in the decision. It is a report for the reviewer, and folding
- * it into SnapCandidate would have put a field on the type that the snap logic
- * is tempted — and once did — to weigh.
- */
-interface SnapLookup {
-    candidate: SnapCandidate;
-    name: string | null;
-    votes: number;
-    samples: number;
 }
 
 /**
@@ -926,12 +955,13 @@ async function lookupSnapStreets(
                 'X-XSRF-TOKEN': csrfToken(),
             },
             credentials: 'same-origin',
+            // The drop is already committed, so giving up on the refinement
+            // costs nothing but the snap. What it does not cost is a stuck
+            // editor: without a deadline, a request that never settles is
+            // indistinguishable from one that is still working.
+            signal: AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS),
             body: JSON.stringify({
-                // Internal order is [lng, lat]; the wire format is lat/lng.
-                points: points.map((position) => ({
-                    lat: position[1],
-                    lng: position[0],
-                })),
+                points: toWirePoints(points),
                 radius: snapSearchRadius(options),
                 threshold: options.threshold,
             }),
@@ -951,24 +981,7 @@ async function lookupSnapStreets(
             return null;
         }
 
-        const data = (await response.json()) as {
-            lat: number;
-            lng: number;
-            name: string | null;
-            distance_m: number;
-            votes: number;
-            samples: number;
-        };
-
-        return {
-            candidate: {
-                position: [data.lng, data.lat],
-                distance: data.distance_m,
-            },
-            name: data.name,
-            votes: data.votes,
-            samples: data.samples,
-        };
+        return snapLookupFromResponse(await response.json());
     } catch {
         return null;
     }

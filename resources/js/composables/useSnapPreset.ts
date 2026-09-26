@@ -26,8 +26,12 @@ const snapPreset = ref<SnapPreset>(DEFAULT_PRESET);
  * as "off" and silently disables snapping with nothing on screen to explain
  * it. Dropping an unrecognised value leaves the reviewer on the default,
  * which is a visible, recoverable state.
+ *
+ * Exported for its test rather than exercised through the composable: the
+ * composable needs a mounted component to run, and what matters here is that
+ * the guard accepts exactly the strings the table defines.
  */
-function isSnapPreset(value: string | null): value is SnapPreset {
+export function isSnapPreset(value: string | null): value is SnapPreset {
     return (
         value !== null &&
         (SNAP_PRESET_NAMES as readonly string[]).includes(value)
