@@ -286,7 +286,7 @@ class LineDirectionsTest extends TestCase
         $this->actingAs($user)->put(route('lines.update', $outbound), [
             'name' => 'Línea 4',
             'geo_json' => json_encode($this->twoSegmentGeometry()),
-        ])->assertRedirect(route('lines.index'));
+        ])->assertRedirect(route('lines.edit', $outbound));
 
         $this->assertTrue($outbound->fresh()->geometry_adjusted);
     }
@@ -301,9 +301,28 @@ class LineDirectionsTest extends TestCase
 
         $this->actingAs($user)->put(route('lines.update', $outbound), [
             'name' => 'Línea 4',
-        ])->assertRedirect(route('lines.index'));
+        ])->assertRedirect(route('lines.edit', $outbound));
 
         $this->assertFalse($outbound->fresh()->geometry_adjusted);
+    }
+
+    public function test_saving_returns_to_the_same_line_instead_of_the_table()
+    {
+        $user = User::factory()->create();
+        $outbound = Line::factory()->create([
+            'code' => '4',
+            'sense' => LineSense::Outbound,
+        ]);
+
+        // Reviewing a route is a per-line job: the reviewer flips directions
+        // and works down a list. Landing on the table after each save loses
+        // their place, so the redirect has to come back here.
+        $response = $this->actingAs($user)->put(route('lines.update', $outbound), [
+            'name' => 'Línea 4',
+        ]);
+
+        $response->assertRedirect(route('lines.edit', $outbound));
+        $this->assertNotSame(route('lines.index'), $response->headers->get('Location'));
     }
 
     public function test_the_edit_page_exposes_the_counterpart_so_the_actions_can_be_offered()

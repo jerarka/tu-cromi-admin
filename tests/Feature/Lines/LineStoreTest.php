@@ -261,7 +261,7 @@ class LineStoreTest extends TestCase
             'code' => '999 hacked',
             'sense' => LineSense::Return->value,
             'name' => 'Ruta 22',
-        ])->assertRedirect(route('lines.index'));
+        ])->assertRedirect(route('lines.edit', $line));
 
         $line->refresh();
 
@@ -285,7 +285,7 @@ class LineStoreTest extends TestCase
 
         $this->put(route('lines.update', $line), [
             'geo_json' => json_encode($geometry),
-        ])->assertRedirect(route('lines.index'));
+        ])->assertRedirect(route('lines.edit', $line));
 
         $this->assertSame($geometry, $line->fresh()->geo_json);
     }

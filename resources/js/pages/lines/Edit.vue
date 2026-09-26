@@ -64,6 +64,29 @@ function confirmDiscard(href: string): void {
 }
 
 /**
+ * Confirm an action that navigates away from the current line.
+ *
+ * The direction and refresh actions both go through Inertia, which replaces
+ * the page and therefore throws away anything typed but not saved. The
+ * unsaved-changes guard in confirmDiscard only covers deliberate navigation,
+ * so without this the reviewer can edit a name, reach for "Invert directions"
+ * and silently lose the edit.
+ *
+ * Deliberately a warning rather than disabling the buttons: hiding the
+ * action leaves no visible reason why it cannot be used, and the reviewer has
+ * no way to tell that is what happened.
+ */
+function confirmNavigation(message: string): boolean {
+    if (isDirty.value) {
+        return window.confirm(
+            `${message}\n\nYou have unsaved edits on this form, and this will discard them.`,
+        );
+    }
+
+    return window.confirm(message);
+}
+
+/**
  * Re-sync the editor when the server hands us a different line.
  *
  * Inertia reuses this component instance when navigating between two lines, so
@@ -117,7 +140,7 @@ function applyDirection(
         return;
     }
 
-    if (!window.confirm(confirmMessage)) {
+    if (!confirmNavigation(confirmMessage)) {
         return;
     }
 
@@ -132,7 +155,7 @@ function refreshGeometry(): void {
         : '';
 
     if (
-        !window.confirm(
+        !confirmNavigation(
             `${warning}Restore "${props.line.code}" from the source GeoJSON?\n\n` +
                 'Precomputed transfers for this line will hold stale point indexes.',
         )

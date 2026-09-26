@@ -150,6 +150,16 @@ class LineController extends Controller
         return to_route('lines.edit', $line);
     }
 
+    /**
+     * Save a line's fields and stay on its own screen.
+     *
+     * Redirects back to the edit page rather than the index table because
+     * correcting a route is a per-line job: a reviewer works down a list
+     * flipping directions, and being thrown back to the table after every save
+     * turns that into a hunt for where they were. Inertia re-renders this same
+     * page with fresh props, which also clears the dirty flag client-side, so
+     * the reviewer can go straight to the next line.
+     */
     public function update(UpdateLineRequest $request, Line $line): RedirectResponse
     {
         $data = $request->validated();
@@ -181,7 +191,7 @@ class LineController extends Controller
             'message' => __('Line updated.'),
         ]);
 
-        return to_route('lines.index');
+        return to_route('lines.edit', $line);
     }
 
     /**
