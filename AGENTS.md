@@ -44,7 +44,8 @@ Both commands have class-level docblocks with algorithm details.
 - **Pages**: `resources/js/pages/` auto-discovered by Inertia. Auth pages under `auth/`, settings under `settings/`.
 - **Layouts**: Assigned by page name in `app.ts`: `auth/*` → AuthLayout, `settings/*` → AppLayout+SettingsLayout, `Welcome` → none, else → AppLayout.
 - **Routes**: `routes/web.php`, `routes/settings.php`, `routes/console.php`. Use named routes.
-- **`@` alias**: `resources/js/` (tsconfig + Inertia config).
+- **`@` alias**: `resources/js/` (tsconfig + Inertia config). `vitest.config.ts` declares it too, since a test runner does not read tsconfig.
+- **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `snapWire` and `snapTransport` (the lat/lng boundary and the street lookup), `mapView`, `undoStack`. If logic is worth testing, it belongs here rather than in a component.
 - **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests).
 - **SSR**: Enabled. Dev URL at `127.0.0.1:13714` (config/inertia.php).
 - **Auth**: Laravel Fortify — features: registration, password reset, email verification, 2FA, passkeys.
@@ -55,6 +56,8 @@ Both commands have class-level docblocks with algorithm details.
 ## Testing quirks
 
 - **PHPUnit classes** (not Pest). `RefreshDatabase` trait. `skipUnlessFortifyHas()` for conditional Fortify feature tests.
+- **Vitest** for `resources/js/**/*.test.ts`, configured in its own `vitest.config.ts` (not a `test` block in `vite.config.ts`, which would start `php artisan pail`). `environment: 'node'`, so there is no jsdom and **component tests are not possible** — anything worth asserting has to live in `resources/js/lib/`.
+- **PostGIS queries are untestable on SQLite**: the `roads` table and the snap lookup are PostgreSQL-only. `php artisan roads:self-test` exercises them against a real instance and rolls back.
 - Tests use **SQLite `:memory:`** — PostGIS spatial queries (`ST_DWithin`, `ST_Distance`) will **fail** in tests. Commands using PostGIS cannot be tested via the standard test suite.
 
 ## Conventions
