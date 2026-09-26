@@ -1,82 +1,29 @@
 <script setup lang="ts">
-import { Form, Head, router } from '@inertiajs/vue3';
+import { Form, Head } from '@inertiajs/vue3';
 import { ArrowLeft } from '@lucide/vue';
-import { computed, ref } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
 import LineMap from '@/components/lines/LineMap.vue';
+import RouteModePicker from '@/components/lines/RouteModePicker.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import lines from '@/routes/lines';
-import type { Line } from '@/types/line';
+import { useRouteGeometry } from '@/composables/useRouteGeometry';
 
-const geoJsonText = ref('');
-
-const parsedGeoJson = computed(() => {
-    if (!geoJsonText.value) {
-        return null;
-    }
-
-    try {
-        return JSON.parse(geoJsonText.value) as NonNullable<Line['geo_json']>;
-    } catch {
-        return null;
-    }
-});
-
-const isEditingMap = ref(false);
-const mode = ref<'move' | 'add' | 'delete'>('move');
-
-const geoJsonError = ref<string | null>(null);
-const isDirty = ref(false);
-
-function markDirty(): void {
-    isDirty.value = true;
-}
-
-function confirmDiscard(): void {
-    if (
-        isDirty.value &&
-        !window.confirm('You have unsaved changes. Leave without saving?')
-    ) {
-        return;
-    }
-
-    router.get(lines.index.url());
-}
-
-function toggleEditing(): void {
-    if (isEditingMap.value) {
-        mode.value = 'move';
-    } else if (!geoJsonText.value) {
-        mode.value = 'add';
-    }
-
-    isEditingMap.value = !isEditingMap.value;
-}
-
-function onMapUpdate(geoJson: NonNullable<Line['geo_json']>): void {
-    geoJsonText.value = JSON.stringify(geoJson, null, 2);
-    geoJsonError.value = null;
-    markDirty();
-}
-
-function validateGeoJson(): void {
-    if (!geoJsonText.value) {
-        geoJsonError.value = null;
-
-        return;
-    }
-
-    try {
-        JSON.parse(geoJsonText.value);
-        geoJsonError.value = null;
-    } catch {
-        geoJsonError.value = 'Invalid JSON format.';
-    }
-}
+const {
+    geoJsonText,
+    parsedGeoJson,
+    geoJsonError,
+    isEditingMap,
+    mode,
+    editToggleLabel,
+    markDirty,
+    validateGeoJson,
+    setGeometry,
+    toggleEditing,
+    confirmDiscard,
+} = useRouteGeometry();
 </script>
 
 <template>
@@ -189,7 +136,6 @@ function validateGeoJson(): void {
                         {{ geoJsonError }}
                     </p>
                 </div>
-
                 <div class="flex items-center gap-4">
                     <Button :disabled="processing">Save</Button>
                     <Button
@@ -214,46 +160,15 @@ function validateGeoJson(): void {
                     size="sm"
                     @click="toggleEditing"
                 >
-                    {{
-                        isEditingMap
-                            ? 'Finish editing'
-                            : parsedGeoJson
-                              ? 'Edit route on map'
-                              : 'Draw route on map'
-                    }}
+                    {{ editToggleLabel }}
                 </Button>
             </div>
-            <div v-if="isEditingMap" class="flex flex-wrap gap-2">
-                <Button
-                    type="button"
-                    :variant="mode === 'move' ? 'default' : 'outline'"
-                    size="sm"
-                    @click="mode = 'move'"
-                >
-                    Move
-                </Button>
-                <Button
-                    type="button"
-                    :variant="mode === 'add' ? 'default' : 'outline'"
-                    size="sm"
-                    @click="mode = 'add'"
-                >
-                    Add vertex
-                </Button>
-                <Button
-                    type="button"
-                    :variant="mode === 'delete' ? 'default' : 'outline'"
-                    size="sm"
-                    @click="mode = 'delete'"
-                >
-                    Delete vertex
-                </Button>
-            </div>
+            <RouteModePicker v-if="isEditingMap" v-model="mode" />
             <LineMap
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
                 :mode="mode"
-                @update:geo-json="onMapUpdate"
+                @update:geo-json="setGeometry"
             />
             <p
                 v-if="isEditingMap"

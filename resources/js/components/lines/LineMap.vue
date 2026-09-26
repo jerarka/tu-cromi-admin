@@ -304,11 +304,17 @@ function announceSnap(label: string | null): void {
     }
 }
 
-/** Whether there is a real route to decorate with endpoint pins. */
+/**
+ * Whether there is a real route to decorate with endpoint pins.
+ *
+ * Asked of routeEndpoints rather than re-derived, because the two-position rule
+ * is not obvious: it counts across the whole route, not per segment, so a
+ * MultiLineString of two one-position segments still gets its two distinct ends.
+ * That reasoning lives with the function that implements it, and a second copy
+ * of the count here would be a second place to forget it.
+ */
 const hasGeometry = computed(
-    () =>
-        (props.geoJson?.coordinates ?? []).reduce((n, s) => n + s.length, 0) >=
-        2,
+    () => routeEndpoints(props.geoJson?.coordinates ?? []) !== null,
 );
 
 /**

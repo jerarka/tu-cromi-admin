@@ -2,12 +2,9 @@ import { describe, expect, test } from 'vitest';
 import {
     applyDeltaToSelection,
     clampRange,
-    closestPointOnSegment,
     decideSnap,
     findClosestSegment,
     insertVertexAt,
-    moveVertexAt,
-    pointToSegmentDistance,
     projectOnSegment,
     rangeBetween,
     removeVertexAt,
@@ -33,36 +30,6 @@ const square: Coordinates = [
         [10, 10],
     ],
 ];
-
-describe('pointToSegmentDistance', () => {
-    test('measures perpendicular to a horizontal segment', () => {
-        expect(pointToSegmentDistance([5, 3], [0, 0], [10, 0])).toBe(3);
-    });
-
-    test('clamps beyond the end of the segment', () => {
-        expect(pointToSegmentDistance([20, 0], [0, 0], [10, 0])).toBe(10);
-    });
-
-    test('falls back to the point distance for a zero-length segment', () => {
-        expect(pointToSegmentDistance([3, 4], [0, 0], [0, 0])).toBe(5);
-    });
-});
-
-describe('closestPointOnSegment', () => {
-    test('returns the perpendicular foot', () => {
-        expect(closestPointOnSegment([5, 3], [0, 0], [10, 0])).toEqual([5, 0]);
-    });
-
-    test('clamps to the end vertex past the segment', () => {
-        expect(closestPointOnSegment([20, 5], [0, 0], [10, 0])).toEqual([
-            10, 0,
-        ]);
-    });
-
-    test('returns the point itself for a zero-length segment', () => {
-        expect(closestPointOnSegment([3, 4], [1, 1], [1, 1])).toEqual([1, 1]);
-    });
-});
 
 describe('findClosestSegment', () => {
     test('picks the nearest span', () => {
@@ -109,6 +76,13 @@ describe('findClosestSegment', () => {
 describe('projectOnSegment', () => {
     test('reports the raw parameter for a click inside the span', () => {
         expect(projectOnSegment([5, 3], [0, 0], [10, 0]).t).toBe(0.5);
+    });
+
+    test('returns the perpendicular foot in the module coordinate order', () => {
+        // Longitude first, like every position here. The point the editor moves
+        // a vertex onto comes from this, so the two fields being the wrong way
+        // round would mirror the whole route.
+        expect(projectOnSegment([5, 3], [0, 0], [10, 0]).point).toEqual([5, 0]);
     });
 
     test('keeps the parameter below zero when the click overshoots the start', () => {
@@ -208,23 +182,6 @@ describe('removeVertexAt', () => {
     });
 });
 
-describe('moveVertexAt', () => {
-    test('replaces only the addressed vertex', () => {
-        const result = moveVertexAt(square, { segment: 0, index: 0 }, [4, 4]);
-
-        expect(result[0][0]).toEqual([4, 4]);
-        expect(result[0][1]).toEqual([10, 0]);
-    });
-
-    test('does not mutate the input', () => {
-        const before = snapshot(square);
-
-        moveVertexAt(square, { segment: 0, index: 0 }, [4, 4]);
-
-        expect(square).toEqual(before);
-    });
-});
-
 describe('rangeBetween', () => {
     test('orders a forward selection', () => {
         expect(
@@ -233,6 +190,60 @@ describe('rangeBetween', () => {
             { segment: 0, index: 1 },
             { segment: 0, index: 2 },
             { segment: 0, index: 3 },
+        ]);
+    });
+
+    test('refuses a range whose ends are on different segments', () => {
+        // The regression. b.segment was never read, so an anchor on segment 0
+        // and a click on segment 1 produced a range inside segment 0 — vertices
+        // the reviewer never indicated, which then move together on a drag and
+        // get saved that way. Every route in the database is currently a single
+        // segment, so this could not happen yet, which is exactly why it needs
+        // a test written here rather than a report from the field.
+        expect(
+            rangeBetween({ segment: 0, index: 8 }, { segment: 1, index: 0 }),
+        ).toEqual([]);
+    });
+
+    test('refuses the range whichever end is on the other segment', () => {
+        expect(
+            rangeBetween({ segment: 1, index: 0 }, { segment: 0, index: 8 }),
+        ).toEqual([]);
+    });
+
+    test('an empty range clamps to an empty selection, not a wrong one', () => {
+        // What the caller does with a refusal: the selection ends up empty
+        // rather than holding a range nobody asked for.
+        const twoSegments: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+            ],
+            [
+                [3, 0],
+                [4, 0],
+            ],
+        ];
+
+        expect(
+            clampRange(
+                twoSegments,
+                rangeBetween(
+                    { segment: 0, index: 2 },
+                    { segment: 1, index: 0 },
+                ),
+            ),
+        ).toEqual([]);
+    });
+
+    test('still spans a whole segment when both ends are on it', () => {
+        expect(
+            rangeBetween({ segment: 1, index: 1 }, { segment: 1, index: 3 }),
+        ).toEqual([
+            { segment: 1, index: 1 },
+            { segment: 1, index: 2 },
+            { segment: 1, index: 3 },
         ]);
     });
 

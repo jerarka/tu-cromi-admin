@@ -43,7 +43,7 @@ export interface RouteEndpoints {
  * walk distance should convert once, at the point of comparison, rather than
  * trusting a degree figure to be a distance.
  */
-export function pointToSegmentDistance(
+function pointToSegmentDistance(
     point: Position,
     a: Position,
     b: Position,
@@ -104,19 +104,6 @@ export function projectOnSegment(
             a[1] + Math.max(0, Math.min(1, t)) * dy,
         ],
     };
-}
-
-/**
- * Nearest point on a segment, clamped to its ends.
- *
- * Returns [lng, lat] like every other position here.
- */
-export function closestPointOnSegment(
-    point: Position,
-    a: Position,
-    b: Position,
-): Position {
-    return projectOnSegment(point, a, b).point;
 }
 
 /**
@@ -236,28 +223,25 @@ export function verticesWithinBounds(
 }
 
 /**
- * Replace one vertex, returning a new array.
- */
-export function moveVertexAt(
-    coordinates: Coordinates,
-    ref: VertexRef,
-    position: Position,
-): Coordinates {
-    const next = coordinates.map((segment) => [...segment]);
-
-    next[ref.segment][ref.index] = [position[0], position[1]];
-
-    return next;
-}
-
-/**
  * Every vertex in an inclusive range, ordered from lower to higher.
  *
  * Order matters: a range is picked by clicking two endpoints, and which one was
  * clicked first is not information worth carrying. Normalising here means the
  * caller never has to branch on direction.
+ *
+ * Both endpoints have to be on the same segment. They were not checked, and a
+ * click that landed on the next segment along silently produced a range inside
+ * the *anchor's* segment instead — nine vertices the reviewer never indicated,
+ * which then move together on a drag and get saved that way. Refusing is the
+ * honest answer: a range across a boundary is a shape this function cannot
+ * describe, and the caller has a marquee for the selection that ignores
+ * segment boundaries anyway.
  */
 export function rangeBetween(a: VertexRef, b: VertexRef): VertexRef[] {
+    if (a.segment !== b.segment) {
+        return [];
+    }
+
     const segment = a.segment;
 
     const from = Math.min(a.index, b.index);

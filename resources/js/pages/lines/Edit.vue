@@ -16,9 +16,11 @@ import LineController from '@/actions/App/Http/Controllers/Admin/LineController'
 import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
 import LineMap from '@/components/lines/LineMap.vue';
+import RouteModePicker from '@/components/lines/RouteModePicker.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
 import { SNAP_PRESET_NAMES, snapOptionsFor } from '@/lib/routeEditing';
 import type { SnapPreset } from '@/lib/routeEditing';
@@ -60,42 +62,29 @@ const props = defineProps<{
     nav: LineNav;
 }>();
 
-const geoJsonText = ref(
-    props.line.geo_json ? JSON.stringify(props.line.geo_json, null, 2) : '',
-);
+/**
+ * The composable starts from empty text, so the line is loaded through the same
+ * path the watcher below uses. Loading it here rather than seeding a ref keeps
+ * one rule for what a loaded route looks like, instead of two that have to agree
+ * about the JSON formatting and the error state.
+ */
+const {
+    geoJsonText,
+    parsedGeoJson,
+    geoJsonError,
+    isDirty,
+    isEditingMap,
+    mode,
+    editToggleLabel,
+    markDirty,
+    replaceGeometry,
+    setGeometry,
+    validateGeoJson,
+    toggleEditing,
+    confirmDiscard,
+} = useRouteGeometry();
 
-const parsedGeoJson = computed(() => {
-    if (!geoJsonText.value) {
-        return null;
-    }
-
-    try {
-        return JSON.parse(geoJsonText.value) as NonNullable<Line['geo_json']>;
-    } catch {
-        return null;
-    }
-});
-
-const isEditingMap = ref(false);
-const mode = ref<'move' | 'add' | 'delete'>('move');
-
-const geoJsonError = ref<string | null>(null);
-const isDirty = ref(false);
-
-function markDirty(): void {
-    isDirty.value = true;
-}
-
-function confirmDiscard(href: string): void {
-    if (
-        isDirty.value &&
-        !window.confirm('You have unsaved changes. Leave without saving?')
-    ) {
-        return;
-    }
-
-    router.get(href);
-}
+replaceGeometry(props.line.geo_json);
 
 /**
  * Confirm an action that navigates away from the current line.
@@ -131,9 +120,7 @@ function confirmNavigation(message: string): boolean {
 watch(
     () => props.line.geo_json,
     (geoJson) => {
-        geoJsonText.value = geoJson ? JSON.stringify(geoJson, null, 2) : '';
-        geoJsonError.value = null;
-        isDirty.value = false;
+        replaceGeometry(geoJson);
 
         // New geometry means a new route to undo edits on. Keeping the old
         // stack would offer a step that restores a shape that is no longer the
@@ -203,14 +190,6 @@ function refreshGeometry(): void {
     }
 
     router.post(LineController.refreshGeometry.url({ line: props.line.id }));
-}
-
-function toggleEditing(): void {
-    if (isEditingMap.value) {
-        mode.value = 'move';
-    }
-
-    isEditingMap.value = !isEditingMap.value;
 }
 
 /**
@@ -326,6 +305,13 @@ onUnmounted(() => {
     document.removeEventListener('keydown', handleKeydown);
 });
 
+/**
+ * Take geometry from the map, recording what it replaced.
+ *
+ * The only part of this page's map handling that is not shared with the create
+ * page, and it is here rather than in the composable because the history belongs
+ * to this visit of this line: the create page has nothing to undo.
+ */
 function onMapUpdate(
     geoJson: NonNullable<Line['geo_json']>,
     meta?: { snap?: boolean },
@@ -338,24 +324,7 @@ function onMapUpdate(
         history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
     }
 
-    geoJsonText.value = JSON.stringify(geoJson, null, 2);
-    geoJsonError.value = null;
-    markDirty();
-}
-
-function validateGeoJson(): void {
-    if (!geoJsonText.value) {
-        geoJsonError.value = null;
-
-        return;
-    }
-
-    try {
-        JSON.parse(geoJsonText.value);
-        geoJsonError.value = null;
-    } catch {
-        geoJsonError.value = 'Invalid JSON format.';
-    }
+    setGeometry(geoJson);
 }
 
 const pageTitle = computed(
@@ -636,39 +605,11 @@ const pageTitle = computed(
                         size="sm"
                         @click="toggleEditing"
                     >
-                        {{
-                            isEditingMap
-                                ? 'Finish editing'
-                                : 'Edit route on map'
-                        }}
+                        {{ editToggleLabel }}
                     </Button>
                 </div>
             </div>
-            <div v-if="isEditingMap" class="flex flex-wrap gap-2">
-                <Button
-                    type="button"
-                    :variant="mode === 'move' ? 'default' : 'outline'"
-                    size="sm"
-                    @click="mode = 'move'"
-                >
-                    Move
-                </Button>
-                <Button
-                    type="button"
-                    :variant="mode === 'add' ? 'default' : 'outline'"
-                    size="sm"
-                    @click="mode = 'add'"
-                >
-                    Add vertex
-                </Button>
-                <Button
-                    type="button"
-                    :variant="mode === 'delete' ? 'default' : 'outline'"
-                    size="sm"
-                    @click="mode = 'delete'"
-                >
-                    Delete vertex
-                </Button>
+            <RouteModePicker v-if="isEditingMap" v-model="mode">
                 <div
                     v-if="mode === 'move'"
                     class="ms-1 flex items-center gap-2"
@@ -694,7 +635,7 @@ const pageTitle = computed(
                         </option>
                     </select>
                 </div>
-            </div>
+            </RouteModePicker>
             <p
                 v-if="isEditingMap && mode === 'move'"
                 class="text-xs text-muted-foreground"
