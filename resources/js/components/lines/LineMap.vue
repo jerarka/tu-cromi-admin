@@ -2,6 +2,30 @@
 import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
+import {
+    applyDeltaToSelection,
+    clampRange,
+    decideSnap,
+    findClosestSegment,
+    insertVertexAt,
+    projectOnSegment,
+    rangeBetween,
+    removeVertexAt,
+    routeEndpoints,
+    snapOptionsFor,
+    snapSample,
+    snapSearchRadius,
+    verticesWithinBounds,
+} from '@/lib/routeEditing';
+import type {
+    Coordinates,
+    Position,
+    SnapCandidate,
+    SnapOptions,
+    SnapPreset,
+    VertexRef,
+} from '@/lib/routeEditing';
+import roads from '@/routes/roads';
 
 const props = defineProps<{
     geoJson: {
@@ -10,20 +34,260 @@ const props = defineProps<{
     } | null;
     editable?: boolean;
     mode?: 'move' | 'add' | 'delete';
+    /**
+     * How hard a drop is pulled onto the street network.
+     *
+     * Defaults to normal rather than being required, because this map is also
+     * mounted by the route create page, which has no preset control of its own.
+     * A required prop would mean every caller has to remember a snapping
+     * decision it never offers the user, and a forgotten one is a silently
+     * broken editor rather than a type error at runtime.
+     */
+    snapPreset?: SnapPreset;
+    /**
+     * Bumped by the parent when a geometry change should not reframe the map.
+     *
+     * See consumePreserveToken for why this is a counter and not a flag.
+     */
+    preserveViewToken?: number;
 }>();
 
 const emit = defineEmits<{
     (e: 'update:geoJson', value: NonNullable<typeof props.geoJson>): void;
 }>();
 
+/** The snap settings in force, or null when snapping is off. */
+const snapOptions = computed(() =>
+    snapOptionsFor(props.snapPreset ?? 'normal'),
+);
+
 const mapContainer = ref<HTMLElement | null>(null);
 let map: L.Map | null = null;
 let polyline: L.Polyline | null = null;
 let vertexMarkers: L.CircleMarker[] = [];
-let dragCoords: number[][][] | null = null;
+
+/**
+ * Markers addressed by the vertex they stand for, so a drag can move a
+ * selection without having to recompute flat-array offsets.
+ */
+let vertexMarkersByRef = new Map<string, L.CircleMarker>();
+let dragCoords: Coordinates | null = null;
 let skipNextFitBounds = false;
+
+/**
+ * The last preserve-view request the map acted on.
+ *
+ * Starts equal to the prop's default so the very first render still frames the
+ * route: a fresh map has nothing to preserve, it has yet to look at anything.
+ */
+let lastPreserveToken = 0;
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 let endpointMarkers: L.Marker[] = [];
+
+/** Which street a dropped vertex was pulled onto, shown briefly. */
+const snapLabel = ref<string | null>(null);
+let snapLabelTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * The vertices a drag would move.
+ *
+ * Empty means nothing is selected, which is the state a plain drag starts from
+ * for a single vertex and leaves the rest of the route alone.
+ */
+const selection = ref<VertexRef[]>([]);
+
+/**
+ * Where the next shift-click starts a range from.
+ *
+ * Kept separate from the selection because a range is picked with two clicks
+ * and the reviewer needs to be able to change their mind about the second one.
+ */
+const selectionAnchor = ref<VertexRef | null>(null);
+
+/**
+ * True between a vertex drag's mousedown and mouseup.
+ *
+ * The markers are repainted when the selection changes, and doing that during
+ * a drag would remove the layer the drag is bound to out from under it.
+ */
+let isDragging = false;
+
+/** The rubber band drawn while marquee-selecting, if any. */
+let marqueeLayer: L.Rectangle | null = null;
+
+function vertexKey(ref: VertexRef): string {
+    return `${ref.segment}:${ref.index}`;
+}
+
+function isSelected(ref: VertexRef): boolean {
+    return selection.value.some(
+        (candidate) =>
+            candidate.segment === ref.segment && candidate.index === ref.index,
+    );
+}
+
+function clearSelection(): void {
+    selection.value = [];
+    selectionAnchor.value = null;
+}
+
+/**
+ * Every vertex inside a rectangle, in route order.
+ *
+ * A marquee is an area gesture and a route is a line, so what it catches is
+ * rarely one tidy stretch. Returning the vertices in route order keeps the
+ * selection meaningful to look at, and lets the length of it be reported.
+ */
+function verticesWithin(bounds: L.LatLngBounds): VertexRef[] {
+    const coordinates = props.geoJson?.coordinates;
+
+    if (!coordinates) {
+        return [];
+    }
+
+    return verticesWithinBounds(coordinates, ([lng, lat]) =>
+        bounds.contains(L.latLng(lat, lng)),
+    );
+}
+
+/**
+ * Shift-drag on the map background draws a box and selects everything in it.
+ *
+ * Shift rather than a plain drag because a plain drag pans, and a tool that
+ * fights the map for the same gesture is a tool nobody uses. Modifying it is
+ * the convention in every editor that has both.
+ */
+function startMarquee(e: L.LeafletMouseEvent): void {
+    if (!map || !props.editable || (props.mode ?? 'move') !== 'move') {
+        return;
+    }
+
+    // Plain drag on the background pans. Without this guard the marquee
+    // swallowed every drag and the map became impossible to move while
+    // editing — the marquee is the rarer action, so it takes the modifier.
+    if (!e.originalEvent.shiftKey) {
+        return;
+    }
+
+    L.DomEvent.stopPropagation(e.originalEvent);
+
+    isDragging = true;
+    map.dragging.disable();
+
+    const origin = e.latlng;
+
+    marqueeLayer = L.rectangle(
+        L.latLngBounds(origin, origin) as L.LatLngBounds,
+        {
+            color: '#16a34a',
+            weight: 1,
+            fillColor: '#16a34a',
+            fillOpacity: 0.12,
+            interactive: false,
+        },
+    ).addTo(map);
+
+    // The document listener is a plain MouseEvent and carries no Leaflet
+    // payload, so the last position the map reported is what gets used.
+    let latest = origin;
+
+    const onMouseMove = (move: L.LeafletMouseEvent): void => {
+        latest = move.latlng;
+        marqueeLayer?.setBounds(
+            L.latLngBounds(origin, move.latlng) as L.LatLngBounds,
+        );
+    };
+
+    const onMouseUp = (): void => {
+        marqueeLayer?.remove();
+        marqueeLayer = null;
+        isDragging = false;
+        map?.off('mousemove', onMouseMove);
+        map?.dragging.enable();
+        document.removeEventListener('mouseup', onMouseUp);
+
+        const bounds = L.latLngBounds(origin, latest);
+
+        // A box smaller than a few pixels is a stray shift-click, not a
+        // selection, and selecting everything it happens to contain would be a
+        // nasty surprise.
+        if (!map || map.distance(origin, latest) < 5) {
+            return;
+        }
+
+        clearSelection();
+        selection.value = verticesWithin(bounds);
+        refreshMarkerStyles();
+    };
+
+    map.on('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+}
+
+/**
+ * Shift-click: pick a range of vertices, or restart the range.
+ *
+ * The range is ordered from lower to higher regardless of which end was clicked
+ * first, so the direction of the two clicks does not matter.
+ */
+function selectRangeTo(ref: VertexRef): void {
+    const anchor = selectionAnchor.value;
+
+    if (!anchor) {
+        selectionAnchor.value = ref;
+        selection.value = [ref];
+
+        return;
+    }
+
+    const coordinates = props.geoJson?.coordinates;
+
+    if (!coordinates) {
+        clearSelection();
+
+        return;
+    }
+
+    selection.value = clampRange(coordinates, rangeBetween(anchor, ref));
+    selectionAnchor.value = null;
+}
+
+/**
+ * Shift every selected marker by the same offset.
+ *
+ * Called on each mousemove while dragging, so it reads the marker's current
+ * position and moves it by the frame's delta rather than tracking an absolute
+ * target. That keeps the movement exactly in step with the cursor even if a
+ * frame is skipped.
+ */
+function moveMarkers(active: VertexRef[], delta: Position): void {
+    for (const ref of active) {
+        const marker = vertexMarkersByRef.get(vertexKey(ref));
+
+        if (!marker) {
+            continue;
+        }
+
+        const current = marker.getLatLng();
+        marker.setLatLng(
+            L.latLng(current.lat + delta[1], current.lng + delta[0]),
+        );
+    }
+}
+
+function announceSnap(label: string | null): void {
+    if (snapLabelTimer) {
+        clearTimeout(snapLabelTimer);
+    }
+
+    snapLabel.value = label;
+
+    if (label !== null) {
+        snapLabelTimer = setTimeout(() => {
+            snapLabel.value = null;
+        }, 2600);
+    }
+}
 
 /** Whether there is a real route to decorate with endpoint pins. */
 const hasGeometry = computed(
@@ -49,67 +313,20 @@ function handleWindowResize(): void {
     }, 150);
 }
 
-function pointToSegmentDist(
-    px: number,
-    py: number,
-    ax: number,
-    ay: number,
-    bx: number,
-    by: number,
-): number {
-    const dx = bx - ax;
-    const dy = by - ay;
-    const lenSq = dx * dx + dy * dy;
-
-    if (lenSq === 0) {
-        return Math.hypot(px - ax, py - ay);
-    }
-
-    const t = Math.max(
-        0,
-        Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq),
-    );
-
-    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
-}
-
-function findClosestSegment(
-    latlng: L.LatLng,
-    coords: number[][][],
-): { segIdx: number; pointIdx: number } | null {
-    let minDist = Infinity;
-    let result: { segIdx: number; pointIdx: number } | null = null;
-
-    coords.forEach((segment, segIdx) => {
-        for (let i = 0; i < segment.length - 1; i++) {
-            const dist = pointToSegmentDist(
-                latlng.lat,
-                latlng.lng,
-                segment[i][1],
-                segment[i][0],
-                segment[i + 1][1],
-                segment[i + 1][0],
-            );
-
-            if (dist < minDist) {
-                minDist = dist;
-                result = { segIdx, pointIdx: i };
-            }
-        }
-    });
-
-    return result;
-}
-
 function updateMapClickListener(mode: 'move' | 'add' | 'delete'): void {
     if (!map) {
         return;
     }
 
     map.off('click', handleAddVertexClick);
+    map.off('mousedown', startMarquee);
 
     if (props.editable && mode === 'add') {
         map.on('click', handleAddVertexClick);
+    }
+
+    if (props.editable && mode === 'move') {
+        map.on('mousedown', startMarquee);
     }
 }
 
@@ -121,7 +338,7 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
     const coordinates = props.geoJson?.coordinates;
 
     if (!coordinates?.length) {
-        const pos: [number, number] = [e.latlng.lng, e.latlng.lat];
+        const pos: Position = [e.latlng.lng, e.latlng.lat];
         skipNextFitBounds = true;
         emit('update:geoJson', {
             type: 'MultiLineString' as const,
@@ -132,8 +349,8 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
     }
 
     if (coordinates.length === 1 && coordinates[0].length <= 1) {
-        const pos: [number, number] = [e.latlng.lng, e.latlng.lat];
-        const newCoords = structuredClone(coordinates);
+        const pos: Position = [e.latlng.lng, e.latlng.lat];
+        const newCoords = coordinates.map((segment) => [...segment]);
         newCoords[0].push(pos);
         skipNextFitBounds = true;
         emit('update:geoJson', {
@@ -144,38 +361,22 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
         return;
     }
 
-    const result = findClosestSegment(e.latlng, coordinates);
+    const result = findClosestSegment(
+        [e.latlng.lng, e.latlng.lat],
+        coordinates,
+    );
 
     if (!result) {
         return;
     }
 
     const { segIdx, pointIdx } = result;
-    const a = coordinates[segIdx][pointIdx];
-    const b = coordinates[segIdx][pointIdx + 1];
-    const pos: [number, number] = [e.latlng.lng, e.latlng.lat];
+    const a = coordinates[segIdx][pointIdx] as Position;
+    const b = coordinates[segIdx][pointIdx + 1] as Position;
+    const pos: Position = [e.latlng.lng, e.latlng.lat];
 
-    const dx = b[0] - a[0];
-    const dy = b[1] - a[1];
-    const lenSq = dx * dx + dy * dy;
-    let t = 0;
-
-    if (lenSq > 0) {
-        t = ((pos[0] - a[0]) * dx + (pos[1] - a[1]) * dy) / lenSq;
-    }
-
-    // Check if the click is close enough to the segment (within 300 meters)
-    let closestProj: [number, number];
-
-    if (t <= 0) {
-        closestProj = [a[1], a[0]];
-    } else if (t >= 1) {
-        closestProj = [b[1], b[0]];
-    } else {
-        closestProj = [a[1] + t * dy, a[0] + t * dx];
-    }
-
-    const closestLatLng = L.latLng(closestProj[0], closestProj[1]);
+    const projection = projectOnSegment(pos, a, b);
+    const closestLatLng = L.latLng(projection.point[1], projection.point[0]);
     const distMeters = map.distance(e.latlng, closestLatLng);
 
     if (distMeters > 300) {
@@ -195,53 +396,57 @@ function handleAddVertexClick(e: L.LeafletMouseEvent): void {
         return;
     }
 
-    const newCoords = structuredClone(coordinates);
-
-    if (t <= 0) {
-        newCoords[segIdx].splice(pointIdx, 0, pos);
-    } else if (t >= 1) {
-        newCoords[segIdx].splice(pointIdx + 2, 0, pos);
-    } else {
-        newCoords[segIdx].splice(pointIdx + 1, 0, pos);
-    }
-
     skipNextFitBounds = true;
     emit('update:geoJson', {
         type: 'MultiLineString' as const,
-        coordinates: newCoords,
+        coordinates: insertVertexAt(
+            coordinates,
+            segIdx,
+            pointIdx,
+            pos,
+            projection.t,
+        ),
     });
 }
 
-function toLatLngs(coords: number[][][]): L.LatLngTuple[][] {
+function toLatLngs(coords: Coordinates): L.LatLngTuple[][] {
     return coords.map((segment) =>
         segment.map((coord) => [coord[1], coord[0]] as L.LatLngTuple),
     );
 }
 
-interface RouteEndpoints {
-    start: L.LatLng;
-    end: L.LatLng;
-}
-
 /**
- * First coordinate of the first segment and last coordinate of the last one.
+ * Draw the start and end pins.
  *
- * Returns null when the route holds fewer than two coordinates, so a freshly
- * clicked single vertex does not get two pins stacked on the same point.
+ * Takes the raw coordinates rather than the Leaflet tuples so the endpoint
+ * lookup happens in the pure module, on the project's [lng, lat] convention,
+ * and the conversion to Leaflet order happens once per pin.
+ *
+ * Only called in preview mode, and they are read-only and non-interactive, so
+ * they can neither occlude a vertex nor swallow a click meant for the map.
  */
-function routeEndpoints(segments: L.LatLngTuple[][]): RouteEndpoints | null {
-    const first = segments[0]?.[0];
-    const lastSegment = segments[segments.length - 1];
-    const last = lastSegment?.[lastSegment.length - 1];
-
-    if (!first || !last) {
-        return null;
+function addRouteDecorations(coordinates: Coordinates): void {
+    if (!map) {
+        return;
     }
 
-    return {
-        start: L.latLng(first[0], first[1]),
-        end: L.latLng(last[0], last[1]),
-    };
+    const endpoints = routeEndpoints(coordinates);
+
+    if (!endpoints) {
+        return;
+    }
+
+    const pin = (position: Position, endpoint: 'start' | 'end'): L.Marker =>
+        L.marker(L.latLng(position[1], position[0]), {
+            interactive: false,
+            keyboard: false,
+            icon: endpointIcon(endpoint),
+        });
+
+    endpointMarkers.push(
+        pin(endpoints.start, 'start').addTo(map),
+        pin(endpoints.end, 'end').addTo(map),
+    );
 }
 
 function endpointIcon(endpoint: 'start' | 'end'): L.DivIcon {
@@ -251,37 +456,6 @@ function endpointIcon(endpoint: 'start' | 'end'): L.DivIcon {
         iconSize: [18, 18],
         iconAnchor: [9, 9],
     });
-}
-
-/**
- * Draw the start and end pins.
- *
- * Only called in preview mode, and they are read-only and non-interactive, so
- * they can neither occlude a vertex nor swallow a click meant for the map.
- */
-function addRouteDecorations(latlngs: L.LatLngTuple[][]): void {
-    if (!map) {
-        return;
-    }
-
-    const endpoints = routeEndpoints(latlngs);
-
-    if (!endpoints) {
-        return;
-    }
-
-    endpointMarkers.push(
-        L.marker(endpoints.start, {
-            interactive: false,
-            keyboard: false,
-            icon: endpointIcon('start'),
-        }).addTo(map),
-        L.marker(endpoints.end, {
-            interactive: false,
-            keyboard: false,
-            icon: endpointIcon('end'),
-        }).addTo(map),
-    );
 }
 
 function renderMap(): void {
@@ -325,36 +499,155 @@ function renderMap(): void {
         // Either the route is being edited or it is being looked at, never
         // both. Keeping the pins out of edit mode means they can never occlude
         // a vertex or intercept a click.
-        addRouteDecorations(latlngs);
+        addRouteDecorations(coordinates);
     }
 
-    if (skipNextFitBounds) {
+    if (skipNextFitBounds || consumePreserveToken()) {
         skipNextFitBounds = false;
     } else {
         map.fitBounds(polyline.getBounds().pad(0.1));
     }
 }
 
+/**
+ * Whether the parent asked to keep the current view for exactly this change.
+ *
+ * Undo and redo rewrite the geometry, and every geometry change arrives here,
+ * so the map refits after an undo the same way it refits after a drag — which
+ * throws away the zoom and pan the reviewer had just chosen, at the exact
+ * moment they are trying to check what the undo actually did.
+ *
+ * A flag cannot express "this once". Left set, it would still be set when the
+ * reviewer moves to the next line, and that navigation is precisely the case
+ * where the bounds should change. Counting the requests makes the one-shot
+ * explicit and leaves the next real navigation free to reframe.
+ */
+function consumePreserveToken(): boolean {
+    const token = props.preserveViewToken ?? 0;
+
+    if (token === lastPreserveToken) {
+        return false;
+    }
+
+    lastPreserveToken = token;
+
+    return true;
+}
+
+/**
+ * The look of a vertex marker, given what it currently is.
+ *
+ * Split out from creation so the selection can be repainted with setStyle
+ * alone. Recreating the markers on every selection change would work, but it
+ * throws away and rebuilds several hundred layers, and it would yank the very
+ * marker out from under a drag that is still in progress.
+ */
+function vertexStyle(
+    selected: boolean,
+    mode: 'move' | 'add' | 'delete',
+): L.CircleMarkerOptions {
+    if (mode === 'delete') {
+        return {
+            radius: 6,
+            color: '#dc2626',
+            fillColor: '#ffffff',
+            fillOpacity: 1,
+            weight: 2,
+        };
+    }
+
+    if (selected) {
+        return {
+            radius: 7,
+            color: '#16a34a',
+            fillColor: '#ffffff',
+            fillOpacity: 1,
+            weight: 3,
+        };
+    }
+
+    return {
+        radius: 6,
+        color: '#2563eb',
+        fillColor: '#ffffff',
+        fillOpacity: 1,
+        weight: 2,
+    };
+}
+
+/**
+ * Repaint the markers to match the current selection and mode.
+ *
+ * Without this, selecting a vertex changed state that nothing could see: the
+ * colour is applied when a marker is created, and only a re-render creates
+ * markers. A range selection therefore looked like it had done nothing, and
+ * the next drag quietly collapsed it back to one vertex.
+ */
+function refreshMarkerStyles(): void {
+    if (isDragging) {
+        return;
+    }
+
+    const mode = props.mode ?? 'move';
+
+    for (const [key, marker] of vertexMarkersByRef) {
+        const selected = selection.value.some((ref) => vertexKey(ref) === key);
+
+        marker.setStyle(vertexStyle(selected, mode));
+    }
+}
+
 function addVertexMarkers(
-    coords: number[][][],
+    coords: Coordinates,
     latlngs: L.LatLngTuple[][],
     mode: 'move' | 'add' | 'delete',
 ): void {
     coords.forEach((segment, segIdx) => {
         segment.forEach((_, pointIdx) => {
-            const marker = L.circleMarker(latlngs[segIdx][pointIdx], {
-                radius: 6,
-                color: mode === 'delete' ? '#dc2626' : '#2563eb',
-                fillColor: '#ffffff',
-                fillOpacity: 1,
-                weight: 2,
-            });
+            const ref: VertexRef = { segment: segIdx, index: pointIdx };
+
+            const marker = L.circleMarker(
+                latlngs[segIdx][pointIdx],
+                vertexStyle(isSelected(ref), mode),
+            );
 
             if (mode === 'move') {
                 let wasDragged = false;
 
+                // Seeded with the vertex's own position, not zero. The first
+                // mousemove computes its delta from here, and starting at the
+                // origin of the coordinate space would fling the selection
+                // across the map on the first frame of every drag.
+                let dropped: Position = [
+                    coords[segIdx][pointIdx][0],
+                    coords[segIdx][pointIdx][1],
+                ];
+
                 marker.on('mousedown', (e: L.LeafletMouseEvent) => {
                     L.DomEvent.stopPropagation(e.originalEvent);
+
+                    // Shift belongs to the selection, which is handled on click.
+                    // Starting a drag here as well would mean a shift-click
+                    // both picks a range and nudges the route.
+                    if (e.originalEvent.shiftKey) {
+                        return;
+                    }
+
+                    // Grabbing a vertex that is already selected moves the
+                    // whole selection. Grabbing an unselected one collapses the
+                    // selection to it, which is what makes a plain drag always
+                    // do what the reviewer expects.
+                    if (!isSelected(ref)) {
+                        clearSelection();
+                        selection.value = [ref];
+                        refreshMarkerStyles();
+                    }
+
+                    const active = selection.value.length
+                        ? [...selection.value]
+                        : [ref];
+
+                    isDragging = true;
 
                     if (!dragCoords) {
                         dragCoords = structuredClone(coords);
@@ -369,46 +662,73 @@ function addVertexMarkers(
                         }
 
                         wasDragged = true;
-                        const pos = e.latlng;
 
-                        marker.setLatLng(pos);
-                        dragCoords[segIdx][pointIdx] = [pos.lng, pos.lat];
-                        updatePolylinePath();
+                        const next: Position = [e.latlng.lng, e.latlng.lat];
+                        const delta: Position = [
+                            next[0] - dropped[0],
+                            next[1] - dropped[1],
+                        ];
+
+                        if (delta[0] !== 0 || delta[1] !== 0) {
+                            dropped = next;
+                            dragCoords = applyDeltaToSelection(
+                                dragCoords,
+                                active,
+                                delta,
+                            );
+                            moveMarkers(active, delta);
+                            updatePolylinePath();
+                        }
                     };
 
-                    const onMouseUp = (): void => {
+                    const onMouseUp = (event: MouseEvent): void => {
                         map?.off('mousemove', onMouseMove);
                         map?.dragging.enable();
                         document.removeEventListener('mouseup', onMouseUp);
+                        isDragging = false;
 
-                        if (wasDragged && dragCoords) {
-                            skipNextFitBounds = true;
-                            const payload = {
-                                type: 'MultiLineString' as const,
-                                coordinates: dragCoords,
-                            };
+                        if (!wasDragged || !dragCoords) {
                             dragCoords = null;
-                            emit('update:geoJson', payload);
-                        } else {
-                            dragCoords = null;
+
+                            return;
                         }
+
+                        // Alt suppresses the snap for this drop, so a stretch
+                        // of route can be placed deliberately off the centreline.
+                        void settleDrag(
+                            dragCoords,
+                            active,
+                            ref,
+                            dropped,
+                            event.altKey,
+                        );
                     };
 
                     map?.on('mousemove', onMouseMove);
                     document.addEventListener('mouseup', onMouseUp);
                 });
+
+                // Selection lives on click rather than mousedown. Leaflet only
+                // fires click when the pointer barely moved, which is exactly
+                // the distinction wanted: a shift-click picks a range, a
+                // shift-drag moves it.
+                marker.on('click', (e: L.LeafletMouseEvent) => {
+                    L.DomEvent.stopPropagation(e.originalEvent);
+
+                    if (e.originalEvent.shiftKey) {
+                        selectRangeTo(ref);
+                    } else {
+                        clearSelection();
+                        selection.value = [ref];
+                    }
+
+                    refreshMarkerStyles();
+                });
             } else if (mode === 'delete') {
                 marker.on('click', (e: L.LeafletMouseEvent) => {
                     L.DomEvent.stopPropagation(e.originalEvent);
 
-                    const newCoords = structuredClone(coords);
-                    const segment = newCoords[segIdx];
-
-                    if (segment.length <= 2) {
-                        newCoords.splice(segIdx, 1);
-                    } else {
-                        segment.splice(pointIdx, 1);
-                    }
+                    const newCoords = removeVertexAt(coords, segIdx, pointIdx);
 
                     if (newCoords.length === 0) {
                         return;
@@ -424,8 +744,234 @@ function addVertexMarkers(
 
             marker.addTo(map!);
             vertexMarkers.push(marker);
+            vertexMarkersByRef.set(vertexKey(ref), marker);
         });
     });
+}
+
+/**
+ * Finish a drag: snap the vertex onto the street it was dropped near, then
+ * hand the geometry back.
+ *
+ * The lookup happens after the drop, not during the move. A network round trip
+ * on every mousemove would make dragging unusable, and the position the
+ * reviewer actually chose is the one they released the mouse at.
+ *
+ * A failed or slow lookup is not allowed to lose the edit. The route is emitted
+ * exactly as dragged and the snap is simply skipped, because losing a
+ * deliberate move to a network hiccup is worse than leaving a vertex a metre
+ * off the centreline.
+ */
+/**
+ * Finish a drag: snap the drop onto the street it belongs to, then hand the
+ * geometry back.
+ *
+ * The coordinates arriving here are already where the drag left them, including
+ * the grabbed vertex, so the only thing left to decide is the snap offset.
+ *
+ * The lookup happens after the drop, not during the move. A network round trip
+ * on every mousemove would make dragging unusable, and the position the
+ * reviewer actually chose is the one they released the mouse at.
+ *
+ * The whole selection is sampled, but the result is still applied as a rigid
+ * offset. The reference vertex decides where the route should sit; the rest of
+ * the selection follows it without reshaping, because a stretch of route being
+ * dragged across a block is one edit, not N. Sampling all of it is what makes
+ * that offset trustworthy — it is how the street is chosen, and the choice is
+ * made before the offset is computed.
+ *
+ * A failed or slow lookup is not allowed to lose the edit. The route is emitted
+ * exactly as dragged and the snap is simply skipped, because losing a
+ * deliberate move to a network hiccup is worse than leaving a vertex a metre
+ * off the centreline.
+ */
+async function settleDrag(
+    coordinates: Coordinates,
+    active: VertexRef[],
+    reference: VertexRef,
+    dropped: Position,
+    bypass: boolean,
+): Promise<void> {
+    let settled = coordinates;
+    let label: string | null = null;
+    let offset: Position | null = null;
+    const options = snapOptions.value;
+
+    // Off never reaches the network: there is no threshold to argue about, so
+    // asking the server for a street to ignore would be a request per drop
+    // whose answer cannot change the outcome.
+    if (!bypass && options) {
+        const found = await lookupSnapStreets(
+            snapSample(coordinates, active, reference),
+            options,
+        );
+        const decision = decideSnap(found?.candidate ?? null, {
+            ...options,
+            bypass,
+        });
+
+        if (found && decision.apply && decision.position) {
+            offset = [
+                decision.position[0] - dropped[0],
+                decision.position[1] - dropped[1],
+            ];
+            settled = applyDeltaToSelection(settled, active, offset);
+            label = describeSnap(found);
+        }
+    }
+
+    // The markers follow the snap rather than the raw drop, so the vertex the
+    // reviewer sees is the one that was written.
+    if (offset) {
+        moveMarkers(active, offset);
+    }
+
+    dragCoords = null;
+    announceSnap(label);
+    skipNextFitBounds = true;
+
+    emit('update:geoJson', {
+        type: 'MultiLineString' as const,
+        coordinates: settled,
+    });
+}
+
+/**
+ * The CSRF token from the XSRF-TOKEN cookie.
+ *
+ * This component is the only place in the app that talks to the server outside
+ * Inertia, and Inertia attaches the token itself. A plain fetch does not, so
+ * without this the road lookup comes back 419 and the snap silently never
+ * happens — which is exactly what it looked like.
+ */
+function csrfToken(): string {
+    const prefix = 'XSRF-TOKEN=';
+    const match = document.cookie
+        .split('; ')
+        .find((row) => row.startsWith(prefix));
+
+    if (!match) {
+        return '';
+    }
+
+    return decodeURIComponent(match.slice(prefix.length));
+}
+
+/**
+ * What the lookup came back with: the decision-relevant pair, plus how much of
+ * the moved selection is on the chosen street.
+ *
+ * The count is kept beside the candidate rather than inside it because it does
+ * not take part in the decision. It is a report for the reviewer, and folding
+ * it into SnapCandidate would have put a field on the type that the snap logic
+ * is tempted — and once did — to weigh.
+ */
+interface SnapLookup {
+    candidate: SnapCandidate;
+    name: string | null;
+    votes: number;
+    samples: number;
+}
+
+/**
+ * What to tell the reviewer about a snap.
+ *
+ * The count only speaks when it has something to say. Along a route the moved
+ * vertices are mostly on different streets by definition, so a stretch of any
+ * length reports something like "1 of 7" — and printing that after a perfectly
+ * good snap makes a correct result read as a doubtful one, which is the exact
+ * opposite of what a confirmation is for.
+ *
+ * So it appears only when the moved vertices back the street the snap chose,
+ * which is the crossing case: the votes settled something the distances could
+ * not, and the reviewer is being told which of the two nearby roads the choice
+ * went to and on what grounds. Everything else just gets the street name.
+ */
+function describeSnap(found: SnapLookup): string {
+    const street = found.name ?? 'unnamed street';
+
+    if (found.votes < 2 || found.votes * 2 <= found.samples) {
+        return street;
+    }
+
+    return `${street} — ${found.votes} of ${found.samples} moved vertices are on it`;
+}
+
+/**
+ * Ask which street a whole dropped selection belongs to.
+ *
+ * The first point is the one the user grabbed and the only one whose distance
+ * counts; it is sent as the reference and the server holds it to the threshold.
+ * The rest are how far the other moved vertices look for a street to vote for,
+ * which is what settles a drop made on a crossing. They cannot widen the
+ * answer: the threshold the caller sends is the same one this component then
+ * applies to the result, so a street the editor would have refused is never
+ * proposed.
+ */
+async function lookupSnapStreets(
+    points: Position[],
+    options: SnapOptions,
+): Promise<SnapLookup | null> {
+    if (points.length === 0) {
+        return null;
+    }
+
+    try {
+        const response = await fetch(roads.snap.url(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-XSRF-TOKEN': csrfToken(),
+            },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                // Internal order is [lng, lat]; the wire format is lat/lng.
+                points: points.map((position) => ({
+                    lat: position[1],
+                    lng: position[0],
+                })),
+                radius: snapSearchRadius(options),
+                threshold: options.threshold,
+            }),
+        });
+
+        // 204 is the documented "nothing close enough" answer, not a failure.
+        if (response.status === 204) {
+            return null;
+        }
+
+        if (!response.ok) {
+            // Worth surfacing rather than swallowing: a 419 here means the
+            // lookup is not working at all, and it would otherwise look
+            // identical to "no street nearby".
+            console.warn('Road lookup failed', response.status);
+
+            return null;
+        }
+
+        const data = (await response.json()) as {
+            lat: number;
+            lng: number;
+            name: string | null;
+            distance_m: number;
+            votes: number;
+            samples: number;
+        };
+
+        return {
+            candidate: {
+                position: [data.lng, data.lat],
+                distance: data.distance_m,
+            },
+            name: data.name,
+            votes: data.votes,
+            samples: data.samples,
+        };
+    } catch {
+        return null;
+    }
 }
 
 function updatePolylinePath(): void {
@@ -439,6 +985,7 @@ function updatePolylinePath(): void {
 function clearVertexMarkers(): void {
     vertexMarkers.forEach((m) => map?.removeLayer(m));
     vertexMarkers = [];
+    vertexMarkersByRef = new Map();
     dragCoords = null;
 }
 
@@ -454,11 +1001,28 @@ function clearLayers(): void {
     clearVertexMarkers();
 }
 
+/**
+ * Escape drops the selection.
+ *
+ * Without it there is no way back to a single-vertex drag once a range is
+ * picked, short of shift-clicking somewhere useless.
+ */
+function handleKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape') {
+        clearSelection();
+    }
+}
+
 onMounted(() => {
     renderMap();
     window.addEventListener('resize', handleWindowResize);
+    document.addEventListener('keydown', handleKeydown);
 });
+
+// A selection addresses vertices by index, so it only means something against
+// the geometry it was picked from. New geometry means a new route to select on.
 watch(() => props.geoJson, renderMap, { deep: true });
+watch(() => props.geoJson, clearSelection, { deep: true });
 watch(
     () => props.mode,
     async (newMode) => {
@@ -467,6 +1031,7 @@ watch(
         }
 
         clearVertexMarkers();
+        clearSelection();
 
         const coordinates = props.geoJson?.coordinates;
 
@@ -484,6 +1049,7 @@ watch(
     () => props.editable,
     async (editable) => {
         clearVertexMarkers();
+        clearSelection();
 
         if (editable) {
             const coordinates = props.geoJson?.coordinates;
@@ -506,19 +1072,29 @@ watch(
 
 onUnmounted(() => {
     window.removeEventListener('resize', handleWindowResize);
+    document.removeEventListener('keydown', handleKeydown);
 
     if (resizeTimer) {
         clearTimeout(resizeTimer);
         resizeTimer = null;
     }
 
+    if (snapLabelTimer) {
+        clearTimeout(snapLabelTimer);
+        snapLabelTimer = null;
+    }
+
     clearLayers();
 
     if (map) {
         map.off('click', handleAddVertexClick);
+        map.off('mousedown', startMarquee);
         map.remove();
         map = null;
     }
+
+    marqueeLayer = null;
+    isDragging = false;
 });
 </script>
 
@@ -535,6 +1111,28 @@ onUnmounted(() => {
                 class="h-[clamp(400px,60vh,700px)] w-full rounded-md border"
             />
         </div>
+        <p
+            v-if="snapLabel"
+            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
+        >
+            Snapped onto {{ snapLabel }}.
+        </p>
+        <p
+            v-if="editable && mode === 'move'"
+            class="mt-2 text-sm text-muted-foreground"
+        >
+            <template v-if="selection.length > 1">
+                {{ selection.length }} vertices selected. Drag any of them to
+                move the whole stretch. Hold Alt to skip snapping, Escape to
+                deselect.
+            </template>
+            <template v-else>
+                Shift-click two vertices to grab everything between them, or
+                Shift-drag on the map to box one out. Then drag any selected
+                vertex to move them together. A dropped vertex snaps onto the
+                nearest street — hold Alt to place it off the centreline.
+            </template>
+        </p>
         <p
             v-if="!geoJson && !editable"
             class="mt-2 text-sm text-muted-foreground"

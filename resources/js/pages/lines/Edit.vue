@@ -6,10 +6,12 @@ import {
     ArrowRightLeft,
     ChevronLeft,
     ChevronRight,
+    Redo2,
     RotateCcw,
     Shuffle,
+    Undo2,
 } from '@lucide/vue';
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
@@ -17,8 +19,40 @@ import LineMap from '@/components/lines/LineMap.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { useSnapPreset } from '@/composables/useSnapPreset';
+import { SNAP_PRESET_NAMES, snapOptionsFor } from '@/lib/routeEditing';
+import type { SnapPreset } from '@/lib/routeEditing';
+import {
+    canRedo,
+    canUndo,
+    emptyHistory,
+    record,
+    redoStep,
+    undoStep,
+} from '@/lib/undoStack';
 import lines from '@/routes/lines';
 import type { DirectionOperation, Line, LineNav } from '@/types/line';
+
+/**
+ * The presets as the reviewer reads them.
+ *
+ * Kept beside the settings themselves rather than inside them: the numbers are
+ * domain, the wording is presentation, and a preset table carrying both would
+ * make a copy change look like a behaviour change.
+ */
+const SNAP_PRESET_LABELS: Record<SnapPreset, string> = {
+    off: 'Off',
+    subtle: 'Subtle',
+    normal: 'Normal',
+    aggressive: 'Aggressive',
+};
+
+/**
+ * How many geometry states to keep. Deep enough to walk back through a whole
+ * line, shallow enough that a route with 591 vertices does not pin a lot of
+ * memory: 50 of them is well under a couple of megabytes.
+ */
+const UNDO_LIMIT = 50;
 
 const props = defineProps<{
     line: Line;
@@ -100,6 +134,11 @@ watch(
         geoJsonText.value = geoJson ? JSON.stringify(geoJson, null, 2) : '';
         geoJsonError.value = null;
         isDirty.value = false;
+
+        // New geometry means a new route to undo edits on. Keeping the old
+        // stack would offer a step that restores a shape that is no longer the
+        // one being edited.
+        history.value = emptyHistory();
     },
 );
 
@@ -174,7 +213,122 @@ function toggleEditing(): void {
     isEditingMap.value = !isEditingMap.value;
 }
 
+/**
+ * Undo/redo for geometry edits, scoped to this visit of this line.
+ *
+ * Not a version log: a direction change, a save, or navigating to another line
+ * all reload the page and the history goes with them. The state it covers is
+ * the one that actually needs a safety net — dragging a vertex by accident —
+ * because nothing is written to the database until Save.
+ *
+ * Typing in the textarea is deliberately not recorded. A keystroke would be an
+ * entry, and the browser's own text undo already covers it, both because it is
+ * better and because the stack would fill up with noise within seconds.
+ */
+const history = ref(emptyHistory());
+
+/**
+ * Tells the map to keep its framing for the change about to happen.
+ *
+ * The map refits the route into view whenever the geometry changes, which is
+ * right after a drag and wrong after an undo: the reviewer is looking at a
+ * detail they just zoomed to, and a refit is thrown away at the moment they are
+ * trying to see what the undo did. Incrementing a counter rather than setting a
+ * flag is what makes it apply once — see the note on the map's side.
+ */
+const preserveViewToken = ref(0);
+
+function undo(): void {
+    const step = undoStep(history.value, geoJsonText.value);
+
+    if (step.value === null) {
+        return;
+    }
+
+    history.value = step.history;
+    geoJsonText.value = step.value;
+    preserveViewToken.value += 1;
+    markDirty();
+}
+
+function redo(): void {
+    const step = redoStep(history.value, geoJsonText.value);
+
+    if (step.value === null) {
+        return;
+    }
+
+    history.value = step.history;
+    geoJsonText.value = step.value;
+    preserveViewToken.value += 1;
+    markDirty();
+}
+
+const canUndoGeometry = computed(() => canUndo(history.value));
+const canRedoGeometry = computed(() => canRedo(history.value));
+
+const { snapPreset, updateSnapPreset } = useSnapPreset();
+
+/**
+ * What the active preset actually does, in the reviewer's terms.
+ *
+ * Shown next to the picker deliberately. "Aggressive" and "subtle" are words
+ * that mean nothing on their own, while the distance is what decides whether a
+ * given drop snaps at all — and being able to read it is how anyone calibrates
+ * a setting on a street they do not know yet, instead of guessing from a label
+ * and then blaming the tool.
+ */
+const snapSummary = computed(() => {
+    const options = snapOptionsFor(snapPreset.value);
+
+    if (options === null) {
+        return 'Drops land exactly where you release them, with no street lookup.';
+    }
+
+    return `Moves a drop onto a street within ${options.threshold} m of where you released it. When a selection is dropped on a crossing, the street more of the moved vertices are already on wins.`;
+});
+
+/**
+ * Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z, deferring to the browser's own text undo
+ * whenever the caret is in a field.
+ *
+ * A global handler that also fired inside the textarea would fight the native
+ * behaviour, and the two together are worse than either alone: the field would
+ * undo text while the map looked frozen.
+ */
+function handleKeydown(e: KeyboardEvent): void {
+    if (!e.metaKey && !e.ctrlKey) {
+        return;
+    }
+
+    const target = e.target as HTMLElement | null;
+
+    if (target && ['INPUT', 'TEXTAREA'].includes(target.tagName)) {
+        return;
+    }
+
+    const key = e.key.toLowerCase();
+
+    if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+    } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+        e.preventDefault();
+        redo();
+    }
+}
+
+onMounted(() => {
+    document.addEventListener('keydown', handleKeydown);
+});
+
+onUnmounted(() => {
+    document.removeEventListener('keydown', handleKeydown);
+});
+
 function onMapUpdate(geoJson: NonNullable<Line['geo_json']>): void {
+    history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
+
     geoJsonText.value = JSON.stringify(geoJson, null, 2);
     geoJsonError.value = null;
     markDirty();
@@ -266,9 +420,9 @@ const pageTitle = computed(
         description="Update line name, color, syndicate, or route geometry"
     />
 
-    <div class="grid gap-8 lg:grid-cols-2">
+    <div class="grid gap-8 lg:grid-cols-5">
         <!-- Form -->
-        <div>
+        <div class="space-y-4 lg:col-span-2">
             <Form
                 v-bind="LineController.update.form(line.id)"
                 class="grid grid-cols-2 gap-4"
@@ -381,7 +535,7 @@ const pageTitle = computed(
         </div>
 
         <!-- Map preview / editor -->
-        <div class="space-y-4">
+        <div class="space-y-4 lg:col-span-3">
             <div class="rounded-md border p-4">
                 <div class="flex items-center justify-between">
                     <Label>Direction</Label>
@@ -441,15 +595,45 @@ const pageTitle = computed(
 
             <div class="flex items-center justify-between">
                 <Label>Route preview</Label>
-                <Button
-                    v-if="parsedGeoJson"
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    @click="toggleEditing"
-                >
-                    {{ isEditingMap ? 'Finish editing' : 'Edit route on map' }}
-                </Button>
+                <div class="flex items-center gap-2">
+                    <Button
+                        v-if="isEditingMap"
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        :disabled="!canUndoGeometry"
+                        title="Undo the last geometry edit (Ctrl+Z)"
+                        @click="undo"
+                    >
+                        <Undo2 class="size-4" />
+                        Undo
+                    </Button>
+                    <Button
+                        v-if="isEditingMap"
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        :disabled="!canRedoGeometry"
+                        title="Redo (Ctrl+Shift+Z)"
+                        @click="redo"
+                    >
+                        <Redo2 class="size-4" />
+                        Redo
+                    </Button>
+                    <Button
+                        v-if="parsedGeoJson"
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        @click="toggleEditing"
+                    >
+                        {{
+                            isEditingMap
+                                ? 'Finish editing'
+                                : 'Edit route on map'
+                        }}
+                    </Button>
+                </div>
             </div>
             <div v-if="isEditingMap" class="flex flex-wrap gap-2">
                 <Button
@@ -476,11 +660,44 @@ const pageTitle = computed(
                 >
                     Delete vertex
                 </Button>
+                <div
+                    v-if="mode === 'move'"
+                    class="ms-1 flex items-center gap-2"
+                >
+                    <Label for="snap-preset">Snap</Label>
+                    <select
+                        id="snap-preset"
+                        :value="snapPreset"
+                        class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+                        @change="
+                            updateSnapPreset(
+                                ($event.target as HTMLSelectElement)
+                                    .value as SnapPreset,
+                            )
+                        "
+                    >
+                        <option
+                            v-for="preset in SNAP_PRESET_NAMES"
+                            :key="preset"
+                            :value="preset"
+                        >
+                            {{ SNAP_PRESET_LABELS[preset] }}
+                        </option>
+                    </select>
+                </div>
             </div>
+            <p
+                v-if="isEditingMap && mode === 'move'"
+                class="text-xs text-muted-foreground"
+            >
+                {{ snapSummary }}
+            </p>
             <LineMap
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
                 :mode="mode"
+                :snap-preset="snapPreset"
+                :preserve-view-token="preserveViewToken"
                 @update:geo-json="onMapUpdate"
             />
             <p
@@ -488,7 +705,14 @@ const pageTitle = computed(
                 class="text-sm text-blue-600 dark:text-blue-500"
             >
                 <template v-if="mode === 'move'">
-                    Drag the white dots to adjust the route geometry.
+                    Drag a dot to move it. Shift-click two dots to grab
+                    everything between them, or Shift-drag on the map to box a
+                    selection out; then drag any selected dot to move them all
+                    together. A drop snaps onto a street near the dot you
+                    dragged; on a crossing it takes the street more of the moved
+                    dots are already on. Hold Alt to place it off the centreline
+                    instead. Undo takes back the last geometry edit, without
+                    moving the map.
                 </template>
                 <template v-else-if="mode === 'add'">
                     Click on the route to add a new vertex.
