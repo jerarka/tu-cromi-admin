@@ -3,10 +3,13 @@ import { Form, Head, router } from '@inertiajs/vue3';
 import {
     ArrowLeft,
     ArrowLeftRight,
+    ArrowRightLeft,
     ChevronLeft,
     ChevronRight,
+    RotateCcw,
+    Shuffle,
 } from '@lucide/vue';
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
@@ -15,10 +18,11 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import lines from '@/routes/lines';
-import type { Line, LineNav } from '@/types/line';
+import type { DirectionOperation, Line, LineNav } from '@/types/line';
 
 const props = defineProps<{
     line: Line;
+    counterpart?: Pick<Line, 'id' | 'code' | 'sense'> | null;
     nav: LineNav;
 }>();
 
@@ -57,6 +61,86 @@ function confirmDiscard(href: string): void {
     }
 
     router.get(href);
+}
+
+/**
+ * Re-sync the editor when the server hands us a different line.
+ *
+ * Inertia reuses this component instance when navigating between two lines, so
+ * setup does not run again and the textarea would keep the previous line's
+ * geometry while the form action already pointed at the new line's id. Saving
+ * would then write one line's geometry onto another.
+ */
+watch(
+    () => props.line.geo_json,
+    (geoJson) => {
+        geoJsonText.value = geoJson ? JSON.stringify(geoJson, null, 2) : '';
+        geoJsonError.value = null;
+        isDirty.value = false;
+    },
+);
+
+const canChangeDirection = computed(() => Boolean(props.counterpart));
+
+const directionActions: {
+    operation: DirectionOperation;
+    label: string;
+    icon: typeof Shuffle;
+    confirm: string;
+}[] = [
+    {
+        operation: 'invert',
+        label: 'Invert directions',
+        icon: ArrowRightLeft,
+        confirm:
+            'Reverse the point order of both this line and its counterpart?\n\n' +
+            'Each direction keeps its own streets; only the direction of travel flips. ' +
+            'Running this again restores the previous geometry.',
+    },
+    {
+        operation: 'swap',
+        label: 'Swap routes',
+        icon: Shuffle,
+        confirm:
+            'Swap the geometry between this line and its counterpart?\n\n' +
+            'This direction will then trace the streets its counterpart used. ' +
+            'Name, color and syndicate stay with the sense they describe. ' +
+            'Running this again restores the previous geometry.',
+    },
+];
+
+function applyDirection(
+    operation: DirectionOperation,
+    confirmMessage: string,
+): void {
+    if (!canChangeDirection.value) {
+        return;
+    }
+
+    if (!window.confirm(confirmMessage)) {
+        return;
+    }
+
+    router.patch(LineController.directions.url({ line: props.line.id }), {
+        operation,
+    });
+}
+
+function refreshGeometry(): void {
+    const warning = props.line.geometry_adjusted
+        ? 'This line carries a manual correction. Restoring the source geometry discards it.\n\n'
+        : '';
+
+    if (
+        !window.confirm(
+            `${warning}Restore "${props.line.code}" from the source GeoJSON?\n\n` +
+                'Precomputed transfers for this line will hold stale point indexes.',
+        )
+    ) {
+        return;
+    }
+
+    router.post(LineController.refreshGeometry.url({ line: props.line.id }));
 }
 
 function toggleEditing(): void {
@@ -110,23 +194,19 @@ const pageTitle = computed(
 
         <div class="flex items-center gap-2">
             <Button
-                v-if="props.line.parent_line"
+                v-if="props.counterpart"
                 type="button"
                 variant="secondary"
                 size="sm"
-                :title="`Switch to ${props.line.parent_line.code} (${props.line.parent_line.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'})`"
+                :title="`Switch to ${props.counterpart.code} (${props.counterpart.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'})`"
                 @click="
                     confirmDiscard(
-                        lines.edit.url({ line: props.line.parent_line.id }),
+                        lines.edit.url({ line: props.counterpart!.id }),
                     )
                 "
             >
                 <ArrowLeftRight class="size-4" />
-                {{
-                    props.line.parent_line.sense === 'OUTBOUND'
-                        ? 'Ida'
-                        : 'Vuelta'
-                }}
+                {{ props.counterpart.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta' }}
             </Button>
 
             <Button
@@ -239,7 +319,7 @@ const pageTitle = computed(
                     </div>
                 </div>
 
-                <div class="grid gap-2 col-span-2">
+                <div class="col-span-2 grid gap-2">
                     <Label for="geo_json">Route geometry (GeoJSON)</Label>
                     <textarea
                         id="geo_json"
@@ -279,6 +359,63 @@ const pageTitle = computed(
 
         <!-- Map preview / editor -->
         <div class="space-y-4">
+            <div class="rounded-md border p-4">
+                <div class="flex items-center justify-between">
+                    <Label>Direction</Label>
+                    <span
+                        v-if="props.line.geometry_adjusted"
+                        class="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                    >
+                        Manually corrected
+                    </span>
+                </div>
+                <p class="mt-2 text-sm text-muted-foreground">
+                    The source data does not record which end a bus departs
+                    from, so this is a manual correction. Both actions cover
+                    this line and its counterpart, and both are undone by
+                    repeating them.
+                </p>
+                <div class="mt-3 flex flex-wrap gap-2">
+                    <Button
+                        v-for="action in directionActions"
+                        :key="action.operation"
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        :disabled="!canChangeDirection"
+                        :title="
+                            canChangeDirection
+                                ? undefined
+                                : 'This line has no counterpart to re-orient.'
+                        "
+                        @click="
+                            applyDirection(action.operation, action.confirm)
+                        "
+                    >
+                        <component :is="action.icon" class="size-4" />
+                        {{ action.label }}
+                    </Button>
+                    <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        title="Restore this line's geometry from the source GeoJSON"
+                        @click="refreshGeometry"
+                    >
+                        <RotateCcw class="size-4" />
+                        Reset to source
+                    </Button>
+                </div>
+                <p
+                    v-if="!canChangeDirection"
+                    class="mt-2 text-sm text-muted-foreground"
+                >
+                    A line with no counterpart cannot be re-oriented. Circular
+                    routes such as 72 and 73 are legitimately alone in their
+                    direction.
+                </p>
+            </div>
+
             <div class="flex items-center justify-between">
                 <Label>Route preview</Label>
                 <Button

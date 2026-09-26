@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { Head, Link, router, usePage } from '@inertiajs/vue3';
+import { Head, Link, router } from '@inertiajs/vue3';
 import { ref } from 'vue';
 import Heading from '@/components/Heading.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+// Aliased because this page already has a `lines` prop from defineProps,
+// and vue/no-dupe-keys rejects the collision.
+import lineRoutes from '@/routes/lines';
 import type { Line, LineFilters } from '@/types/line';
 
 interface PaginatedLines {
@@ -31,7 +34,7 @@ const sense = ref(props.filters.sense ?? '');
 
 function applyFilters(): void {
     router.get(
-        '/lines',
+        lineRoutes.index.url(),
         {
             search: search.value || undefined,
             sense: sense.value || undefined,
@@ -57,8 +60,6 @@ function visitPage(url: string | null): void {
         },
     );
 }
-
-const page = usePage();
 
 const senseBadge = (sense: string): string => {
     return sense === 'OUTBOUND'
@@ -119,7 +120,7 @@ const senseLabel = (sense: string): string => {
 
         <div class="ml-auto">
             <Button as-child>
-                <Link href="/lines/create">Create</Link>
+                <Link :href="lineRoutes.create.url()">Create</Link>
             </Button>
         </div>
     </div>
@@ -177,7 +178,11 @@ const senseLabel = (sense: string): string => {
                     </td>
                     <td class="px-4 py-3 text-right">
                         <Button variant="outline" size="sm" as-child>
-                            <Link :href="`/lines/${line.id}/edit`">Edit</Link>
+                            <Link
+                                :href="lineRoutes.edit.url({ line: line.id })"
+                            >
+                                Edit
+                            </Link>
                         </Button>
                     </td>
                 </tr>
@@ -210,8 +215,9 @@ const senseLabel = (sense: string): string => {
                 size="sm"
                 :disabled="!link.url"
                 @click="visitPage(link.url)"
-                v-html="link.label"
-            />
+            >
+                {{ link.label }}
+            </Button>
         </nav>
     </div>
 </template>

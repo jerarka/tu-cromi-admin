@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import L from 'leaflet';
-import { nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
+import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
 
 const props = defineProps<{
@@ -23,6 +23,14 @@ let vertexMarkers: L.CircleMarker[] = [];
 let dragCoords: number[][][] | null = null;
 let skipNextFitBounds = false;
 let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+let endpointMarkers: L.Marker[] = [];
+
+/** Whether there is a real route to decorate with endpoint pins. */
+const hasGeometry = computed(
+    () =>
+        (props.geoJson?.coordinates ?? []).reduce((n, s) => n + s.length, 0) >=
+        2,
+);
 
 /**
  * The map container is sized with clamp(400px, 60vh, 700px), so its height
@@ -210,6 +218,72 @@ function toLatLngs(coords: number[][][]): L.LatLngTuple[][] {
     );
 }
 
+interface RouteEndpoints {
+    start: L.LatLng;
+    end: L.LatLng;
+}
+
+/**
+ * First coordinate of the first segment and last coordinate of the last one.
+ *
+ * Returns null when the route holds fewer than two coordinates, so a freshly
+ * clicked single vertex does not get two pins stacked on the same point.
+ */
+function routeEndpoints(segments: L.LatLngTuple[][]): RouteEndpoints | null {
+    const first = segments[0]?.[0];
+    const lastSegment = segments[segments.length - 1];
+    const last = lastSegment?.[lastSegment.length - 1];
+
+    if (!first || !last) {
+        return null;
+    }
+
+    return {
+        start: L.latLng(first[0], first[1]),
+        end: L.latLng(last[0], last[1]),
+    };
+}
+
+function endpointIcon(endpoint: 'start' | 'end'): L.DivIcon {
+    return L.divIcon({
+        className: 'route-endpoint',
+        html: `<i data-endpoint="${endpoint}"></i>`,
+        iconSize: [18, 18],
+        iconAnchor: [9, 9],
+    });
+}
+
+/**
+ * Draw the start and end pins.
+ *
+ * Only called in preview mode, and they are read-only and non-interactive, so
+ * they can neither occlude a vertex nor swallow a click meant for the map.
+ */
+function addRouteDecorations(latlngs: L.LatLngTuple[][]): void {
+    if (!map) {
+        return;
+    }
+
+    const endpoints = routeEndpoints(latlngs);
+
+    if (!endpoints) {
+        return;
+    }
+
+    endpointMarkers.push(
+        L.marker(endpoints.start, {
+            interactive: false,
+            keyboard: false,
+            icon: endpointIcon('start'),
+        }).addTo(map),
+        L.marker(endpoints.end, {
+            interactive: false,
+            keyboard: false,
+            icon: endpointIcon('end'),
+        }).addTo(map),
+    );
+}
+
 function renderMap(): void {
     if (!mapContainer.value) {
         return;
@@ -247,6 +321,11 @@ function renderMap(): void {
     if (props.editable) {
         addVertexMarkers(coordinates, latlngs, mode);
         updateMapClickListener(mode);
+    } else {
+        // Either the route is being edited or it is being looked at, never
+        // both. Keeping the pins out of edit mode means they can never occlude
+        // a vertex or intercept a click.
+        addRouteDecorations(latlngs);
     }
 
     if (skipNextFitBounds) {
@@ -369,6 +448,9 @@ function clearLayers(): void {
         polyline = null;
     }
 
+    endpointMarkers.forEach((m) => map?.removeLayer(m));
+    endpointMarkers = [];
+
     clearVertexMarkers();
 }
 
@@ -465,6 +547,19 @@ onUnmounted(() => {
         >
             Click on the map to start drawing the route.
         </p>
+        <div
+            v-if="!editable && hasGeometry"
+            class="mt-3 flex flex-wrap gap-4 text-xs text-muted-foreground"
+        >
+            <span class="flex items-center gap-1.5">
+                <i data-endpoint="start"></i>
+                Start
+            </span>
+            <span class="flex items-center gap-1.5">
+                <i data-endpoint="end"></i>
+                End
+            </span>
+        </div>
     </div>
 </template>
 
@@ -477,5 +572,25 @@ onUnmounted(() => {
 .cursor-pointer :deep(.leaflet-container),
 .cursor-pointer :deep(.leaflet-interactive) {
     cursor: pointer !important;
+}
+
+/* Leaflet builds these divIcons in its own panes, so the selectors have to
+   reach out of the scoped tree with :deep(). */
+:deep(i[data-endpoint]) {
+    display: block;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    border-radius: 9999px;
+    border: 2px solid #ffffff;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+:deep(i[data-endpoint='start']) {
+    background-color: #16a34a;
+}
+
+:deep(i[data-endpoint='end']) {
+    background-color: #dc2626;
 }
 </style>

@@ -16,26 +16,26 @@ class EditNavigationTest extends TestCase
     /**
      * Seed three lines, each with both senses.
      *
-     * Rows are inserted in the REVERSE of index order, and `code` is a string
-     * column, so index order (code ASC, sense ASC) is:
+     * Rows are inserted in the REVERSE of index order so that a passing test
+     * proves navigation follows the natural code ordering rather than insertion
+     * order or primary key order. Index order is
+     * (code_number, code_suffix, sense), which is numeric — "2" before "10",
+     * not the lexicographic "10" before "2" a plain string sort would give:
      *
      *   1. '1'  OUTBOUND
      *   2. '1'  RETURN
-     *   3. '10' OUTBOUND   <- '10' sorts before '2' (lexicographic)
-     *   4. '10' RETURN
-     *   5. '2'  OUTBOUND
-     *   6. '2'  RETURN
-     *
-     * A test that passes therefore proves navigation follows (code, sense)
-     * rather than insertion order, primary key order, or numeric code order.
+     *   3. '2'  OUTBOUND
+     *   4. '2'  RETURN
+     *   5. '10' OUTBOUND
+     *   6. '10' RETURN
      */
     private function seedUnlinkedLines(): void
     {
         foreach ([
-            ['2', LineSense::Return],
-            ['2', LineSense::Outbound],
             ['10', LineSense::Return],
             ['10', LineSense::Outbound],
+            ['2', LineSense::Return],
+            ['2', LineSense::Outbound],
             ['1', LineSense::Return],
             ['1', LineSense::Outbound],
         ] as [$code, $sense]) {
@@ -99,20 +99,21 @@ class EditNavigationTest extends TestCase
         $user = User::factory()->create();
         $this->seedUnlinkedLines();
 
-        $last = $this->find('2', LineSense::Return);
+        // '10' RETURN is last under natural ordering; '2' RETURN is not.
+        $last = $this->find('10', LineSense::Return);
 
         $this->actingAs($user)
             ->get(route('lines.edit', $last))
             ->assertOk()
             ->assertInertia(fn (Assert $page) => $page
                 ->component('lines/Edit')
-                ->where('nav.prev.code', '2')
+                ->where('nav.prev.code', '10')
                 ->where('nav.prev.sense', LineSense::Outbound->value)
                 ->where('nav.next', null)
             );
     }
 
-    public function test_navigation_follows_code_then_sense_rather_than_id_order()
+    public function test_navigation_follows_natural_code_order_rather_than_id_order()
     {
         $user = User::factory()->create();
         $this->seedUnlinkedLines();
@@ -128,29 +129,30 @@ class EditNavigationTest extends TestCase
                 ->component('lines/Edit')
                 ->where('nav.prev.code', '1')
                 ->where('nav.prev.sense', LineSense::Outbound->value)
-                ->where('nav.next.code', '10')
+                ->where('nav.next.code', '2')
                 ->where('nav.next.sense', LineSense::Outbound->value)
             );
     }
 
-    public function test_code_ordering_is_lexicographic_not_numeric()
+    public function test_code_ordering_is_numeric_not_lexicographic()
     {
         $user = User::factory()->create();
         $this->seedUnlinkedLines();
 
-        // '10' precedes '2' under a string sort, so from '10' the next line is
-        // '2' OUTBOUND. A numeric sort would have gone the other way.
-        $line = $this->find('10', LineSense::Return);
+        // "2" must precede "10". A plain string sort on `code` would place
+        // "10" third (right after "1" RETURN) because '1' < '2' byte-wise,
+        // making the previous row "1" RETURN rather than "2" RETURN.
+        $line = $this->find('10', LineSense::Outbound);
 
         $this->actingAs($user)
             ->get(route('lines.edit', $line))
             ->assertOk()
             ->assertInertia(fn (Assert $page) => $page
                 ->component('lines/Edit')
-                ->where('nav.prev.code', '10')
-                ->where('nav.prev.sense', LineSense::Outbound->value)
-                ->where('nav.next.code', '2')
-                ->where('nav.next.sense', LineSense::Outbound->value)
+                ->where('nav.prev.code', '2')
+                ->where('nav.prev.sense', LineSense::Return->value)
+                ->where('nav.next.code', '10')
+                ->where('nav.next.sense', LineSense::Return->value)
             );
     }
 
@@ -159,21 +161,21 @@ class EditNavigationTest extends TestCase
         $user = User::factory()->create();
         $this->seedUnlinkedLines();
 
-        $line = $this->find('2', LineSense::Outbound);
+        $line = $this->find('2', LineSense::Return);
 
         $this->actingAs($user)
             ->get(route('lines.edit', $line))
             ->assertOk()
             ->assertInertia(fn (Assert $page) => $page
                 ->component('lines/Edit')
-                ->where('nav.prev.code', '10')
-                ->where('nav.prev.sense', LineSense::Return->value)
-                ->where('nav.next.code', '2')
-                ->where('nav.next.sense', LineSense::Return->value)
+                ->where('nav.prev.code', '2')
+                ->where('nav.prev.sense', LineSense::Outbound->value)
+                ->where('nav.next.code', '10')
+                ->where('nav.next.sense', LineSense::Outbound->value)
             );
     }
 
-    public function test_edit_exposes_the_opposite_direction_via_parent_line()
+    public function test_edit_exposes_the_opposite_direction_as_the_counterpart()
     {
         $user = User::factory()->create();
 
@@ -185,8 +187,35 @@ class EditNavigationTest extends TestCase
             ->assertOk()
             ->assertInertia(fn (Assert $page) => $page
                 ->component('lines/Edit')
-                ->where('line.parent_line.id', $return->id)
-                ->where('line.parent_line.sense', LineSense::Return->value)
+                ->where('counterpart.id', $return->id)
+                ->where('counterpart.sense', LineSense::Return->value)
+            );
+    }
+
+    public function test_the_counterpart_is_found_even_when_the_parent_link_is_missing()
+    {
+        $user = User::factory()->create();
+
+        $outbound = Line::factory()->create([
+            'code' => '16 azul',
+            'sense' => LineSense::Outbound,
+            'parent_line_id' => null,
+        ]);
+
+        $return = Line::factory()->create([
+            'code' => '16 azul',
+            'sense' => LineSense::Return,
+            'parent_line_id' => null,
+        ]);
+
+        // The page resolves by code and sense, so a stale or absent
+        // parent_line_id no longer hides a counterpart that plainly exists.
+        $this->actingAs($user)
+            ->get(route('lines.edit', $outbound))
+            ->assertOk()
+            ->assertInertia(fn (Assert $page) => $page
+                ->component('lines/Edit')
+                ->where('counterpart.id', $return->id)
             );
     }
 
@@ -204,7 +233,7 @@ class EditNavigationTest extends TestCase
             ->assertOk()
             ->assertInertia(fn (Assert $page) => $page
                 ->component('lines/Edit')
-                ->where('line.parent_line', null)
+                ->where('counterpart', null)
             );
     }
 

@@ -1,5 +1,7 @@
 export type LineSense = 'OUTBOUND' | 'RETURN';
 
+export type DirectionOperation = 'invert' | 'swap';
+
 export interface Line {
     id: number;
     code: string;
@@ -9,6 +11,7 @@ export interface Line {
         type: 'MultiLineString';
         coordinates: number[][][];
     } | null;
+    geometry_adjusted: boolean;
     sense: LineSense;
     syndicate: string | null;
     objectid: number | null;
@@ -17,7 +20,12 @@ export interface Line {
     total_reviews: number;
     created_at: string | null;
     updated_at: string | null;
-    parent_line?: Pick<Line, 'id' | 'code' | 'sense'> | null;
+    /**
+     * The record holding the opposite direction, resolved by code and sense.
+     * Null for a line that is alone in its direction, such as circular routes
+     * 72 and 73 — which is exactly when the direction actions are unavailable.
+     */
+    counterpart?: Pick<Line, 'id' | 'code' | 'sense'> | null;
 }
 
 export interface LineNav {
