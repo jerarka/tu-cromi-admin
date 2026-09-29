@@ -5,8 +5,16 @@ import {
     decideSnap,
     findClosestSegment,
     insertVertexAt,
+    longitudeScale,
     projectOnSegment,
+    propagationLimitsFor,
+    propagateAlongStreet,
+    PROPAGATION_MAX_ARC_METERS,
+    PROPAGATION_MAX_VERTICES,
     rangeBetween,
+    RELAY_MIN_SPACING_METERS,
+    relayLimitsFor,
+    relaySelectionOntoNetwork,
     removeVertexAt,
     routeEndpoints,
     SNAP_PRESETS,
@@ -16,7 +24,15 @@ import {
     snapSearchRadius,
     verticesWithinBounds,
 } from './routeEditing';
-import type { Coordinates, Position, VertexRef } from './routeEditing';
+import type {
+    Coordinates,
+    Position,
+    PropagationDirection,
+    PropagationLimits,
+    RelayLimits,
+    StreetLookup,
+    VertexRef,
+} from './routeEditing';
 
 /** A deep copy, so a test asserting non-mutation cannot be fooled by the fixture itself. */
 function snapshot(coordinates: Coordinates): Coordinates {
@@ -804,5 +820,967 @@ describe('snapSample', () => {
         expect(snapSample(run(3), refs(3), { segment: 0, index: 99 })).toEqual(
             [],
         );
+    });
+});
+
+describe('longitudeScale', () => {
+    test('shrinks towards the poles, which is why degrees are not distances', () => {
+        // The reason the whole feature measures in metres. One degree of
+        // longitude is 5% shorter in Santa Cruz than at the equator and 43%
+        // shorter at 60 north, so a limit left in degrees would be a different
+        // limit on every route in the city.
+        expect(longitudeScale(0)).toBeCloseTo(1, 6);
+        expect(longitudeScale(-17.78)).toBeCloseTo(0.952, 3);
+        expect(longitudeScale(60)).toBeCloseTo(0.5, 3);
+    });
+
+    test('treats the two hemispheres the same, since only the magnitude matters', () => {
+        expect(longitudeScale(-17.78)).toBeCloseTo(longitudeScale(17.78), 10);
+    });
+
+    test('never returns zero, which would divide by zero on the way back', () => {
+        // cos(90 deg) is 0, and the walk divides by this to turn a measured
+        // position back into a real longitude.
+        expect(longitudeScale(90)).toBeGreaterThan(0);
+        expect(longitudeScale(-90)).toBeGreaterThan(0);
+        expect(longitudeScale(1000)).toBeGreaterThan(0);
+    });
+});
+
+describe('propagationLimitsFor', () => {
+    test('takes the offset from the preset and nothing else', () => {
+        // One number the reviewer calibrates, deliberately. A second setting
+        // here would be a second thing to tune with no visible reason to
+        // disagree with the threshold they just chose.
+        expect(propagationLimitsFor(25)).toEqual({
+            maxOffset: 25,
+            maxArc: PROPAGATION_MAX_ARC_METERS,
+            maxVertices: PROPAGATION_MAX_VERTICES,
+        });
+    });
+
+    test('rides the threshold when the preset changes', () => {
+        expect(
+            propagationLimitsFor(SNAP_PRESETS.subtle.threshold).maxOffset,
+        ).toBe(12);
+        expect(
+            propagationLimitsFor(SNAP_PRESETS.aggressive.threshold).maxOffset,
+        ).toBe(50);
+    });
+});
+
+/**
+ * Fixtures for the walk, all in Santa Cruz at about -17.78.
+ *
+ * A degree of longitude there is ~106 000 m, so a thousandth of a degree is
+ * about 106 m and a ten-thousandth about 10.6 m. The route sits 11 m south of
+ * the centreline, which is a real offset on a real route � the imported data
+ * averages 3.6 m from a centreline with a p90 of 8.2 m � and comfortably inside
+ * the 25 m the normal preset allows.
+ */
+describe('propagateAlongStreet', () => {
+    const CENTRELINE_LAT = -17.78;
+
+    /**
+     * A straight street running east, `segments` segments of about 106 m.
+     *
+     * Latitude is a parameter rather than fixed because one of the cases below
+     * is about what the same number of degrees means in different places, and
+     * that is only a question if the street and the route are compared at the
+     * same latitude.
+     */
+    const street = (
+        segments: number,
+        latitude = CENTRELINE_LAT,
+    ): Coordinates => [
+        Array.from({ length: segments + 1 }, (_, i) => [
+            -63.18 + i * 0.001,
+            latitude,
+        ]),
+    ];
+
+    /** The default fixture: a 5-vertex route running east beside the street. */
+    const route = (): Coordinates => [
+        [
+            [-63.181, CENTRELINE_LAT - 0.0001],
+            [-63.18, CENTRELINE_LAT - 0.0001],
+            // The dropped vertex, already snapped onto the centreline. The walk
+            // starts from the geometry that carries the snap, so this is what it
+            // always sees.
+            [-63.179, CENTRELINE_LAT],
+            [-63.178, CENTRELINE_LAT - 0.0001],
+            [-63.177, CENTRELINE_LAT - 0.0001],
+        ],
+    ];
+
+    const REFERENCE: VertexRef = { segment: 0, index: 2 };
+    const limits = (
+        over: Partial<PropagationLimits> = {},
+    ): PropagationLimits => ({
+        ...propagationLimitsFor(25),
+        ...over,
+    });
+
+    // The centreline is required rather than defaulted, so that a case testing
+    // what happens without one can actually pass "without one" instead of
+    // quietly getting a street.
+    const walk = (
+        coordinates: Coordinates,
+        centreline: Coordinates | null,
+        direction: PropagationDirection = 1,
+        over: Partial<PropagationLimits> = {},
+        reference: VertexRef = REFERENCE,
+    ) =>
+        propagateAlongStreet(
+            coordinates,
+            reference,
+            centreline,
+            direction,
+            limits(over),
+        );
+
+    test('pulls the following vertices onto the centreline', () => {
+        const result = walk(route(), street(3));
+
+        // Two ahead, both landing on the street rather than 11 m south of it.
+        expect(result.moved).toEqual([
+            { segment: 0, index: 3 },
+            { segment: 0, index: 4 },
+        ]);
+        expect(result.coordinates[0][3][1]).toBeCloseTo(CENTRELINE_LAT, 9);
+        expect(result.coordinates[0][4][1]).toBeCloseTo(CENTRELINE_LAT, 9);
+    });
+
+    test('leaves the dropped vertex and everything behind it alone', () => {
+        const result = walk(route(), street(3));
+
+        // Forward only. The walk is asked for one direction and takes one, which
+        // is what lets the caller run both without them interfering.
+        expect(result.coordinates[0][0]).toEqual([
+            -63.181,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+        expect(result.coordinates[0][1]).toEqual([
+            -63.18,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+        expect(result.coordinates[0][2]).toEqual([-63.179, CENTRELINE_LAT]);
+    });
+
+    test('walks backwards, for the kink behind the drop', () => {
+        const result = walk(route(), street(3), -1);
+
+        // One behind, and then the street runs out: the vertex at index 0 is
+        // 106 m west of where the centreline begins.
+        expect(result.moved).toEqual([{ segment: 0, index: 1 }]);
+        expect(result.coordinates[0][1][1]).toBeCloseTo(CENTRELINE_LAT, 9);
+    });
+
+    test('never folds a vertex back to the near end of the street', () => {
+        // The case the whole windowed search exists for. A plain "closest point
+        // on the street" would answer chainage 0 for the vertex at index 4, and
+        // every drop on a long route would scribble the geometry back over
+        // itself. Here the reference is at the far end and the next vertex sits
+        // beside the near end, so the only thing the walk may consider is the
+        // single point where the street runs out � 318 m away, and refused.
+        const folded: Coordinates = [
+            [
+                [-63.18, CENTRELINE_LAT],
+                [-63.179, CENTRELINE_LAT],
+                [-63.178, CENTRELINE_LAT],
+                [-63.177, CENTRELINE_LAT],
+                [-63.18, CENTRELINE_LAT - 0.0001],
+            ],
+        ];
+
+        const result = walk(folded, street(3), 1, {}, { segment: 0, index: 3 });
+
+        expect(result.moved).toEqual([]);
+        expect(result.coordinates).toEqual(folded);
+    });
+
+    test('stops at the first vertex too far off the centreline', () => {
+        // The route announcing it has left this street � a turn, or the end of
+        // the block. Everything past it is a different street's business, so the
+        // vertices after it are left alone even though they are perfectly placed.
+        const turning: Coordinates = [
+            [
+                [-63.179, CENTRELINE_LAT],
+                [-63.178, CENTRELINE_LAT - 0.01],
+                [-63.177, CENTRELINE_LAT],
+            ],
+        ];
+
+        const result = walk(
+            turning,
+            street(3),
+            1,
+            {},
+            {
+                segment: 0,
+                index: 0,
+            },
+        );
+
+        expect(result.moved).toEqual([]);
+        expect(result.coordinates).toEqual(turning);
+    });
+
+    test('stops at the end of the way, which is the honest limit', () => {
+        // Two segments end 212 m along. The route's fourth vertex sits exactly
+        // there and is taken; the fifth is a further 106 m west, past the end of
+        // the way, and is left alone. A named street made of 38 ways is corrected
+        // one way at a time, and this is what that looks like from inside.
+        const result = walk(route(), street(2));
+
+        expect(result.moved).toEqual([{ segment: 0, index: 3 }]);
+        expect(result.coordinates[0][4]).toEqual([
+            -63.177,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+    });
+
+    test('never crosses a segment boundary', () => {
+        // A route's segments are not a continuation of each other. The second
+        // vertex of segment 0 is beside the street and is taken, and then the
+        // walk stops — even though segment 1's vertices are equally close to it
+        // and would otherwise be next in line.
+        const split: Coordinates = [
+            [
+                [-63.179, CENTRELINE_LAT],
+                [-63.178, CENTRELINE_LAT - 0.0001],
+            ],
+            [
+                [-63.177, CENTRELINE_LAT - 0.0001],
+                [-63.176, CENTRELINE_LAT - 0.0001],
+            ],
+        ];
+
+        const result = walk(split, street(3), 1, {}, { segment: 0, index: 0 });
+
+        expect(result.moved).toEqual([{ segment: 0, index: 1 }]);
+        expect(result.coordinates[1]).toEqual([
+            [-63.177, CENTRELINE_LAT - 0.0001],
+            [-63.176, CENTRELINE_LAT - 0.0001],
+        ]);
+    });
+
+    test('stays inside the part of a split street it started in', () => {
+        // A road can be stored as more than one part with a real gap. Stepping
+        // over that gap would lay the route across whatever is in it.
+        const twoParts: Coordinates = [
+            [
+                [-63.179, CENTRELINE_LAT],
+                [-63.178, CENTRELINE_LAT],
+            ],
+            [
+                [-63.17, CENTRELINE_LAT],
+                [-63.169, CENTRELINE_LAT],
+            ],
+        ];
+
+        const result = walk(route(), twoParts);
+
+        expect(result.moved).toEqual([{ segment: 0, index: 3 }]);
+        expect(result.coordinates[0][3][1]).toBeCloseTo(CENTRELINE_LAT, 9);
+    });
+
+    test('honours the vertex cap even when every vertex qualifies', () => {
+        const result = walk(route(), street(3), 1, { maxVertices: 1 });
+
+        expect(result.moved).toEqual([{ segment: 0, index: 3 }]);
+    });
+
+    test('honours the arc cap, which bounds a long straight', () => {
+        // Ten segments is about a kilometre of street and the next vertex is only
+        // 106 m along it, so 250 m of arc would take it. At 30 m the walk cannot
+        // even reach it: the closest point inside the window is 76 m from the
+        // vertex, which is further than the offset limit as well. A route running
+        // exactly along a street is the case that would otherwise be pulled as
+        // far as the reviewer cared to look.
+        expect(walk(route(), street(10), 1, { maxArc: 250 }).moved).toEqual([
+            { segment: 0, index: 3 },
+            { segment: 0, index: 4 },
+        ]);
+        expect(walk(route(), street(10), 1, { maxArc: 30 }).moved).toEqual([]);
+    });
+
+    test('a limit of zero takes nothing, and a negative one is not a licence', () => {
+        // The guard the 'off' preset gets for free by returning null: a zero
+        // threshold would otherwise still take a vertex dropped at exactly zero.
+        expect(walk(route(), street(3), 1, { maxOffset: 0 }).moved).toEqual([]);
+        expect(walk(route(), street(3), 1, { maxOffset: -5 }).moved).toEqual(
+            [],
+        );
+        expect(walk(route(), street(3), 1, { maxVertices: 0 }).moved).toEqual(
+            [],
+        );
+    });
+
+    test('does not mutate the route it was given', () => {
+        // A walk that took two vertices is the case worth asserting: the one that
+        // takes none returns the input by identity and cannot mutate it.
+        const before = route();
+        const copy = snapshot(before);
+
+        walk(before, street(3));
+
+        expect(before).toEqual(copy);
+    });
+
+    test('returns the input untouched when nothing is taken', () => {
+        // Most drops propagate nothing, and a route of five hundred vertices
+        // should not be deep-copied to say so. Identity is asserted rather than
+        // equality because it is the cheaper contract callers rely on.
+        const untouched = route();
+
+        // One segment of street puts the reference at its far end, so the very
+        // next vertex is out of reach.
+        expect(walk(untouched, street(1), 1).coordinates).toBe(untouched);
+        expect(walk(untouched, null).coordinates).toBe(untouched);
+    });
+
+    test('gives up rather than guess when there is no street to walk', () => {
+        const before = route();
+
+        // A response with no usable centreline is a normal outcome, not an
+        // error: the drop still snapped, and the street it snapped to is on
+        // screen either way.
+        expect(walk(before, null).moved).toEqual([]);
+        expect(walk(before, []).moved).toEqual([]);
+        expect(walk(before, [[[0, 0]]]).moved).toEqual([]);
+    });
+
+    test('gives up when the reference does not exist', () => {
+        // A stale ref costs the propagation, not a walk from the wrong place.
+        expect(
+            walk(
+                route(),
+                street(3),
+                1,
+                {},
+                {
+                    segment: 0,
+                    index: 99,
+                },
+            ).moved,
+        ).toEqual([]);
+        expect(
+            walk(
+                route(),
+                street(3),
+                1,
+                {},
+                {
+                    segment: 7,
+                    index: 0,
+                },
+            ).moved,
+        ).toEqual([]);
+    });
+
+    test('walks from the vertex it was pointed at, not a fixed index', () => {
+        // Same route, different drop. Starting from index 1 walks two vertices
+        // forward; the ones behind are another walk's business.
+        const result = walk(
+            route(),
+            street(3),
+            1,
+            {},
+            {
+                segment: 0,
+                index: 1,
+            },
+        );
+
+        expect(result.moved).toEqual([
+            { segment: 0, index: 2 },
+            { segment: 0, index: 3 },
+            { segment: 0, index: 4 },
+        ]);
+    });
+
+    test('measures the offset in metres, not in degrees', () => {
+        // A north-south street, so the vertex's offset from it is a *longitude*
+        // difference — which is the one that shrinks with latitude. The same
+        // 0.0005 deg is 53 m in Santa Cruz and 32 m at 55 north, so a 40 m limit
+        // takes the vertex at one latitude and refuses it at the other. Read in
+        // degrees the walk would behave differently on every route in the city
+        // for no reason a reviewer could see, which is what the metric frame is
+        // for.
+        const northSouth = (latitude: number): Coordinates => [
+            Array.from({ length: 4 }, (_, i) => [-63.18, latitude + i * 0.001]),
+        ];
+        const offsetEast = (latitude: number): Coordinates => [
+            [
+                [-63.18, latitude],
+                [-63.1795, latitude + 0.001],
+            ],
+        ];
+
+        const start: VertexRef = { segment: 0, index: 0 };
+        const limit = { maxOffset: 40 };
+
+        expect(
+            walk(
+                offsetEast(CENTRELINE_LAT),
+                northSouth(CENTRELINE_LAT),
+                1,
+                limit,
+                start,
+            ).moved,
+        ).toEqual([]);
+        expect(
+            walk(offsetEast(55), northSouth(55), 1, limit, start).moved,
+        ).toEqual([{ segment: 0, index: 1 }]);
+    });
+});
+
+describe('relayLimitsFor', () => {
+    test('takes the offset from the preset and the spacing from the project', () => {
+        // The offset is the reviewer's own calibration; the spacing is the ten
+        // metres the editor already refuses to add a vertex within, so neither is
+        // a second number to tune.
+        expect(relayLimitsFor(25)).toEqual({
+            maxOffset: 25,
+            minSpacing: RELAY_MIN_SPACING_METERS,
+        });
+    });
+
+    test('rides the threshold when the preset changes', () => {
+        expect(relayLimitsFor(SNAP_PRESETS.subtle.threshold).maxOffset).toBe(
+            12,
+        );
+        expect(
+            relayLimitsFor(SNAP_PRESETS.aggressive.threshold).maxOffset,
+        ).toBe(50);
+    });
+});
+
+/**
+ * Fixtures for the re-lay, all in Santa Cruz at about -17.78.
+ *
+ * A degree of longitude is ~106 000 m there, so a thousandth of a degree is
+ * about 106 m. Streets run east-west unless stated otherwise.
+ */
+describe('relaySelectionOntoNetwork', () => {
+    const LAT = -17.78;
+
+    /**
+     * A straight street running east, `segments` of about 106 m each, from
+     * `fromLng`.
+     *
+     * The start is a parameter because a route that runs past the end of its
+     * street is a different case from one that does not, and mixing them up
+     * makes a test assert the clamping behaviour while claiming to assert
+     * something else.
+     */
+    const street = (segments: number, fromLng = -63.18): Coordinates => [
+        Array.from({ length: segments + 1 }, (_, i) => [
+            fromLng + i * 0.001,
+            LAT,
+        ]),
+    ];
+
+    /** A north-south street crossing the first at the anchor. */
+    const crossStreet: Coordinates = [
+        Array.from({ length: 11 }, (_, i) => [-63.18, LAT - 0.005 + i * 0.001]),
+    ];
+
+    const lookup = (
+        line: Coordinates | null,
+        over: Partial<StreetLookup> = {},
+    ): StreetLookup => ({
+        roadId: 1,
+        name: 'Calle Mercado',
+        votes: 3,
+        distance: 4,
+        line,
+        ...over,
+    });
+
+    const limits = (over: Partial<RelayLimits> = {}): RelayLimits => ({
+        ...relayLimitsFor(25),
+        ...over,
+    });
+
+    const selection = (...indices: number[]): VertexRef[] =>
+        indices.map((index) => ({ segment: 0, index }));
+
+    const run = (
+        coordinates: Coordinates,
+        refs: VertexRef[],
+        lookups: StreetLookup[],
+        over: Partial<RelayLimits> = {},
+    ) => relaySelectionOntoNetwork(coordinates, refs, lookups, limits(over));
+
+    test('moves a straight run onto the street it runs along', () => {
+        // The case the whole feature exists for: points 11 m south of a road,
+        // dragged into a line, and the network says what the shape should be.
+        const line: Coordinates = [
+            [
+                [-63.181, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+                [-63.179, LAT - 0.0001],
+                [-63.178, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(
+            line,
+            selection(0, 1, 2, 3),
+            [0, 1, 2, 3].map(() => lookup(street(6, -63.182))),
+        );
+
+        expect(result.moved).toHaveLength(4);
+
+        // Compared with a tolerance rather than for equality, because every
+        // position makes a round trip through the metric frame — scaled by the
+        // cosine of the latitude and back — and that leaves the last few bits
+        // different. It is worth stating here so a future reader does not take
+        // the noise for drift: it is a few times 1e-15 of a degree, which is a
+        // ten-thousandth of a millimetre.
+        for (const position of result.coordinates[0]) {
+            expect(position[1]).toBeCloseTo(LAT, 9);
+        }
+
+        // The lngs are untouched, because the route was only ever displaced
+        // sideways — the street runs east and so does the route. That is the
+        // difference between a re-lay and a drag: nothing slides along the road.
+        for (const [i, expected] of [
+            -63.181, -63.18, -63.179, -63.178,
+        ].entries()) {
+            expect(result.coordinates[0][i][0]).toBeCloseTo(expected, 9);
+        }
+    });
+
+    test('re-lays in route order however the selection arrived', () => {
+        // A box gesture has no order of its own, and both invariants are
+        // statements about order, so an unsorted selection would be meaningless.
+        const line: Coordinates = [
+            [
+                [-63.181, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+                [-63.179, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(
+            line,
+            selection(2, 0, 1),
+            [0, 1, 2].map(() => lookup(street(4))),
+        );
+
+        expect(result.moved.map((ref) => ref.index)).toEqual([0, 1, 2]);
+        expect(result.coordinates[0].map((p) => p[1])).toEqual([LAT, LAT, LAT]);
+    });
+
+    test('lets a corner be two streets', () => {
+        // The reason this is per vertex rather than per selection. The point
+        // before the corner belongs to the street the route came along, the point
+        // after belongs to the one it turned onto, and neither is wrong � so a
+        // rule that demanded one street for the whole selection would have to be
+        // wrong about one of them.
+        const line: Coordinates = [
+            [
+                [-63.181, LAT],
+                [-63.18, LAT],
+                [-63.18, LAT + 0.0001],
+                [-63.18, LAT + 0.001],
+            ],
+        ];
+
+        const result = run(line, selection(0, 1, 2, 3), [
+            lookup(street(4), { roadId: 1, name: 'Calle Mercado' }),
+            lookup(street(4), { roadId: 1, name: 'Calle Mercado' }),
+            lookup(crossStreet, { roadId: 2, name: 'Av. Ca�oto' }),
+            lookup(crossStreet, { roadId: 2, name: 'Av. Ca�oto' }),
+        ]);
+
+        expect(result.moved).toHaveLength(4);
+        expect(result.streets.map((s) => s.name)).toEqual([
+            'Calle Mercado',
+            'Av. Ca�oto',
+        ]);
+        expect(result.streets.map((s) => s.placed)).toEqual([2, 2]);
+    });
+
+    test('exempts a corner from the minimum spacing', () => {
+        // The rule is per street precisely so this is not a violation. Where a
+        // route turns, the street it came along ends and the next one begins a
+        // metre or two away, and enforcing ten metres across that would shove
+        // both vertices down their own streets and flatten every turn in the
+        // selection into a rounded corner that is not on the map.
+        //
+        // The east street starts west of the corner so the vertex before the turn
+        // is not already sitting on its west end, which would make this assert
+        // clamping rather than the exemption.
+        const line: Coordinates = [
+            [
+                [-63.181, LAT],
+                [-63.18, LAT],
+                [-63.18, LAT + 0.00001],
+            ],
+        ];
+
+        const result = run(line, selection(0, 1, 2), [
+            lookup(street(4, -63.182), { roadId: 1 }),
+            lookup(street(4, -63.182), { roadId: 1 }),
+            lookup(crossStreet, { roadId: 2 }),
+        ]);
+
+        // Vertex 0 is 106 m along its street and vertex 1 is at the corner, so
+        // they are 106 m apart and the ten-metre rule had nothing to do. Vertex 2
+        // is one metre north of vertex 1 on a different street, and stayed there.
+        expect(result.coordinates[0][0][0]).toBeCloseTo(-63.181, 6);
+        expect(result.coordinates[0][1][0]).toBeCloseTo(-63.18, 6);
+        expect(result.coordinates[0][2][0]).toBeCloseTo(-63.18, 9);
+        expect(result.coordinates[0][2][1]).toBeCloseTo(LAT + 0.00001, 9);
+        // The two streets are reported separately, which is what makes the corner
+        // legible afterwards: one street did not swallow the turn.
+        expect(result.streets.map((s) => s.placed)).toEqual([2, 1]);
+    });
+
+    test('keeps two vertices on one street from landing on the same spot', () => {
+        // A reviewer selecting two vertices that sit on top of each other, or a
+        // street that doubles back near itself, both produce this. Coincident
+        // points are the failure the minimum exists to prevent: they draw as one
+        // and ST_DumpPoints reports a position for a stop that is not there.
+        const line: Coordinates = [
+            [
+                [-63.18, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(line, selection(0, 1), [
+            lookup(street(4)),
+            lookup(street(4)),
+        ]);
+
+        const a = result.coordinates[0][0];
+        const b = result.coordinates[0][1];
+        const apart =
+            Math.hypot(a[0] - b[0], a[1] - b[1]) *
+            111320 *
+            Math.cos((LAT * Math.PI) / 180);
+
+        expect(apart).toBeGreaterThan(RELAY_MIN_SPACING_METERS - 1);
+    });
+
+    test('never places a vertex behind one already on the same street', () => {
+        // The cursor, and why it is per street rather than global: a route that
+        // leaves a street and rejoins it further along must not be able to send
+        // its second visit backwards down the road it is already on.
+        //
+        // Three vertices on a five-segment street: two travelling east, the third
+        // back west past the start. The third has nowhere to go that is not behind
+        // the first, so it is refused to move backwards and clamped to the west
+        // end instead — which is a coincidence with vertex 1's start, not a
+        // reversal.
+        const line: Coordinates = [
+            [
+                [-63.182, LAT - 0.0001],
+                [-63.181, LAT - 0.0001],
+                [-63.183, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(line, selection(0, 1, 2), [
+            lookup(street(5, -63.182)),
+            lookup(street(5, -63.182)),
+            lookup(street(5, -63.182)),
+        ]);
+
+        expect(result.moved).toHaveLength(3);
+        // Monotone: no vertex is west of the one before it on the same street.
+        expect(result.coordinates[0][1][0]).toBeGreaterThanOrEqual(
+            result.coordinates[0][0][0],
+        );
+        expect(result.coordinates[0][2][0]).toBeGreaterThanOrEqual(
+            result.coordinates[0][1][0],
+        );
+        // And it did not slide back down the road to reach the west end it asked
+        // for. It went *forward* to the nearest position the cursor allows, which
+        // is the spacing rule doing its job rather than the clamping: putting it
+        // at the west end would have been behind vertex 1, and behind is the one
+        // thing a cursor exists to prevent.
+        const gap =
+            (result.coordinates[0][2][0] - result.coordinates[0][1][0]) *
+            111320 *
+            Math.cos((LAT * Math.PI) / 180);
+
+        expect(gap).toBeGreaterThan(RELAY_MIN_SPACING_METERS - 1);
+        expect(gap).toBeLessThan(RELAY_MIN_SPACING_METERS + 15);
+    });
+
+    test('leaves a vertex alone when no street is within range', () => {
+        // Thirty-six vertices across nine codes are in exactly this position: the
+        // imported network does not reach them. Nothing is invented for one, and
+        // it does not move any street's cursor either.
+        const line: Coordinates = [
+            [
+                [-63.181, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+                [-63.179, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(line, selection(0, 1, 2), [
+            lookup(street(4)),
+            lookup(street(4), { distance: 400 }),
+            lookup(street(4)),
+        ]);
+
+        expect(result.moved.map((ref) => ref.index)).toEqual([0, 2]);
+        expect(result.unmatched).toBe(1);
+        expect(result.coordinates[0][1]).toEqual([-63.18, LAT - 0.0001]);
+    });
+
+    test('leaves a vertex alone when the response carried no geometry', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, LAT - 0.0001],
+                [-63.179, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(line, selection(0, 1), [
+            lookup(street(4)),
+            lookup(null),
+        ]);
+
+        expect(result.moved.map((ref) => ref.index)).toEqual([0]);
+        expect(result.unmatched).toBe(1);
+    });
+
+    test('reports the separation it actually achieved, not the one it asked for', () => {
+        // A street too short for the vertices put on it cannot give them ten
+        // metres each. Printing the target when the result was four metres would
+        // be a claim about the geometry the reviewer has no way to check.
+        const line: Coordinates = [
+            [
+                [-63.181, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+                [-63.179, LAT - 0.0001],
+                [-63.178, LAT - 0.0001],
+                [-63.177, LAT - 0.0001],
+            ],
+        ];
+
+        // A single 106 m segment for five vertices: 10 m each fits exactly, and a
+        // shorter one does not.
+        const tight: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.179, LAT],
+            ],
+        ];
+
+        const roomy = run(
+            line,
+            selection(0, 1, 2, 3, 4),
+            [0, 1, 2, 3, 4].map(() => lookup(tight)),
+        );
+
+        expect(roomy.streets).toHaveLength(1);
+        expect(roomy.streets[0].placed).toBe(5);
+        // Every vertex lands on the 106 m way, so the tightest pair is at its
+        // ends and the number is reported rather than assumed.
+        expect(roomy.streets[0].closestSpacing).not.toBeNull();
+        expect(roomy.streets[0].closestSpacing).toBeLessThanOrEqual(
+            RELAY_MIN_SPACING_METERS,
+        );
+    });
+
+    test('has no separation to report while only one vertex is on a street', () => {
+        const line: Coordinates = [[[-63.18, LAT - 0.0001]]];
+
+        const result = run(line, selection(0), [lookup(street(4))]);
+
+        expect(result.moved).toHaveLength(1);
+        expect(result.streets[0].closestSpacing).toBeNull();
+    });
+
+    test('does not mutate the route it was given', () => {
+        const line: Coordinates = [
+            [
+                [-63.181, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+            ],
+        ];
+        const copy = snapshot(line);
+
+        run(line, selection(0, 1), [lookup(street(4)), lookup(street(4))]);
+
+        expect(line).toEqual(copy);
+    });
+
+    test('returns the input untouched when nothing is moved', () => {
+        // Most selections are not fully on-network, and a route of five hundred
+        // vertices should not be deep-copied to say so.
+        const line: Coordinates = [[[-63.18, LAT - 0.0001]]];
+
+        expect(run(line, selection(0), []).coordinates).toBe(line);
+        expect(run(line, selection(), [lookup(street(4))]).coordinates).toBe(
+            line,
+        );
+        expect(
+            run(line, selection(0), [lookup(street(4), { distance: 900 })])
+                .coordinates,
+        ).toBe(line);
+    });
+
+    test('gives up rather than guess when a reference does not exist', () => {
+        // A stale ref costs the re-lay, not a walk from the wrong place.
+        const line: Coordinates = [[[-63.18, LAT - 0.0001]]];
+
+        expect(run(line, selection(9), [lookup(street(4))]).moved).toEqual([]);
+        expect(
+            run(line, [{ segment: 4, index: 0 }], [lookup(street(4))]).moved,
+        ).toEqual([]);
+    });
+
+    test('never crosses a segment boundary while re-laying', () => {
+        // A route's segments are not a continuation of each other, and the
+        // vertices in the next one are somebody else's route.
+        const split: Coordinates = [
+            [
+                [-63.181, LAT - 0.0001],
+                [-63.18, LAT - 0.0001],
+            ],
+            [
+                [-63.179, LAT - 0.0001],
+                [-63.178, LAT - 0.0001],
+            ],
+        ];
+
+        const result = run(
+            split,
+            [
+                { segment: 0, index: 0 },
+                { segment: 0, index: 1 },
+                { segment: 1, index: 0 },
+                { segment: 1, index: 1 },
+            ],
+            [0, 1, 2, 3].map(() => lookup(street(4))),
+        );
+
+        // The two parts are still two parts, and each one's own vertices moved
+        // within it. The reply was matched by position in the sorted selection,
+        // which is what keeps a street from being applied across the boundary.
+        expect(split.length).toBe(2);
+        expect(result.coordinates.length).toBe(2);
+        expect(result.moved).toHaveLength(4);
+    });
+});
+
+describe('the walk stays inside the street it is given', () => {
+    const LAT = -17.78;
+    const street: Coordinates = [
+        Array.from({ length: 6 }, (_, i) => [-63.18 + i * 0.001, LAT]),
+    ];
+
+    test('clamps a vertex that sits before the start of the way to the start', () => {
+        // A regression, and one worth naming: the projection helper reports its
+        // parameter unclamped on purpose, because an overshoot is how a click is
+        // placed on the right side of a vertex. Used inside a window that
+        // unclamped answer put the vertex 106 m *before* the beginning of the
+        // street, which put the cursor behind the way and made the spacing rule
+        // measure the wrong distance. The distance was never wrong, so every test
+        // that only checked a refusal passed while this was broken.
+        const line: Coordinates = [
+            [
+                [-63.182, LAT - 0.0001],
+                [-63.181, LAT - 0.0001],
+            ],
+        ];
+
+        const result = relaySelectionOntoNetwork(
+            line,
+            [
+                { segment: 0, index: 0 },
+                { segment: 0, index: 1 },
+            ],
+            [
+                {
+                    roadId: 1,
+                    name: 'Calle Mercado',
+                    votes: 2,
+                    distance: 11,
+                    line: street,
+                },
+                {
+                    roadId: 1,
+                    name: 'Calle Mercado',
+                    votes: 2,
+                    distance: 11,
+                    line: street,
+                },
+            ],
+            relayLimitsFor(25),
+        );
+
+        // Both are on the street, and the one that was west of its start is at
+        // the start rather than past it.
+        for (const position of result.coordinates[0]) {
+            expect(position[1]).toBeCloseTo(LAT, 9);
+        }
+
+        expect(result.coordinates[0][0][0]).toBeCloseTo(-63.18, 9);
+        // The second vertex is not at the start either: the spacing rule pushes it
+        // ten metres along. What matters is the gap, which is the observable
+        // symptom of the bug — ten metres because the rule worked, not a hundred
+        // and six because the cursor had been left at a negative chainage.
+        const gap =
+            (result.coordinates[0][1][0] - result.coordinates[0][0][0]) *
+            111320 *
+            Math.cos((LAT * Math.PI) / 180);
+
+        expect(gap).toBeGreaterThan(9);
+        expect(gap).toBeLessThan(12);
+    });
+
+    test('never returns a position off the end of the way', () => {
+        // The same clamp at the other end, and the case the arc cap depends on.
+        const long: Coordinates = [
+            Array.from({ length: 6 }, (_, i) => [-63.18 + i * 0.001, LAT]),
+        ];
+        const line: Coordinates = [
+            [
+                [-63.18, LAT - 0.0001],
+                [-63.175, LAT - 0.0001],
+            ],
+        ];
+
+        const result = relaySelectionOntoNetwork(
+            line,
+            [
+                { segment: 0, index: 0 },
+                { segment: 0, index: 1 },
+            ],
+            [
+                {
+                    roadId: 1,
+                    name: 'Calle Mercado',
+                    votes: 2,
+                    distance: 11,
+                    line: long,
+                },
+                {
+                    roadId: 1,
+                    name: 'Calle Mercado',
+                    votes: 2,
+                    distance: 11,
+                    line: long,
+                },
+            ],
+            relayLimitsFor(25),
+        );
+
+        // The street ends at -63.175, so nothing can be placed beyond it.
+        for (const position of result.coordinates[0]) {
+            expect(position[0]).toBeLessThanOrEqual(-63.175 + 1e-9);
+        }
     });
 });

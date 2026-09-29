@@ -45,7 +45,9 @@ Both commands have class-level docblocks with algorithm details.
 - **Layouts**: Assigned by page name in `app.ts`: `auth/*` → AuthLayout, `settings/*` → AppLayout+SettingsLayout, `Welcome` → none, else → AppLayout.
 - **Routes**: `routes/web.php`, `routes/settings.php`, `routes/console.php`. Use named routes.
 - **`@` alias**: `resources/js/` (tsconfig + Inertia config). `vitest.config.ts` declares it too, since a test runner does not read tsconfig.
-- **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `snapWire` and `snapTransport` (the lat/lng boundary and the street lookup), `mapView`, `undoStack`. If logic is worth testing, it belongs here rather than in a component.
+- **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `snapWire` and `snapTransport` (the lat/lng boundary and the street lookup), `mapView`, `undoStack`.
+- **`resources/js/composables/`**: Vue-aware shared state — `useRouteGeometry` (route editing state, shared by the create and edit pages), `useSnapPreset`, `useAppearance`. No DOM, so testable under `environment: 'node'`.
+- If logic is worth testing, it belongs in one of those two rather than in a component.
 - **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests).
 - **SSR**: Enabled. Dev URL at `127.0.0.1:13714` (config/inertia.php).
 - **Auth**: Laravel Fortify — features: registration, password reset, email verification, 2FA, passkeys.

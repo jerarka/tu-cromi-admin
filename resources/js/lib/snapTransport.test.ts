@@ -5,7 +5,9 @@ import type { SnapLookup } from '@/lib/snapWire';
 import {
     SNAP_LOOKUP_TIMEOUT_MS,
     csrfToken,
+    describeRelay,
     describeSnap,
+    lookupRelayStreets,
     lookupSnapStreets,
 } from './snapTransport';
 
@@ -54,6 +56,7 @@ describe('describeSnap', () => {
         name,
         votes,
         samples,
+        line: null,
     });
 
     test('names the street when the moved vertices are scattered', () => {
@@ -89,6 +92,41 @@ describe('describeSnap', () => {
 
     test('falls back to a description when the street has no name', () => {
         expect(describeSnap(lookup(1, 7, null))).toBe('unnamed street');
+    });
+
+    test('counts the vertices it pulled along, which the reviewer cannot see', () => {
+        // The whole point of saying it: nobody watched those vertices move, so a
+        // silent count is a count nobody is told.
+        expect(describeSnap(lookup(1, 7), 2)).toBe(
+            'Avenida Siempre Viva — 2 following vertices pulled along',
+        );
+    });
+
+    test('uses the singular for a single pulled vertex', () => {
+        expect(describeSnap(lookup(1, 7), 1)).toBe(
+            'Avenida Siempre Viva — 1 following vertex pulled along',
+        );
+    });
+
+    test('says nothing about propagation when none happened', () => {
+        // The default, and the case a snap with the feature off always takes. A
+        // "0 vertices pulled along" here would be noise on most drops.
+        expect(describeSnap(lookup(1, 7), 0)).toBe('Avenida Siempre Viva');
+        expect(describeSnap(lookup(1, 7))).toBe('Avenida Siempre Viva');
+    });
+
+    test('reports the votes and the pull together', () => {
+        // Both are true at once on a crossing with propagation on, and dropping
+        // either would hide a decision the reviewer made.
+        expect(describeSnap(lookup(5, 7), 3)).toBe(
+            'Avenida Siempre Viva — 5 of 7 moved vertices are on it; 3 following vertices pulled along',
+        );
+    });
+
+    test('reports the pull on an unnamed street too', () => {
+        expect(describeSnap(lookup(1, 7, null), 2)).toBe(
+            'unnamed street — 2 following vertices pulled along',
+        );
     });
 });
 
@@ -255,5 +293,217 @@ describe('lookupSnapStreets', () => {
 
         expect(signal).toBeInstanceOf(AbortSignal);
         expect(SNAP_LOOKUP_TIMEOUT_MS).toBeGreaterThan(0);
+    });
+});
+
+describe('describeRelay', () => {
+    const street = (
+        name: string | null,
+        placed: number,
+        closestSpacing: number | null = null,
+    ) => ({ roadId: 1, name, placed, closestSpacing });
+
+    test('names every street and how many points went onto it', () => {
+        // The only claim the tool actually makes, and the only one a reviewer can
+        // check against the map: "18 points re-laid" says something happened,
+        // "Calle Mercado x6, Av. Ca�oto x5" can be held against what they see.
+        expect(
+            describeRelay(
+                [street('Calle Mercado', 6), street('Avenida Ca�oto', 5)],
+                0,
+            ),
+        ).toBe(
+            'Re-laid 11 points onto 2 streets: Calle Mercado x6, Avenida Ca�oto x5.',
+        );
+    });
+
+    test('uses the singular for one street', () => {
+        expect(describeRelay([street('Calle Mercado', 4)], 0)).toBe(
+            'Re-laid 4 points onto 1 street: Calle Mercado x4.',
+        );
+    });
+
+    test('counts a point per street, not per selection', () => {
+        // A re-lay is the one action that can use several streets, so the total
+        // has to be their sum. Reading it as the selection size would be a
+        // number the reviewer could not reconcile with anything on screen.
+        expect(
+            describeRelay(
+                [
+                    street('Calle Mercado', 3),
+                    street('Av. Ca�oto', 3),
+                    street('Calle M. Montero', 2),
+                ],
+                0,
+            ),
+        ).toContain('Re-laid 8 points onto 3 streets');
+    });
+
+    test('says an unnamed street is unnamed rather than skipping it', () => {
+        // Two thirds of the network has no name, and "unnamed street x3" is still
+        // information about where three vertices went.
+        expect(describeRelay([street(null, 3)], 0)).toBe(
+            'Re-laid 3 points onto 1 street: unnamed street x3.',
+        );
+    });
+
+    test('reports the points it could not place, and why', () => {
+        // Silence here would read as "all of them moved", which is the one thing
+        // a reviewer must not be left guessing about a change they did not drag.
+        expect(describeRelay([street('Calle Mercado', 3)], 2)).toBe(
+            'Re-laid 3 points onto 1 street: Calle Mercado x3, ' +
+                '2 left where they are: no street within range.',
+        );
+    });
+
+    test('uses the singular for a single unplaced point', () => {
+        expect(describeRelay([street('Calle Mercado', 3)], 1)).toContain(
+            '1 left where it is',
+        );
+    });
+
+    test('mentions the spacing only when it had to be reduced', () => {
+        // The target is ten metres. Saying so when it was achieved is noise, and
+        // saying nothing when it was not would leave a claim about the geometry
+        // the reviewer cannot check.
+        expect(describeRelay([street('Calle Mercado', 4, 40)], 0)).toBe(
+            'Re-laid 4 points onto 1 street: Calle Mercado x4.',
+        );
+
+        expect(describeRelay([street('Calle Mercado', 4, 10)], 0)).toBe(
+            'Re-laid 4 points onto 1 street: Calle Mercado x4.',
+        );
+
+        expect(describeRelay([street('Calle Mercado', 4, 4)], 0)).toBe(
+            'Re-laid 4 points onto 1 street: Calle Mercado x4 (closest 4 m apart).',
+        );
+    });
+
+    test('says so when nothing at all could be placed', () => {
+        // The outcome a reviewer most needs stated plainly, and the one a naive
+        // composition gets wrong: it reads "Re-laid 0 points onto 0 streets",
+        // which is both clumsy and a claim that work happened.
+        expect(describeRelay([], 3)).toBe(
+            'No selected point had a street within range. 3 left where they are.',
+        );
+        expect(describeRelay([], 1)).toBe(
+            'No selected point had a street within range. 1 left where it is.',
+        );
+        expect(describeRelay([], 0)).toBe('Nothing was selected.');
+    });
+});
+
+describe('lookupRelayStreets', () => {
+    const options = { threshold: 25 };
+    const points: Position[] = [
+        [-63.18, -17.78],
+        [-63.179, -17.78],
+    ];
+
+    const body = [
+        {
+            index: 0,
+            road_id: 501,
+            name: 'Calle Mercado',
+            highway: 'residential',
+            oneway: 'no',
+            votes: 2,
+            distance_m: 3.5,
+            geometry: {
+                type: 'MultiLineString',
+                coordinates: [
+                    [
+                        [-63.18, -17.78],
+                        [-63.179, -17.78],
+                    ],
+                ],
+            },
+        },
+    ];
+
+    const response = (status: number, payload: unknown = body): Response =>
+        ({
+            status,
+            ok: status >= 200 && status < 300,
+            json: async () => payload,
+        }) as Response;
+
+    let fetchMock: ReturnType<typeof vi.fn>;
+    let warn: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+        fetchMock = vi.fn().mockResolvedValue(response(200));
+        vi.stubGlobal('fetch', fetchMock);
+        warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    test('sends the points as lat and lng objects, in order', () => {
+        // The order is the contract on the way out as well as in: the reply is
+        // matched back by position, so a shuffled request would have every street
+        // applied to somebody else's vertex.
+        return lookupRelayStreets(points, options, 'XSRF-TOKEN=tok').then(
+            () => {
+                const init = fetchMock.mock.calls[0][1] as RequestInit;
+                const sent = JSON.parse(String(init.body));
+
+                expect(sent.points).toEqual([
+                    { lat: -17.78, lng: -63.18 },
+                    { lat: -17.78, lng: -63.179 },
+                ]);
+                expect(sent.threshold).toBe(25);
+            },
+        );
+    });
+
+    test('attaches the CSRF token, without which the lookup is a silent 419', () => {
+        return lookupRelayStreets(points, options, 'XSRF-TOKEN=tok123').then(
+            () => {
+                const init = fetchMock.mock.calls[0][1] as RequestInit;
+                const headers = init.headers as Record<string, string>;
+
+                expect(headers['X-XSRF-TOKEN']).toBe('tok123');
+            },
+        );
+    });
+
+    test('reads a list of streets back', () => {
+        return lookupRelayStreets(points, options, '').then((found) => {
+            expect(found).toHaveLength(1);
+            expect(found[0].name).toBe('Calle Mercado');
+            expect(found[0].line).not.toBeNull();
+        });
+    });
+
+    test('returns nothing when the server reports no PostGIS', async () => {
+        fetchMock.mockResolvedValue(response(404, null));
+
+        // The client has to leave the selection alone here rather than treat it as
+        // an answer, which is the whole contract of an empty result.
+        expect(await lookupRelayStreets(points, options, '')).toEqual([]);
+    });
+
+    test('warns about a broken lookup, which looks like a gap in the map', () => {
+        fetchMock.mockResolvedValue(response(419));
+
+        return lookupRelayStreets(points, options, '').then((found) => {
+            expect(found).toEqual([]);
+            expect(warn).toHaveBeenCalledWith('Road lookup failed', 419);
+        });
+    });
+
+    test('returns nothing when the request throws', async () => {
+        fetchMock.mockRejectedValue(new Error('offline'));
+
+        expect(await lookupRelayStreets(points, options, '')).toEqual([]);
+    });
+
+    test('asks about nothing without spending a request', async () => {
+        expect(await lookupRelayStreets([], options, '')).toEqual([]);
+        expect(fetchMock).not.toHaveBeenCalled();
     });
 });

@@ -1,7 +1,10 @@
 <script setup lang="ts">
+import { Waves } from '@lucide/vue';
 import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
+import { Button } from '@/components/ui/button';
+import { usePropagation } from '@/composables/usePropagation';
 import { consumePreserveToken } from '@/lib/mapView';
 import {
     applyDeltaToSelection,
@@ -10,7 +13,11 @@ import {
     findClosestSegment,
     insertVertexAt,
     projectOnSegment,
+    propagationLimitsFor,
+    propagateAlongStreet,
     rangeBetween,
+    relayLimitsFor,
+    relaySelectionOntoNetwork,
     removeVertexAt,
     routeEndpoints,
     snapOptionsFor,
@@ -23,7 +30,12 @@ import type {
     SnapPreset,
     VertexRef,
 } from '@/lib/routeEditing';
-import { describeSnap, lookupSnapStreets } from '@/lib/snapTransport';
+import {
+    describeRelay,
+    describeSnap,
+    lookupRelayStreets,
+    lookupSnapStreets,
+} from '@/lib/snapTransport';
 
 const props = defineProps<{
     geoJson: {
@@ -48,6 +60,16 @@ const props = defineProps<{
      * See consumePreserveToken for why this is a counter and not a flag.
      */
     preserveViewToken?: number;
+    /**
+     * Whether to offer re-laying a selected stretch onto the street network.
+     *
+     * A prop rather than something every map gets, because the create page has
+     * no snap control to sit next to and no preset to take its distance from. A
+     * required prop would mean every caller had to make a snapping decision it
+     * never offers the user, and a forgotten one is a broken editor rather than
+     * a type error.
+     */
+    relay?: boolean;
 }>();
 
 /**
@@ -67,9 +89,35 @@ const emit = defineEmits<{
     (
         e: 'update:geoJson',
         value: NonNullable<typeof props.geoJson>,
-        meta?: { snap?: boolean },
+        meta?: { snap?: boolean; propagated?: number },
     ): void;
 }>();
+
+/**
+ * Whether a snap may also pull the vertices around the dropped one onto the same
+ * street.
+ *
+ * Read here rather than passed in, because the map is the only thing that knows
+ * how to carry it out and a prop the create page would have to offer a control
+ * for is a prop nobody offers a control for. The composable is a plain shared
+ * ref, so reading it per drop picks up a change made on the parent without this
+ * component needing to be told.
+ */
+const { propagationEnabled } = usePropagation();
+
+/**
+ * What a drop did, once the street lookup has come back.
+ *
+ * Carries the route, which vertices changed, and where those vertices now are.
+ * The last two are not redundant: the count is what the reviewer is told, and
+ * the positions are what the markers have to be moved to. A caller that derived
+ * one from the other would be re-deriving geometry that already exists.
+ */
+interface PropagationResult {
+    coordinates: Coordinates;
+    moved: VertexRef[];
+    positions: Map<string, Position>;
+}
 
 /** The snap settings in force, or null when snapping is off. */
 const snapOptions = computed(() =>
@@ -290,6 +338,27 @@ function moveMarkers(active: VertexRef[], delta: Position): void {
     }
 }
 
+/**
+ * Put markers at exact positions, keyed by the vertex they stand for.
+ *
+ * The counterpart to moveMarkers for the vertices a walk placed on a street
+ * centreline one at a time. A propagated vertex has no single offset to be moved
+ * by — each one lands at its own place along the street — so the positions are
+ * absolute, and this is the one place they can be applied without rebuilding
+ * every marker and throwing away the layers a drag may still be bound to.
+ */
+function setMarkers(positions: Map<string, Position>): void {
+    for (const [key, position] of positions) {
+        const marker = vertexMarkersByRef.get(key);
+
+        if (!marker) {
+            continue;
+        }
+
+        marker.setLatLng(L.latLng(position[1], position[0]));
+    }
+}
+
 function announceSnap(label: string | null): void {
     if (snapLabelTimer) {
         clearTimeout(snapLabelTimer);
@@ -301,6 +370,27 @@ function announceSnap(label: string | null): void {
         snapLabelTimer = setTimeout(() => {
             snapLabel.value = null;
         }, 2600);
+    }
+}
+
+/** What a re-lay did, said in full because it moves vertices nobody dragged. */
+const relayLabel = ref<string | null>(null);
+let relayLabelTimer: ReturnType<typeof setTimeout> | null = null;
+
+function announceRelay(label: string | null): void {
+    if (relayLabelTimer) {
+        clearTimeout(relayLabelTimer);
+    }
+
+    relayLabel.value = label;
+
+    if (label !== null) {
+        // Longer than the snap's own two and a half seconds, because a re-lay
+        // reports on a hundred vertices across several streets and reading it
+        // takes longer than reading a street name.
+        relayLabelTimer = setTimeout(() => {
+            relayLabel.value = null;
+        }, 9000);
     }
 }
 
@@ -819,7 +909,8 @@ function commitDrop(coordinates: Coordinates): number {
 }
 
 /**
- * Pull a committed drop onto a street centreline, if the street agrees.
+ * Pull a committed drop onto a street centreline, and take the rest of the route
+ * with it, if the street agrees.
  *
  * The edit is already written by the time this runs, so everything here is
  * optional: a failed, slow or stale lookup costs the refinement and nothing
@@ -832,6 +923,19 @@ function commitDrop(coordinates: Coordinates): number {
  * dragged across a block is one edit, not N. Sampling all of it is what makes
  * that offset trustworthy — it is how the street is chosen, and the choice is
  * made before the offset is computed.
+ *
+ * The offset only reaches the vertices that were dragged, and that is the gap
+ * this second half exists to close: a one-vertex drag onto a street two blocks
+ * over leaves its neighbours on the street it came from, so the route crosses
+ * the block diagonally and the kink is the reviewer's first sign that the tool
+ * did half a job. So once the street is settled, the vertices on either side of
+ * the drop are walked onto it — forwards and backwards, because a route has a
+ * direction of travel and the kink behind a moved vertex is the same defect as
+ * the one in front of it.
+ *
+ * Only ever enabled deliberately, and never when the drop bypassed the snap:
+ * holding Alt says the reviewer placed this vertex by hand, and a hand-placed
+ * vertex is not an invitation to edit its neighbours either.
  */
 async function refineDropAfterSnap(
     coordinates: Coordinates,
@@ -875,20 +979,113 @@ async function refineDropAfterSnap(
         decision.position[1] - dropped[1],
     ];
 
+    // The snap is applied first and the walk starts from the result, so the
+    // reference is already on the centreline when the cursor is placed. Doing it
+    // the other way round would start the walk from a point that is off the
+    // street and put every propagated vertex that same distance off it, which is
+    // the rigid offset this is here to replace.
+    const snapped = applyDeltaToSelection(coordinates, active, offset);
+    const propagation = spreadAlongStreet(snapped, reference, found.line);
+
     // The markers follow the snap rather than the raw drop, so the vertex the
-    // reviewer sees is the one that was written.
+    // reviewer sees is the one that was written. The propagated vertices are set
+    // absolutely rather than by an offset, because a walk places each one on the
+    // centreline at its own distance rather than moving them all by one amount.
+    //
+    // The order matters and is not interchangeable. A walked vertex can also be
+    // in the dragged selection — grab the middle of a stretch and the walk
+    // reaches the ones either side of it — so the two sets overlap. The absolute
+    // set has to come second, since it is the one that wins: the geometry below
+    // is the snap with the walk applied on top of it, and the markers have to end
+    // up matching that rather than the other way round.
     moveMarkers(active, offset);
-    announceSnap(describeSnap(found));
+    setMarkers(propagation.positions);
+    announceSnap(describeSnap(found, propagation.moved.length));
     skipNextFitBounds = true;
     emit(
         'update:geoJson',
         {
             type: 'MultiLineString' as const,
-            coordinates: applyDeltaToSelection(coordinates, active, offset),
+            coordinates: propagation.coordinates,
         },
-        { snap: true },
+        { snap: true, propagated: propagation.moved.length },
     );
     geometryRevision += 1;
+}
+
+/**
+ * Walk the vertices either side of a dropped one onto the street it snapped to.
+ *
+ * Both directions, from the same geometry and over the same input. They cannot
+ * collide: each walk only ever touches indices on its own side of the reference,
+ * and neither adds nor removes a vertex, so the two index ranges are disjoint
+ * and their results can simply be written into one copy of the route.
+ *
+ * A drop that snapped to a street the response carried no centreline for
+ * propagates nothing, which is the same outcome as a reviewer with the feature
+ * switched off. That is the right way round: the drop still snapped, and the
+ * street it snapped to is on screen either way.
+ *
+ * Returns the positions as well as the references because the map has to move
+ * the markers itself. Leaving that to a re-render would work, and would also
+ * clear the selection — the same thing it already does after a plain snap, but
+ * with three more vertices moved it stops looking like a rounding error.
+ */
+function spreadAlongStreet(
+    coordinates: Coordinates,
+    reference: VertexRef,
+    line: Coordinates | null,
+): PropagationResult {
+    const options = snapOptions.value;
+
+    if (!line || !options || !propagationEnabled.value) {
+        return { coordinates, moved: [], positions: new Map() };
+    }
+
+    const limits = propagationLimitsFor(options.threshold);
+
+    // Backwards first only so the message counts the vertices before the drop
+    // before the ones after it, which is the order the reviewer is reading the
+    // route in.
+    const backward = propagateAlongStreet(
+        coordinates,
+        reference,
+        line,
+        -1,
+        limits,
+    );
+    const forward = propagateAlongStreet(
+        coordinates,
+        reference,
+        line,
+        1,
+        limits,
+    );
+    const moved: VertexRef[] = [...backward.moved, ...forward.moved];
+
+    if (moved.length === 0) {
+        return { coordinates, moved, positions: new Map() };
+    }
+
+    const merged = coordinates.map((part) => [...part]);
+    const positions = new Map<string, Position>();
+
+    for (const result of [backward, forward]) {
+        for (const ref of result.moved) {
+            const position = result.coordinates[ref.segment]?.[ref.index];
+
+            if (!position) {
+                continue;
+            }
+
+            const next: Position = [position[0], position[1]];
+
+            merged[ref.segment][ref.index] = next;
+            positions.set(vertexKey(ref), next);
+        }
+    }
+
+    return { coordinates: merged, moved, positions };
 }
 
 function updatePolylinePath(): void {
@@ -897,6 +1094,97 @@ function updatePolylinePath(): void {
     }
 
     polyline.setLatLngs(toLatLngs(dragCoords));
+}
+
+/**
+ * Re-lay the selected stretch onto the street network.
+ *
+ * The one action in this editor that reshapes rather than moves, and it is here
+ * for a case the other two cannot reach at all: a straight run of points drawn
+ * over a road that curves. A drag applies one rigid offset and a propagation
+ * walks a few vertices onto a street a single drop chose, so neither can bend a
+ * line into a curve however many vertices are selected.
+ *
+ * Not undoable in a special way. It is an explicit button rather than a
+ * refinement of something the reviewer just did, so it is written like any other
+ * map edit and the parent's history records it as one step — which is the whole
+ * safety net, and the reason there is no preview: a hundred vertices moving is
+ * large, and one Ctrl+Z is a smaller thing to reason about than a ghost on the
+ * map that has to be confirmed.
+ *
+ * The revision guard is the same one a snap uses. This is a button rather than a
+ * drag, so a second press is possible while the first is in flight, and applying
+ * a stale answer would move vertices the reviewer has since changed.
+ */
+async function relaySelection(): Promise<void> {
+    const options = snapOptions.value;
+    const coordinates = props.geoJson?.coordinates;
+
+    if (!options || !coordinates || selection.value.length < 2) {
+        return;
+    }
+
+    // Route order before anything else, because the reply is matched by position
+    // and a corner is only distinguishable from a straight run by knowing which
+    // point came before which. A box gesture has no order of its own.
+    const ordered = [...selection.value].sort((a, b) =>
+        a.segment !== b.segment ? a.segment - b.segment : a.index - b.index,
+    );
+
+    const points = ordered
+        .map((ref) => coordinates[ref.segment]?.[ref.index])
+        .filter((point): point is number[] => Array.isArray(point))
+        .map((point) => [point[0], point[1]] as Position);
+
+    if (points.length < 2) {
+        return;
+    }
+
+    announceRelay(null);
+
+    const revision = ++geometryRevision;
+    const found = await lookupRelayStreets(points, options, document.cookie);
+
+    if (geometryRevision !== revision || found.length === 0) {
+        announceRelay('No street was found for the selection.');
+
+        return;
+    }
+
+    const result = relaySelectionOntoNetwork(
+        coordinates,
+        ordered,
+        found,
+        relayLimitsFor(options.threshold),
+    );
+
+    if (result.moved.length === 0) {
+        announceRelay(
+            describeRelay(result.streets, result.unmatched) ||
+                'No street was found for the selection.',
+        );
+
+        return;
+    }
+
+    setMarkers(
+        new Map(
+            result.moved.map((ref) => [
+                vertexKey(ref),
+                [
+                    result.coordinates[ref.segment][ref.index][0],
+                    result.coordinates[ref.segment][ref.index][1],
+                ] as Position,
+            ]),
+        ),
+    );
+
+    announceRelay(describeRelay(result.streets, result.unmatched));
+    skipNextFitBounds = true;
+    emit('update:geoJson', {
+        type: 'MultiLineString' as const,
+        coordinates: result.coordinates,
+    });
 }
 
 function clearVertexMarkers(): void {
@@ -1001,6 +1289,11 @@ onUnmounted(() => {
         snapLabelTimer = null;
     }
 
+    if (relayLabelTimer) {
+        clearTimeout(relayLabelTimer);
+        relayLabelTimer = null;
+    }
+
     clearLayers();
 
     if (map) {
@@ -1035,6 +1328,12 @@ onUnmounted(() => {
             Snapped onto {{ snapLabel }}.
         </p>
         <p
+            v-if="relayLabel"
+            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
+        >
+            {{ relayLabel }}
+        </p>
+        <p
             v-if="editable && mode === 'move'"
             class="mt-2 text-sm text-muted-foreground"
         >
@@ -1049,6 +1348,44 @@ onUnmounted(() => {
                 vertex to move them together. A dropped vertex snaps onto the
                 nearest street — hold Alt to place it off the centreline.
             </template>
+        </p>
+        <div
+            v-if="relay && editable && mode === 'move'"
+            class="mt-3 flex items-center gap-3"
+        >
+            <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="selection.length < 2"
+                :title="
+                    selection.length < 2
+                        ? 'Select at least two vertices to re-lay.'
+                        : 'Move each selected vertex onto the street it belongs to, which is how a straight run drawn over a curving road gets its shape back.'
+                "
+                @click="relaySelection"
+            >
+                <Waves class="size-4" />
+                Re-lay on the street network
+            </Button>
+            <p class="text-xs text-muted-foreground">
+                Works on the shape, not just the position: each selected vertex
+                moves onto its own street, so a stretch that turns a corner
+                comes out right. Points with no street in range stay put.
+            </p>
+        </div>
+        <!--
+            Its own paragraph rather than a clause in the one above, because it
+            only applies with the feature on and the reviewer who just turned it
+            on needs to know what the button did to their route.
+        -->
+        <p
+            v-if="editable && mode === 'move' && propagationEnabled"
+            class="mt-2 text-sm text-muted-foreground"
+        >
+            A drop also pulls the vertices either side of it onto the same
+            street, and stops at the first one too far off it to tell. Hold Alt
+            to skip that along with the snap.
         </p>
         <p
             v-if="!geoJson && !editable"

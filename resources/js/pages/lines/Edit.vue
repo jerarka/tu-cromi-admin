@@ -20,9 +20,15 @@ import RouteModePicker from '@/components/lines/RouteModePicker.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { usePropagation } from '@/composables/usePropagation';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
-import { SNAP_PRESET_NAMES, snapOptionsFor } from '@/lib/routeEditing';
+import {
+    PROPAGATION_MAX_ARC_METERS,
+    PROPAGATION_MAX_VERTICES,
+    SNAP_PRESET_NAMES,
+    snapOptionsFor,
+} from '@/lib/routeEditing';
 import type { SnapPreset } from '@/lib/routeEditing';
 import {
     canRedo,
@@ -55,6 +61,26 @@ const SNAP_PRESET_LABELS: Record<SnapPreset, string> = {
  * memory: 50 of them is well under a couple of megabytes.
  */
 const UNDO_LIMIT = 50;
+
+/**
+ * How long typing has to pause before the GeoJSON is validated.
+ *
+ * Only the validation is deferred — never the state itself. Two things have to
+ * stay immediate and it is worth saying why, because the tempting version of
+ * this change batches all three and loses the reviewer's work:
+ *
+ * The dirty flag gates the unsaved-changes prompt. Set on a timer, a reviewer
+ * who types and reaches for "Back to lines" inside the delay sails straight
+ * out of the page with `isDirty` still false and no prompt ever appearing.
+ *
+ * The text itself feeds `parsedGeoJson`, which is what the map draws. Held back
+ * for the delay, the map would keep showing the previous geometry while the
+ * textarea shows the new one, and the two would disagree on screen.
+ *
+ * Both assignments are free — a ref write and a boolean. The parse is the only
+ * part worth spending a timer on, so that is the only part that gets one.
+ */
+const GEOJSON_VALIDATE_DELAY = 300;
 
 const props = defineProps<{
     line: Line;
@@ -247,15 +273,22 @@ const canUndoGeometry = computed(() => canUndo(history.value));
 const canRedoGeometry = computed(() => canRedo(history.value));
 
 const { snapPreset, updateSnapPreset } = useSnapPreset();
+const { propagationEnabled, updatePropagation } = usePropagation();
 
 /**
  * What the active preset actually does, in the reviewer's terms.
  *
  * Shown next to the picker deliberately. "Aggressive" and "subtle" are words
  * that mean nothing on their own, while the distance is what decides whether a
- * given drop snaps at all — and being able to read it is how anyone calibrates
- * a setting on a street they do not know yet, instead of guessing from a label
+ * given drop snaps at all — and being able to read it is how anyone calibrates a
+ * setting on a street they do not know yet, instead of guessing from a label
  * and then blaming the tool.
+ *
+ * The propagation sentence is part of the same paragraph rather than a line of
+ * its own, because it is governed by the number above it: a following vertex
+ * has to be within that same distance to be pulled along. Printing the distance
+ * once and letting it govern both is what stops the two controls from looking
+ * like independent settings when they are not.
  */
 const snapSummary = computed(() => {
     const options = snapOptionsFor(snapPreset.value);
@@ -264,7 +297,18 @@ const snapSummary = computed(() => {
         return 'Drops land exactly where you release them, with no street lookup.';
     }
 
-    return `Moves a drop onto a street within ${options.threshold} m of where you released it. When a selection is dropped on a crossing, the street more of the moved vertices are already on wins.`;
+    const base = `Moves a drop onto a street within ${options.threshold} m of where you released it. When a selection is dropped on a crossing, the street more of the moved vertices are already on wins.`;
+
+    if (!propagationEnabled.value) {
+        return base;
+    }
+
+    return (
+        `${base} A drop also pulls up to ${PROPAGATION_MAX_VERTICES} ` +
+        'vertices either side of it onto that street, as long as each is within ' +
+        `${options.threshold} m of it and no more than ${PROPAGATION_MAX_ARC_METERS} m ` +
+        'along it.'
+    );
 });
 
 /**
@@ -297,12 +341,47 @@ function handleKeydown(e: KeyboardEvent): void {
     }
 }
 
+/**
+ * The pending validation, or null when none is scheduled.
+ *
+ * A plain `let` rather than a ref on purpose: this is not state anything
+ * renders, and the page is server-rendered, so a ref would only be a value
+ * that has to be reasoned about during SSR for no benefit.
+ */
+let geoJsonValidateTimer: ReturnType<typeof setTimeout> | null = null;
+
+function cancelPendingValidation(): void {
+    if (geoJsonValidateTimer) {
+        clearTimeout(geoJsonValidateTimer);
+        geoJsonValidateTimer = null;
+    }
+}
+
+/**
+ * Take a keystroke into the geometry field.
+ *
+ * The state moves now and the parse happens once the reviewer stops, so the
+ * map and the textarea never disagree and the unsaved-changes guard is already
+ * armed by the time anyone can navigate.
+ */
+function onGeoJsonInput(event: Event): void {
+    geoJsonText.value = (event.target as HTMLTextAreaElement).value;
+    markDirty();
+
+    cancelPendingValidation();
+    geoJsonValidateTimer = setTimeout(() => {
+        geoJsonValidateTimer = null;
+        validateGeoJson();
+    }, GEOJSON_VALIDATE_DELAY);
+}
+
 onMounted(() => {
     document.addEventListener('keydown', handleKeydown);
 });
 
 onUnmounted(() => {
     document.removeEventListener('keydown', handleKeydown);
+    cancelPendingValidation();
 });
 
 /**
@@ -314,13 +393,26 @@ onUnmounted(() => {
  */
 function onMapUpdate(
     geoJson: NonNullable<Line['geo_json']>,
-    meta?: { snap?: boolean },
+    meta?: { snap?: boolean; propagated?: number },
 ): void {
     // A snap is the tool refining a move the reviewer already made, not a
     // second move. Recording it would put "drag the vertex" and "pull it onto
     // the street" in the history as separate steps, so the first undo would
     // appear to do nothing and the second would take back the move itself.
-    if (!meta?.snap) {
+    //
+    // Propagation is the exception that proves why that rule needs saying out
+    // loud. It moves vertices the reviewer never grabbed, which makes it a second
+    // move by any honest reading — and leaving it unrecorded is not merely a
+    // missing undo step. Undo would restore the pre-drag geometry and so discard
+    // the propagation as a side effect, but redo replays the state the drag
+    // produced, which is the state *without* it. A reviewer who undid a four
+    // vertex pull to see what it did and then redid it would come back to a
+    // different route than the one they were looking at, with nothing on screen
+    // to say so. Recording it costs one history entry and makes the round trip
+    // an identity.
+    const isPropagation = (meta?.propagated ?? 0) > 0;
+
+    if (!meta?.snap || isPropagation) {
         history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
     }
 
@@ -481,12 +573,7 @@ const pageTitle = computed(
                         name="geo_json"
                         class="h-80 w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs"
                         :value="geoJsonText"
-                        @input="
-                            geoJsonText = ($event.target as HTMLTextAreaElement)
-                                .value;
-                            validateGeoJson();
-                            markDirty();
-                        "
+                        @input="onGeoJsonInput"
                         placeholder='{"type":"MultiLineString","coordinates":[[[...]]]}'
                     ></textarea>
                     <InputError :message="errors.geo_json" />
@@ -612,28 +699,57 @@ const pageTitle = computed(
             <RouteModePicker v-if="isEditingMap" v-model="mode">
                 <div
                     v-if="mode === 'move'"
-                    class="ms-1 flex items-center gap-2"
+                    class="ms-1 flex flex-wrap items-center gap-4"
                 >
-                    <Label for="snap-preset">Snap</Label>
-                    <select
-                        id="snap-preset"
-                        :value="snapPreset"
-                        class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
-                        @change="
-                            updateSnapPreset(
-                                ($event.target as HTMLSelectElement)
-                                    .value as SnapPreset,
-                            )
-                        "
-                    >
-                        <option
-                            v-for="preset in SNAP_PRESET_NAMES"
-                            :key="preset"
-                            :value="preset"
+                    <div class="flex items-center gap-2">
+                        <Label for="snap-preset">Snap</Label>
+                        <select
+                            id="snap-preset"
+                            :value="snapPreset"
+                            class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+                            @change="
+                                updateSnapPreset(
+                                    ($event.target as HTMLSelectElement)
+                                        .value as SnapPreset,
+                                )
+                            "
                         >
-                            {{ SNAP_PRESET_LABELS[preset] }}
-                        </option>
-                    </select>
+                            <option
+                                v-for="preset in SNAP_PRESET_NAMES"
+                                :key="preset"
+                                :value="preset"
+                            >
+                                {{ SNAP_PRESET_LABELS[preset] }}
+                            </option>
+                        </select>
+                    </div>
+
+                    <!--
+                        A checkbox rather than another preset value, and gated on
+                        snapping being on at all: with the preset at "off" there is
+                        no street for a drop to be pulled onto, so leaving the box
+                        ticked would be a setting that says it is doing something
+                        when it provably is not.
+                    -->
+                    <div
+                        v-if="snapPreset !== 'off'"
+                        class="flex items-center gap-2"
+                    >
+                        <input
+                            id="snap-propagate"
+                            type="checkbox"
+                            class="size-4 rounded border-input accent-primary"
+                            :checked="propagationEnabled"
+                            @change="
+                                updatePropagation(
+                                    ($event.target as HTMLInputElement).checked,
+                                )
+                            "
+                        />
+                        <Label for="snap-propagate" class="font-normal">
+                            Pull neighbouring points onto the same street
+                        </Label>
+                    </div>
                 </div>
             </RouteModePicker>
             <p
@@ -647,6 +763,7 @@ const pageTitle = computed(
                 :editable="isEditingMap"
                 :mode="mode"
                 :snap-preset="snapPreset"
+                :relay="snapPreset !== 'off'"
                 :preserve-view-token="preserveViewToken"
                 @update:geo-json="onMapUpdate"
             />

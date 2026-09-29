@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Http\Controllers\Admin\RoadsController;
+use App\Http\Requests\Road\RelayRoadRequest;
 use App\Http\Requests\Road\SnapRoadRequest;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
@@ -34,6 +35,7 @@ use Throwable;
  *     alpha: FixtureRoad,
  *     bravo: FixtureRoad,
  *     charlie: FixtureRoad,
+ *     delta: FixtureRoad,
  * }
  */
 class RoadsSelfTest extends Command
@@ -79,6 +81,14 @@ class RoadsSelfTest extends Command
             $this->checkNothingInRangeAnswers204($geometry);
             $this->checkProjectionLiesOnTheStreet($geometry);
             $this->checkOnewayKeepsItsToken($geometry);
+            $this->checkStreetGeometryTravelsWithTheSnap($geometry);
+            $this->checkStreetGeometryKeepsItsOrder($geometry);
+            $this->checkRelayAnswersEachPointOnItsOwnStreet($geometry);
+            $this->checkRelayLetsACornerBeTwoStreets($geometry);
+            $this->checkRelayVotesBeatDistanceAtACrossing($geometry);
+            $this->checkRelayIsIndexedByPosition($geometry);
+            $this->checkRelayOmitsPointsWithNoStreet($geometry);
+            $this->checkRelayGeometryKeepsItsOrder($geometry);
         } catch (Throwable $e) {
             $this->results[] = ['ran the whole sequence', false, $e->getMessage()];
 
@@ -136,8 +146,12 @@ class RoadsSelfTest extends Command
      *
      * Alpha runs east-west through the anchor. Bravo is a short north-south
      * street three metres east of it, so the two cross and a drop near the
-     * crossing is genuinely ambiguous. Charlie is far to the north, close enough
-     * to prove nothing interferes and far enough never to win.
+     * crossing is genuinely ambiguous. Delta runs parallel to alpha four metres
+     * south of it, which is what makes the local vote testable: two streets a few
+     * metres apart, like a road and the lane beside it, are the only arrangement
+     * where a point can be closer to one while its neighbours are all on the
+     * other. Charlie is far to the north, close enough to prove nothing
+     * interferes and far enough never to win.
      *
      * @return Fixture
      */
@@ -167,6 +181,11 @@ class RoadsSelfTest extends Command
                 'name' => 'selftest charlie',
                 'oneway' => 'backward',
                 'coords' => sprintf('(%s %s, %s %s)', $lng(-400.0), $lat(300.0), $lng(400.0), $lat(300.0)),
+            ],
+            'delta' => [
+                'name' => 'selftest delta',
+                'oneway' => 'no',
+                'coords' => sprintf('(%s %s, %s %s)', $lng(-400.0), $lat(-4.0), $lng(400.0), $lat(-4.0)),
             ],
         ];
     }
@@ -230,7 +249,7 @@ class RoadsSelfTest extends Command
     {
         $osmId = 990_000_000;
 
-        foreach (['alpha', 'bravo', 'charlie'] as $key) {
+        foreach (['alpha', 'bravo', 'charlie', 'delta'] as $key) {
             DB::insert(
                 'INSERT INTO roads (osm_id, name, highway, oneway, point_count, created_at, updated_at, geom)
                  VALUES (?, ?, ?, ?, 2, now(), now(), ST_GeomFromText(?, 4326))',
@@ -398,7 +417,7 @@ class RoadsSelfTest extends Command
      */
     private function checkOnewayKeepsItsToken(array $geometry): void
     {
-        foreach (['alpha' => 'no', 'bravo' => 'forward', 'charlie' => 'backward'] as $key => $expected) {
+        foreach (['alpha' => 'no', 'bravo' => 'forward', 'charlie' => 'backward', 'delta' => 'no'] as $key => $expected) {
             $response = $this->snap([
                 $this->offsetOn($geometry, $key),
             ], threshold: 25.0, radius: 60.0);
@@ -410,6 +429,372 @@ class RoadsSelfTest extends Command
                 $response,
             );
         }
+    }
+
+    /**
+     * The chosen street's own coordinates travel with the answer.
+     *
+     * The editor walks the route's neighbouring vertices onto this line, and it
+     * can only do that if the line arrives. So this is a check on the response
+     * shape rather than on the geometry: the client accepts a MultiLineString
+     * and nothing else, and a response carrying anything else is one it will
+     * read as "no street", which is a refinement lost with nothing on screen to
+     * say why.
+     *
+     * The size is why this costs nothing. A way in this table averages six
+     * points, so the street rides along with the snap instead of costing a round
+     * trip of its own.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkStreetGeometryTravelsWithTheSnap(array $geometry): void
+    {
+        $response = $this->snap([
+            $this->offset($geometry, 200.0, 0.0),
+        ], threshold: 25.0, radius: 60.0);
+
+        $this->assertSame(
+            'the snap carries the street it chose',
+            'MultiLineString',
+            $response['geometry']['type'] ?? '(missing)',
+            $response,
+        );
+
+        $this->assertSame(
+            'the street arrives as one drawable part of at least two positions',
+            1,
+            is_array($coordinates = $response['geometry']['coordinates'] ?? null)
+                && is_array($coordinates[0] ?? null)
+                && count($coordinates[0]) >= 2
+                && count($coordinates) === 1
+                    ? 1
+                    : 0,
+            $response,
+        );
+    }
+
+    /**
+     * GeoJSON order, asserted rather than assumed.
+     *
+     * The street has to come back as [lng, lat] to match the editor's own
+     * convention, and there is no way to tell from the response alone that it
+     * did: both orders are arrays of two numbers, and the transposed one is
+     * still perfectly valid GeoJSON. The snapped position beside it is
+     * separately and correctly ordered, so a transposed street would read as a
+     * good snap sitting next to a mirrored continuation of the route, and
+     * nothing downstream would object.
+     *
+     * The fixture makes the two orders distinguishable. Alpha runs east-west
+     * through the anchor, so its west end is 400 m *west* of a longitude near
+     * -63 and level with a latitude near -25. Read in the wrong order those two
+     * numbers trade places, and the comparison below fails.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkStreetGeometryKeepsItsOrder(array $geometry): void
+    {
+        $response = $this->snap([
+            $this->offset($geometry, 200.0, 0.0),
+        ], threshold: 25.0, radius: 60.0);
+
+        $west = $response['geometry']['coordinates'][0][0] ?? null;
+        $east = $response['geometry']['coordinates'][0][1] ?? null;
+
+        $this->assert(
+            'the street reads as [lng, lat], the order the editor speaks',
+            is_array($west)
+            && is_array($east)
+            && $this->is($west[1] ?? null, $geometry['anchor']['lat'])
+            && $this->is($east[1] ?? null, $geometry['anchor']['lat'])
+            && $this->is($west[0] ?? null, $this->westEnd($geometry)),
+            sprintf(
+                'answered %s to %s for a street running west to east at latitude %.6f',
+                $this->show($west),
+                $this->show($east),
+                $geometry['anchor']['lat'],
+            ),
+        );
+    }
+
+    /**
+     * The longitude of alpha's west end, in the same rounded form the fixture
+     * was inserted with.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function westEnd(array $geometry): float
+    {
+        return (float) number_format(
+            $geometry['anchor']['lng'] - 400.0 / $this->metresPerDegreeLon($geometry['anchor']['lat']),
+            8,
+            '.',
+            '',
+        );
+    }
+
+    /**
+     * Whether a coordinate is the expected one.
+     *
+     * The fixture is inserted rounded to eight decimals, so the comparison has
+     * to allow for that much and no more — tight enough that a transposed pair
+     * could not pass, loose enough that the rounding is not itself a failure.
+     */
+    private function is(mixed $actual, float $expected): bool
+    {
+        return is_float($actual) || is_int($actual)
+            ? abs($actual - $expected) < 0.0000001
+            : false;
+    }
+
+    /**
+     * Ask the real controller which street each point belongs to.
+     *
+     * The same contract as the snap helper — through the controller and the form
+     * request, because the binding order and the row shape are what is really
+     * under test here and a fixture that went straight to the query would pass
+     * while the editor's actual call failed.
+     *
+     * @param  list<array{lat: float, lng: float}>  $points
+     * @return list<array<string, mixed>>
+     */
+    private function relay(array $points, float $threshold = 25.0, float $radius = 60.0): array
+    {
+        $request = RelayRoadRequest::create('/roads/relay', 'POST', [
+            'points' => $points,
+            'threshold' => $threshold,
+            'radius' => $radius,
+        ]);
+        $request->setContainer(app());
+        $request->setRedirector(app('redirect'));
+        $request->validateResolved();
+
+        $response = app(RoadsController::class)->relay($request);
+        $content = $response->getContent();
+        $decoded = json_decode($content === false ? '' : $content, true);
+
+        // array_values on something json_decode already gave back as a list, and
+        // it is here on purpose rather than as decoration: the reply's order is
+        // the contract the client re-lays a route against, so asserting it is a
+        // list here is the same claim the test below makes about it.
+        return is_array($decoded) ? array_values($decoded) : [];
+    }
+
+    /**
+     * A straight run along one street is answered with that street, point by point.
+     *
+     * The shape of the whole feature in one assertion: unlike a drop, there is no
+     * single winner, because every point is its own reference. A response that
+     * named one street for the lot would be the rigid behaviour this exists to
+     * replace.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkRelayAnswersEachPointOnItsOwnStreet(array $geometry): void
+    {
+        $points = [
+            $this->offset($geometry, -150.0, 0.0),
+            $this->offset($geometry, -50.0, 0.0),
+            $this->offset($geometry, 50.0, 0.0),
+            $this->offset($geometry, 150.0, 0.0),
+        ];
+
+        $rows = $this->relay($points);
+
+        $this->assertSame(
+            'a straight run is answered with one row per point',
+            count($points),
+            count($rows),
+        );
+
+        $this->assert(
+            'every point of a run along one street is answered with that street',
+            array_reduce(
+                $rows,
+                fn (bool $all, array $row): bool => $all && $row['name'] === $geometry['alpha']['name'],
+                true,
+            ),
+            $this->show(array_column($rows, 'name')),
+        );
+    }
+
+    /**
+     * A selection that turns a corner is answered with two streets.
+     *
+     * The case a per-drop lookup cannot express at all. The points along alpha
+     * belong to alpha and the ones up bravo belong to bravo, and neither is wrong
+     * — a rule insisting on one street for the whole selection would have to be
+     * wrong about one of them, which is why this answers per point.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkRelayLetsACornerBeTwoStreets(array $geometry): void
+    {
+        $rows = $this->relay([
+            $this->offset($geometry, -150.0, 0.0),
+            $this->offset($geometry, -100.0, 0.0),
+            $this->offsetOn($geometry, 'bravo'),
+            $this->offset($geometry, 3.0, 10.0),
+            $this->offset($geometry, 3.0, 20.0),
+        ]);
+
+        $names = array_column($rows, 'name');
+
+        $this->assertSame(
+            'the points along alpha are answered with alpha',
+            2,
+            count(array_keys($names, $geometry['alpha']['name'], true)),
+        );
+
+        $this->assert(
+            'the points up bravo are answered with bravo, and the corner is not smoothed into one street',
+            count(array_keys($names, $geometry['bravo']['name'], true)) === 3,
+            $this->show($names),
+        );
+    }
+
+    /**
+     * Where two streets run close alongside each other, the neighbours decide —
+     * not the closer one.
+     *
+     * Alpha and delta run parallel four metres apart, and the point in question
+     * sits three metres south of alpha: one metre from delta, three from alpha. So
+     * delta is the closer street by a factor of three, and every neighbour of the
+     * point is on alpha. Both are inside the three-metre tie band, so the distance
+     * cannot separate them and the vote has to. Alpha must win.
+     *
+     * This is the assertion that fails if the votes were counted across the whole
+     * selection instead of locally. A global count over a route with two long
+     * stretches on parallel roads ties exactly, and a tie broken by distance is a
+     * coin flip at every crossing — which is to say exactly where the route turns.
+     *
+     * It is also the shape of the real problem: a divided road, or a street and
+     * the service lane beside it, are two rows a few metres apart and a route
+     * between them must not be split down the middle.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkRelayVotesBeatDistanceAtACrossing(array $geometry): void
+    {
+        $rows = $this->relay([
+            $this->offset($geometry, -160.0, 0.0),
+            $this->offset($geometry, -130.0, 0.0),
+            $this->offset($geometry, -100.0, -3.0),
+            $this->offset($geometry, -70.0, 0.0),
+            $this->offset($geometry, -60.0, 0.0),
+        ]);
+
+        $middle = $rows[2] ?? [];
+
+        $this->assertSame(
+            'a point between two streets is answered by the one its neighbours are on',
+            $geometry['alpha']['name'],
+            $middle['name'] ?? '(no street)',
+        );
+
+        $this->assert(
+            'and the answer really was the further of the two, so the vote is what decided it',
+            (float) ($middle['distance_m'] ?? 0) > 2.0,
+            sprintf(
+                'answered with %s at %.2fm, delta was at 1.00m',
+                (string) ($middle['name'] ?? '(none)'),
+                (float) ($middle['distance_m'] ?? -1),
+            ),
+        );
+    }
+
+    /**
+     * The reply is indexed by the position the points were sent in.
+     *
+     * The client re-lays the route in that order and matches each answer back to
+     * a vertex by position, so a renumbered or reordered reply would apply every
+     * street to somebody else's vertex. A box gesture has no order of its own, so
+     * this is the only thing making the reply mean anything.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkRelayIsIndexedByPosition(array $geometry): void
+    {
+        // Sent nearest-first, so the natural answer order is the reverse of the
+        // sent order and any reliance on the server sorting would show up.
+        $rows = $this->relay([
+            $this->offset($geometry, 150.0, 0.0),
+            $this->offset($geometry, 50.0, 0.0),
+            $this->offset($geometry, -50.0, 0.0),
+        ]);
+
+        $this->assertSame(
+            'the reply keeps the order the points were sent in',
+            [0, 1, 2],
+            array_map(fn (array $row): int => (int) $row['index'], $rows),
+        );
+    }
+
+    /**
+     * A point with no street in range gets no row, rather than a wrong one.
+     *
+     * Thirty-six vertices across nine codes are genuinely in this position — the
+     * imported network does not reach them — so it is a real case. The absence is
+     * what tells the client to leave that vertex alone, and a row with a street
+     * beyond the threshold would be a route moved to a road the reviewer never
+     * pointed at.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkRelayOmitsPointsWithNoStreet(array $geometry): void
+    {
+        $rows = $this->relay([
+            $this->offset($geometry, -100.0, 0.0),
+            // A kilometre north of everything, where only charlie is in play and
+            // it is 700 m away — well past the threshold.
+            $this->offset($geometry, 0.0, 1000.0),
+        ]);
+
+        $this->assertSame(
+            'a point with no street within range is left out of the reply',
+            [0],
+            array_map(fn (array $row): int => (int) $row['index'], $rows),
+        );
+    }
+
+    /**
+     * Every street comes back as [lng, lat], in the editor's own order.
+     *
+     * Stated for the re-lay as well as the drop because a re-lay has no correct
+     * position sitting beside it to notice a mirrored one: the snapped vertex is
+     * not in this reply at all, so a transposed centreline would put a hundred
+     * vertices on the far side of the world and nothing anywhere would object.
+     *
+     * Alpha runs east-west through the anchor, so read in the wrong order its
+     * coordinates trade a longitude near -63 for a latitude near -25, and the
+     * comparison below fails.
+     *
+     * @param  Fixture  $geometry
+     */
+    private function checkRelayGeometryKeepsItsOrder(array $geometry): void
+    {
+        // Two points, because a re-lay of one vertex is a snap and the request
+        // refuses it — the feature has nothing to add until there is a stretch.
+        $rows = $this->relay([
+            $this->offset($geometry, -50.0, 0.0),
+            $this->offset($geometry, 0.0, 0.0),
+        ]);
+        $west = $rows[1]['geometry']['coordinates'][0][0] ?? null;
+        $east = $rows[1]['geometry']['coordinates'][0][1] ?? null;
+
+        $this->assert(
+            'the re-laid street reads as [lng, lat] too',
+            is_array($west)
+            && is_array($east)
+            && $this->is($west[1] ?? null, $geometry['anchor']['lat'])
+            && $this->is($east[1] ?? null, $geometry['anchor']['lat'])
+            && $this->is($west[0] ?? null, $this->westEnd($geometry)),
+            sprintf(
+                'answered %s to %s for a street running west to east at latitude %.6f',
+                $this->show($west),
+                $this->show($east),
+                $geometry['anchor']['lat'],
+            ),
+        );
     }
 
     /**
@@ -439,6 +824,7 @@ class RoadsSelfTest extends Command
         return match ($key) {
             'alpha' => $this->offset($geometry, 200.0, 0.0),
             'bravo' => $this->offset($geometry, 3.0, 0.0),
+            'delta' => $this->offset($geometry, 200.0, -4.0),
             default => $this->offset($geometry, 200.0, 300.0),
         };
     }

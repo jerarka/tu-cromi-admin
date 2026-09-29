@@ -1,6 +1,15 @@
-import { snapSearchRadius } from '@/lib/routeEditing';
-import type { Position, SnapOptions } from '@/lib/routeEditing';
-import { snapLookupFromResponse, toWirePoints } from '@/lib/snapWire';
+import { RELAY_MIN_SPACING_METERS, snapSearchRadius } from '@/lib/routeEditing';
+import type {
+    Position,
+    RelayStreetReport,
+    SnapOptions,
+    StreetLookup,
+} from '@/lib/routeEditing';
+import {
+    relayLookupsFromResponse,
+    snapLookupFromResponse,
+    toWirePoints,
+} from '@/lib/snapWire';
 import type { SnapLookup } from '@/lib/snapWire';
 import roads from '@/routes/roads';
 
@@ -52,25 +61,40 @@ export function csrfToken(cookie: string): string {
 /**
  * What to tell the reviewer about a snap.
  *
- * The count only speaks when it has something to say. Along a route the moved
- * vertices are mostly on different streets by definition, so a stretch of any
- * length reports something like "1 of 7" — and printing that after a perfectly
- * good snap makes a correct result read as a doubtful one, which is the exact
- * opposite of what a confirmation is for.
+ * The vote count only speaks when it has something to say. Along a route the
+ * moved vertices are mostly on different streets by definition, so a stretch of
+ * any length reports something like "1 of 7" — and printing that after a
+ * perfectly good snap makes a correct result read as a doubtful one, which is
+ * the exact opposite of what a confirmation is for.
  *
  * So it appears only when the moved vertices back the street the snap chose,
  * which is the crossing case: the votes settled something the distances could
  * not, and the reviewer is being told which of the two nearby roads the choice
  * went to and on what grounds. Everything else just gets the street name.
+ *
+ * `propagated` is counted out loud for the opposite reason: those are vertices
+ * the reviewer did not drag and had no other way of learning were moved. A tool
+ * that quietly edits three vertices of a route is a tool nobody trusts on a
+ * route nobody can check, so the number is always said when it is not zero, and
+ * the message names the pull explicitly rather than implying it.
  */
-export function describeSnap(found: SnapLookup): string {
+export function describeSnap(found: SnapLookup, propagated = 0): string {
     const street = found.name ?? 'unnamed street';
+    const parts: string[] = [];
 
-    if (found.votes < 2 || found.votes * 2 <= found.samples) {
-        return street;
+    if (found.votes >= 2 && found.votes * 2 > found.samples) {
+        parts.push(
+            `${found.votes} of ${found.samples} moved vertices are on it`,
+        );
     }
 
-    return `${street} — ${found.votes} of ${found.samples} moved vertices are on it`;
+    if (propagated > 0) {
+        parts.push(
+            `${propagated} following ${propagated === 1 ? 'vertex' : 'vertices'} pulled along`,
+        );
+    }
+
+    return parts.length === 0 ? street : `${street} — ${parts.join('; ')}`;
 }
 
 /**
@@ -137,5 +161,113 @@ export async function lookupSnapStreets(
         return snapLookupFromResponse(await response.json());
     } catch {
         return null;
+    }
+}
+
+/**
+ * What to tell the reviewer about a re-lay.
+ *
+ * By street, with a count each, because that is the claim the tool actually
+ * makes and the only one a reviewer can check: an editor looking at a message
+ * that says "18 points re-laid" learns only that something happened, while
+ * "Calle Mercado �6, Av. Ca�oto �5" can be held against the map in a glance.
+ * Naming the streets is also the honest version of a bulk change � the reviewer
+ * dragged nothing and is about to have a hundred vertices move, and silence
+ * about where they went is what makes a tool like that untrustworthy.
+ *
+ * A street with no name is named as such rather than skipped, on the same
+ * grounds the lookup does not refuse to move a route onto it: two thirds of the
+ * network has no name, and "unnamed street �3" is still information about where
+ * three vertices went.
+ *
+ * The spacing is mentioned only when it had to be reduced, which is the only
+ * case where it is news.
+ */
+export function describeRelay(
+    streets: RelayStreetReport[],
+    unmatched: number,
+): string {
+    // Checked before anything is composed, because "Re-laid 0 points onto 0
+    // streets" is both clumsy and a lie about work that did not happen. Nothing
+    // placed is its own outcome and it is the one a reviewer most needs stated
+    // plainly: the selection was somewhere the imported network does not reach.
+    if (streets.length === 0) {
+        return unmatched === 0
+            ? 'Nothing was selected.'
+            : `No selected point had a street within range. ${unmatched} left where ${unmatched === 1 ? 'it is' : 'they are'}.`;
+    }
+
+    const parts = streets.map(
+        (street) =>
+            `${street.name ?? 'unnamed street'} x${street.placed}` +
+            (street.closestSpacing !== null &&
+            street.closestSpacing < RELAY_MIN_SPACING_METERS - 0.5
+                ? ` (closest ${Math.round(street.closestSpacing)} m apart)`
+                : ''),
+    );
+
+    if (unmatched > 0) {
+        parts.push(
+            `${unmatched} left where ${unmatched === 1 ? 'it is' : 'they are'}: no street within range`,
+        );
+    }
+
+    return (
+        `Re-laid ${streets.reduce((total, street) => total + street.placed, 0)} ` +
+        `points onto ${streets.length} ${streets.length === 1 ? 'street' : 'streets'}: ` +
+        `${parts.join(', ')}.`
+    );
+}
+
+/**
+ * Ask which street each point of a selected stretch belongs to.
+ *
+ * The same shape of call as a drop and for the same reason � the points go out in
+ * route order and the answer comes back in that order, because a corner is only
+ * distinguishable from a straight run by knowing which point came before which.
+ *
+ * Every failure is an empty list, which is what a caller needs to hear in order
+ * to leave the selection alone: the geometry is already written, a stale answer
+ * would move vertices the reviewer has since put somewhere else, and a point with
+ * no street is an ordinary outcome rather than a fault. A non-2xx status is still
+ * worth a warning, for the same reason as on a drop � a broken lookup and a gap
+ * in the map look identical from the outside.
+ */
+export async function lookupRelayStreets(
+    points: Position[],
+    options: { threshold: number },
+    cookie: string,
+): Promise<StreetLookup[]> {
+    if (points.length === 0) {
+        return [];
+    }
+
+    try {
+        const response = await fetch(roads.relay.url(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-XSRF-TOKEN': csrfToken(cookie),
+            },
+            credentials: 'same-origin',
+            signal: AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS),
+            body: JSON.stringify({
+                points: toWirePoints(points),
+                radius: snapSearchRadius(options),
+                threshold: options.threshold,
+            }),
+        });
+
+        if (!response.ok) {
+            console.warn('Road lookup failed', response.status);
+
+            return [];
+        }
+
+        return relayLookupsFromResponse(await response.json());
+    } catch {
+        return [];
     }
 }

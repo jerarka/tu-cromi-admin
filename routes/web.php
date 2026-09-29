@@ -18,6 +18,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::put('/lines/{line}', [LineController::class, 'update'])->name('lines.update');
 
     Route::post('/roads/snap', [RoadsController::class, 'snap'])->name('roads.snap');
+    Route::post('/roads/relay', [RoadsController::class, 'relay'])->name('roads.relay');
 });
 
 require __DIR__.'/settings.php';

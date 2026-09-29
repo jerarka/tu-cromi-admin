@@ -27,3 +27,10 @@ yarn-error.log
 /.nova
 /.vscode
 /.zed
+
+# Tooling caches and one-off scratch space. `scratch/` in particular held a
+# script that rewrote every line's geometry and spatial column with no
+# transaction and no dry run, which is exactly the kind of file that must not
+# be one stray command away from being executed.
+.atl/
+scratch/

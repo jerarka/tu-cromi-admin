@@ -1,4 +1,9 @@
-import type { Position, SnapCandidate } from '@/lib/routeEditing';
+import type {
+    Coordinates,
+    Position,
+    SnapCandidate,
+    StreetLookup,
+} from '@/lib/routeEditing';
 
 /**
  * The two conversions between the module's coordinate convention and the
@@ -33,6 +38,15 @@ export interface SnapWireResponse {
     distance_m: number;
     votes: number;
     samples: number;
+    /**
+     * The chosen street's own coordinates, as GeoJSON geometry.
+     *
+     * Untyped on the wire interface on purpose: it is the one field whose shape
+     * the server is free to vary (a MultiLineString, and in principle a
+     * LineString), so it is validated into the module's own `Coordinates` on the
+     * way in rather than trusted here.
+     */
+    geometry: unknown;
 }
 
 /**
@@ -71,6 +85,86 @@ export interface SnapLookup {
     name: string | null;
     votes: number;
     samples: number;
+    /**
+     * The chosen street's centreline, or null when the response did not carry a
+     * usable one.
+     *
+     * Null rather than an empty array because the two mean different things: an
+     * absent street means the drop is a perfectly good snap with no propagation
+     * offered, while an empty one would be a geometry with nothing in it to walk
+     * along. Keeping them apart lets the caller say which happened.
+     */
+    line: Coordinates | null;
+}
+
+/**
+ * The chosen street's coordinates, validated into the module's own order.
+ *
+ * GeoJSON is `[lng, lat]`, which is also this module's convention, so on paper
+ * this is an identity function. That coincidence is the whole risk: the two
+ * orders meeting here is the one place a transposition would mirror the street
+ * about the antimeridian, and unlike a lat/lng swap in the request body there
+ * is no nearby field to look wrong against — the snapped position above is
+ * already in module order, so a swapped street would be a correct snap beside
+ * a mirrored continuation of it. Hence the shape is rebuilt from scratch rather
+ * than cast, and the order is asserted in a test.
+ *
+ * Strictly a MultiLineString, because that is the only thing the `roads.geom`
+ * column can hold. A response in any other shape yields null, which costs the
+ * propagation and nothing else — the failure direction matters more here than
+ * the convenience of accepting a shape the database cannot produce.
+ *
+ * A part with fewer than two positions is dropped rather than rejected: a single
+ * point is not a stretch of road, and it contributes no length to walk along, so
+ * keeping it would only give the walk a degenerate case to guard against. If
+ * nothing usable survives, the result is null.
+ */
+export function snapLineFromGeometry(value: unknown): Coordinates | null {
+    if (typeof value !== 'object' || value === null) {
+        return null;
+    }
+
+    const { type, coordinates } = value as {
+        type?: unknown;
+        coordinates?: unknown;
+    };
+
+    if (type !== 'MultiLineString' || !Array.isArray(coordinates)) {
+        return null;
+    }
+
+    const parts: Coordinates = [];
+
+    for (const part of coordinates) {
+        if (!Array.isArray(part) || part.length < 2) {
+            continue;
+        }
+
+        const positions: Position[] = [];
+
+        for (const position of part) {
+            if (!Array.isArray(position) || position.length < 2) {
+                continue;
+            }
+
+            const [lng, lat] = position as unknown[];
+
+            // NaN is rejected with the rest. It is a number that arrives by
+            // arithmetic upstream, and everything downstream would carry it into
+            // a saved route without a word.
+            if (!isFiniteNumber(lng) || !isFiniteNumber(lat)) {
+                continue;
+            }
+
+            positions.push([lng, lat]);
+        }
+
+        if (positions.length >= 2) {
+            parts.push(positions);
+        }
+    }
+
+    return parts.length > 0 ? parts : null;
 }
 
 /**
@@ -110,5 +204,87 @@ export function snapLookupFromResponse(data: unknown): SnapLookup | null {
         name: typeof response.name === 'string' ? response.name : null,
         votes: isFiniteNumber(response.votes) ? response.votes : 0,
         samples: isFiniteNumber(response.samples) ? response.samples : 0,
+        // A missing or unusable street leaves the drop a normal snap. The
+        // position above has already been decided by this point, so a caller
+        // that finds no line has lost a refinement, not an edit.
+        line: snapLineFromGeometry(response.geometry),
     };
+}
+
+/**
+ * One row of `POST /roads/relay`: the street a single point belongs to.
+ *
+ * A list rather than a single winner, because every point in a re-lay is its own
+ * reference. A drop answers "which street is this drop on" and the other points
+ * it is sent only vote; this one answers a question per point, and a selection
+ * that turns a corner is only correct if each point is allowed its own answer.
+ */
+export interface RelayWireStreet {
+    /** Position of the point within the selection. The only link back to a vertex. */
+    index: number;
+    road_id: number;
+    name: string | null;
+    highway: string | null;
+    /** The raw OSM token, as on a drop. Never a boolean; 'no' is truthy. */
+    oneway: string | null;
+    votes: number;
+    distance_m: number;
+    geometry: unknown;
+}
+
+/**
+ * A street one point belongs to, validated into the module's own order.
+ *
+ * The reply, as one entry per point, in the order the points were sent.
+ *
+ * Order is the contract and it is the whole contract: entry 7 is the seventh
+ * point the caller asked about, and the route is re-laid in that order so a
+ * corner can be told from a straight run. A point the server found no street for
+ * is simply absent, which is how a caller tells "no street nearby" from "a street
+ * to use" without reading a flag — and the absence is meaningful rather than a
+ * gap to be filled.
+ */
+export function relayLookupsFromResponse(data: unknown): StreetLookup[] {
+    if (!Array.isArray(data)) {
+        return [];
+    }
+
+    const found: StreetLookup[] = [];
+
+    for (const row of data) {
+        if (typeof row !== 'object' || row === null) {
+            continue;
+        }
+
+        const response = row as Partial<RelayWireStreet>;
+        const index = response.index;
+        const distance = response.distance_m;
+
+        // Index, road and distance are required: without the first there is no
+        // vertex to answer for, and without the other two there is nothing to
+        // move. The name is not required, and that is deliberate rather than an
+        // oversight � nineteen thousand of the roads in this network have no
+        // name, and refusing to move a route onto an unnamed street would leave
+        // most of the city unusable.
+        if (
+            !isFiniteNumber(index) ||
+            !isFiniteNumber(response.road_id) ||
+            !isFiniteNumber(distance)
+        ) {
+            continue;
+        }
+
+        found.push({
+            roadId: response.road_id,
+            name: typeof response.name === 'string' ? response.name : null,
+            votes: isFiniteNumber(response.votes) ? response.votes : 0,
+            distance,
+            // The same validation a drop's street gets, for the same reason: this
+            // is where a transposed GeoJSON puts a route's vertices, and unlike a
+            // bad snap there is no correct answer sitting beside it to notice.
+            line: snapLineFromGeometry(response.geometry),
+        });
+    }
+
+    return found;
 }

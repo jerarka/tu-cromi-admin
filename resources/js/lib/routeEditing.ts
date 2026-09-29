@@ -556,3 +556,742 @@ export function snapSample(
 
     return [anchor, ...spread(others, Math.max(0, limit - 1))];
 }
+
+/**
+ * Metres in one degree of the equator.
+ *
+ * The conversion every distance in this feature eventually needs, and the reason
+ * it cannot be skipped: a degree of longitude is this times the cosine of the
+ * latitude, so in Santa Cruz it is about 5% shorter than a degree of latitude,
+ * and a limit expressed in degrees means something different on every route in
+ * the city.
+ *
+ * The rest of the module works in degrees because that is what GeoJSON and
+ * Leaflet speak, and it is the right place to stop — but a *limit* here is in
+ * metres, because that is what the reviewer calibrates against the snap
+ * presets. So the comparison happens in the metric frame below and nowhere else.
+ */
+const METERS_PER_DEGREE = 111_320;
+
+/** Longitude degrees shrink towards the poles; latitude degrees do not. */
+export function longitudeScale(latitude: number): number {
+    // Clamped rather than passed through: cos(90°) is zero, and a zero here
+    // would divide by zero on the way back out of the frame.
+    const clamped = Math.max(-89.9, Math.min(89.9, latitude));
+
+    return Math.cos((clamped * Math.PI) / 180);
+}
+
+/**
+ * A stretch of street, measured.
+ *
+ * One entry per part of the road's MultiLineString, and the split is not
+ * bookkeeping: a road can be stored as more than one part with a real gap
+ * between them, and a walk that stepped over that gap would lay a route across
+ * empty land. Each part is therefore walked on its own and the walk stops at
+ * the end of the one it started in.
+ *
+ * Held in a local metric frame — degrees of longitude scaled by the cosine of
+ * the reference latitude — so a chainage in metres is a plain sum rather than a
+ * sum that mixes two different units. See longitudeScale for why those two are
+ * not the same size.
+ */
+interface StreetPart {
+    /** Positions in the metric frame: `[lng * scale, lat]`. */
+    points: Position[];
+    /** `chainage[i]` is the distance in metres from the start to `points[i]`. */
+    chainage: number[];
+}
+
+/** How far a walk may follow the street before it gives up, in metres. */
+export const PROPAGATION_MAX_ARC_METERS = 250;
+
+/**
+ * How many following vertices a walk may consider.
+ *
+ * Four, and the walk stops the moment one of them is too far off the street, so
+ * the honest answer to "the next two points" is usually two and never more than
+ * four. The number exists to bound the worst case — a route running exactly along
+ * a street would otherwise be pulled as far as the reviewer cared to look — and
+ * a limit of two would cut off a legitimate correction that happens to span
+ * three vertices.
+ */
+export const PROPAGATION_MAX_VERTICES = 4;
+
+export interface PropagationLimits {
+    /**
+     * Furthest a following vertex may sit from the centreline and still be
+     * taken, in metres.
+     *
+     * The same bar the dragged vertex itself was held to, which is why this is
+     * derived from the active snap threshold rather than being a number of its
+     * own: a reviewer who set the threshold to 25 m has already said how far off
+     * a centreline they are willing to accept, and a second number would be a
+     * second thing to calibrate with no visible reason to disagree with the
+     * first.
+     */
+    maxOffset: number;
+    /** Furthest the walk may travel along the street from the drop, in metres. */
+    maxArc: number;
+    /** Most following vertices to consider, whatever the distances say. */
+    maxVertices: number;
+}
+
+/**
+ * The limits a walk runs under, given the snap preset in force.
+ *
+ * Built here rather than at the call site so that what a preset means for the
+ * drag and what it means for the vertices that follow cannot drift apart. The
+ * threshold is the only input, deliberately: everything else is a bound on how
+ * far the feature may reach, not a setting.
+ */
+export function propagationLimitsFor(threshold: number): PropagationLimits {
+    return {
+        maxOffset: threshold,
+        maxArc: PROPAGATION_MAX_ARC_METERS,
+        maxVertices: PROPAGATION_MAX_VERTICES,
+    };
+}
+
+/** Which way along the route a walk travels. */
+export type PropagationDirection = 1 | -1;
+
+export interface PropagationResult {
+    coordinates: Coordinates;
+    /** The vertices that were moved, in the order the walk reached them. */
+    moved: VertexRef[];
+}
+
+/** A vertex placed on the street, with the position to put it at. */
+interface Placement {
+    ref: VertexRef;
+    position: Position;
+}
+
+/**
+ * The street's parts, measured from the reference's latitude.
+ *
+ * Built per call rather than cached because the reference moves with every drop
+ * and the whole structure is a few hundred numbers: caching it would mean a key
+ * to invalidate and a stale frame to reason about, in exchange for saving work
+ * nobody can measure.
+ */
+function measureStreet(street: Coordinates, latitude: number): StreetPart[] {
+    const scale = longitudeScale(latitude);
+
+    return street
+        .filter((part) => part.length >= 2)
+        .map((points) => {
+            const metric = points.map(
+                (position) => [position[0] * scale, position[1]] as Position,
+            );
+            const chainage = [0];
+
+            for (let i = 1; i < metric.length; i++) {
+                // In metres, not in the frame's degrees. The frame removes the
+                // difference between a degree of longitude and a degree of
+                // latitude; this removes the difference between a degree and a
+                // metre. Leaving it out scales every chainage by 111 320, which
+                // makes the arc limit effectively unlimited and lets a walk run
+                // the length of a street instead of the length the reviewer
+                // agreed to.
+                chainage.push(
+                    chainage[i - 1] + metricDistance(metric[i - 1], metric[i]),
+                );
+            }
+
+            return { points: metric, chainage };
+        });
+}
+
+/**
+ * Distance in metres between two positions *in the metric frame*.
+ *
+ * Named for what it needs rather than what it is, because the frame is a
+ * precondition and getting it wrong is silent: a raw `[lng, lat]` pair read as
+ * metric is a point at the wrong longitude, and the only symptom is a walk that
+ * stops early or pulls a stretch to the wrong side of the street.
+ *
+ * The frame's scaling is not applied here — it is already in the positions —
+ * because a route vertex is only ever *measured* against the street and never
+ * rewritten by the walk, so it is converted in at the point of comparison and
+ * does not travel any further.
+ */
+function metricDistance(a: Position, b: Position): number {
+    return Math.hypot(a[0] - b[0], a[1] - b[1]) * METERS_PER_DEGREE;
+}
+
+/**
+ * Where a target lands on one part of the street, within a window of it.
+ *
+ * `target` must already be in the metric frame, like the part it is measured
+ * against. Everything this returns is in that frame too, so the caller undoes
+ * the scaling once on the way out rather than here.
+ *
+ * The window is what makes this a walk and not a lookup. A plain "closest point
+ * on the street" would hand back the near end of the line for a vertex that sits
+ * at the far end of it, and following that around a route of any length folds
+ * the geometry back on itself into a scribble. Searching only the stretch ahead
+ * of the cursor — bounded by how far the walk is allowed to go — is what makes
+ * the result monotone by construction rather than by a check afterwards.
+ */
+function closestOnPart(
+    part: StreetPart,
+    target: Position,
+    from: number,
+    direction: PropagationDirection,
+    maxArc: number,
+): { chainage: number; point: Position; distance: number } | null {
+    const low = direction === 1 ? from : from - maxArc;
+    const high = direction === 1 ? from + maxArc : from;
+
+    let best: { chainage: number; point: Position; distance: number } | null =
+        null;
+
+    for (let i = 0; i < part.points.length - 1; i++) {
+        const segmentStart = part.chainage[i];
+        const segmentEnd = part.chainage[i + 1];
+
+        // Only the part of this segment the window actually covers.
+        const from2 = Math.max(segmentStart, low);
+        const to2 = Math.min(segmentEnd, high);
+
+        if (to2 < from2) {
+            continue;
+        }
+
+        const a = pointAtChainage(part, i, from2);
+        const b = pointAtChainage(part, i, to2);
+        const projection = projectOnSegment(target, a, b);
+
+        // Clamped, and this is the whole reason the window works.
+        // projectOnSegment reports its parameter unclamped on purpose — an
+        // overshoot is how a click is placed on the right side of a vertex — but
+        // here a and b are already the window's edges, so an overshoot means the
+        // target is outside the stretch the walk may use and the answer has to be
+        // the nearest edge rather than a point beyond the end of the way.
+        //
+        // Left unclamped this hands back a chainage outside [low, high]: a vertex
+        // 106 m west of a street that begins there came back at -106, which put
+        // the cursor behind the start of the way and made the spacing rule measure
+        // the wrong distance. The distance was never wrong, because it was
+        // measured to the already-clamped foot — which is exactly why every test
+        // that only checked a refusal passed while the cursor quietly did not.
+        const t = Math.max(0, Math.min(1, projection.t));
+        const chainage = from2 + t * (to2 - from2);
+        const point: Position = [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+        ];
+        const distance = metricDistance(target, point);
+
+        if (best === null || distance < best.distance) {
+            best = { chainage, point, distance };
+        }
+    }
+
+    return best;
+}
+
+/**
+ * A point `chainage` metres along segment `index`, clamped to the segment.
+ *
+ * Needed because a window boundary rarely lands on a vertex, and reading the
+ * position off the nearest stored vertex instead would put a propagated vertex
+ * up to a whole segment away from the centreline — visible as the route stepping
+ * sideways at the end of a stretch.
+ */
+function pointAtChainage(
+    part: StreetPart,
+    index: number,
+    chainage: number,
+): Position {
+    const a = part.points[index];
+    const b = part.points[index + 1];
+    const length = part.chainage[index + 1] - part.chainage[index];
+    const t = length === 0 ? 0 : (chainage - part.chainage[index]) / length;
+    const clamped = Math.max(0, Math.min(1, t));
+
+    return [a[0] + (b[0] - a[0]) * clamped, a[1] + (b[1] - a[1]) * clamped];
+}
+
+/**
+ * The part of the street a position belongs to, and where along it.
+ *
+ * The closest part wins, ties going to the first, so the same drop on the same
+ * street always starts its walk from the same place. The distance is kept only
+ * to make that choice — it is not a snap decision, which `decideSnap` has
+ * already made by the time anything here runs.
+ */
+function locateOnStreet(
+    parts: StreetPart[],
+    position: Position,
+    scale: number,
+): { part: StreetPart; chainage: number } | null {
+    const metric: Position = [position[0] * scale, position[1]];
+    let best: { part: StreetPart; chainage: number; distance: number } | null =
+        null;
+
+    for (const part of parts) {
+        for (let i = 0; i < part.points.length - 1; i++) {
+            const projection = projectOnSegment(
+                metric,
+                part.points[i],
+                part.points[i + 1],
+            );
+            const length = part.chainage[i + 1] - part.chainage[i];
+            const distance = metricDistance(projection.point, metric);
+
+            if (best === null || distance < best.distance) {
+                best = {
+                    part,
+                    chainage: part.chainage[i] + projection.t * length,
+                    distance,
+                };
+            }
+        }
+    }
+
+    return best === null ? null : { part: best.part, chainage: best.chainage };
+}
+
+/**
+ * Pull the vertices that follow a snapped one onto the same street.
+ *
+ * A snap moves the vertices the reviewer grabbed, and nothing else, so a
+ * one-vertex drag onto a street two blocks over leaves its neighbours sitting on
+ * the street it came from. The route then crosses the block diagonally, and the
+ * kink is the reviewer's first sign that the tool did half a job. This is the
+ * other half.
+ *
+ * Three rules keep it from doing damage, and all three are about stopping:
+ *
+ * The walk is monotone. Each vertex is searched for only in the stretch ahead of
+ * where the last one landed, so the route cannot be folded back along the street
+ * it is already following. There is deliberately no tolerance for a vertex a
+ * little behind the cursor — a route that wiggles a couple of metres has its
+ * wiggling straightened, and one that genuinely doubles back is further than the
+ * offset limit from anything in the window and ends the walk.
+ *
+ * It stops at the first vertex too far from the centreline. That vertex is the
+ * route announcing it has left this street — a turn, or the end of the block —
+ * and everything past it is a different street's business.
+ *
+ * And it stops at the end of the way. One row of `roads` is one OSM way and a
+ * way ends at a node, so a named street that is 38 ways long is corrected 38
+ * times rather than once. That is the honest limit of what the table can answer,
+ * and it is a visible one: the route straightens for a block and then stops.
+ *
+ * The reference is expected to already be on the centreline, which it is by the
+ * time this runs — the offset is applied first and the walk starts from the
+ * result. Nothing here checks that, because there is nothing useful to do if it
+ * is not: starting from a cursor that is off the street would put every
+ * propagated vertex that same distance off it, which is the rigid offset this
+ * feature exists to replace.
+ *
+ * The walk never crosses a segment boundary. A route's MultiLineString segments
+ * are not a continuation of each other, and a stretch that ran off the end of
+ * one into the next is not a stretch on one street.
+ *
+ * A null street is part of the signature rather than a caller error, because
+ * that is genuinely what arrives: the centreline comes off a lookup response
+ * that is allowed to omit it, and the drop has already snapped by the time
+ * anyone asks. It costs the propagation and nothing else.
+ *
+ * Returns the input untouched when nothing is taken, rather than a copy of it.
+ * Most drops propagate nothing, and a route of five hundred vertices should not
+ * be deep-copied to say so; callers branch on `moved` and are given a fresh
+ * array in the branch where they use it.
+ */
+export function propagateAlongStreet(
+    coordinates: Coordinates,
+    reference: VertexRef,
+    street: Coordinates | null,
+    direction: PropagationDirection,
+    limits: PropagationLimits,
+): PropagationResult {
+    const referencePosition = positionAt(coordinates, reference);
+
+    if (referencePosition === null || !street) {
+        return { coordinates, moved: [] };
+    }
+
+    const parts = measureStreet(street, referencePosition[1]);
+
+    if (parts.length === 0) {
+        return { coordinates, moved: [] };
+    }
+
+    const scale = longitudeScale(referencePosition[1]);
+    const start = locateOnStreet(parts, referencePosition, scale);
+
+    if (start === null) {
+        return { coordinates, moved: [] };
+    }
+
+    const segment = coordinates[reference.segment];
+
+    if (segment === undefined) {
+        return { coordinates, moved: [] };
+    }
+
+    const placements: Placement[] = [];
+    let cursor = start.chainage;
+    let index = reference.index + direction;
+
+    while (placements.length < limits.maxVertices) {
+        if (index < 0 || index >= segment.length) {
+            break;
+        }
+
+        const target = segment[index];
+
+        if (!target) {
+            break;
+        }
+
+        const found = closestOnPart(
+            start.part,
+            [target[0] * scale, target[1]],
+            cursor,
+            direction,
+            limits.maxArc,
+        );
+
+        if (found === null || found.distance > limits.maxOffset) {
+            break;
+        }
+
+        // Out of the metric frame, which is the only place the scaling is
+        // undone. Getting this wrong mirrors the propagated stretch east or west
+        // of the route, and unlike the walk itself nothing downstream would
+        // notice.
+        placements.push({
+            ref: { segment: reference.segment, index },
+            position: [found.point[0] / scale, found.point[1]],
+        });
+
+        cursor = found.chainage;
+        index += direction;
+    }
+
+    if (placements.length === 0) {
+        return { coordinates, moved: [] };
+    }
+
+    const next = coordinates.map((part) => [...part]);
+
+    for (const placement of placements) {
+        next[placement.ref.segment][placement.ref.index] = placement.position;
+    }
+
+    return {
+        coordinates: next,
+        moved: placements.map((placement) => placement.ref),
+    };
+}
+
+/**
+ * A validated answer about one street, from either of the two lookups.
+ *
+ * Lives here rather than in the wire module because it is a domain shape � a
+ * street, in this module's own coordinate order, with the geometry already
+ * checked � and the wire module's job is to produce one. The dependency runs
+ * that way already, so putting it here keeps it pointing one direction.
+ */
+export interface StreetLookup {
+    /** The road's identity, which is what keeps one street's cursor its own. */
+    roadId: number;
+    name: string | null;
+    /** How many neighbouring points recognised this street. */
+    votes: number;
+    /** How far the point sits from it, in metres. */
+    distance: number;
+    /** The centreline, or null when the response carried nothing usable. */
+    line: Coordinates | null;
+}
+
+/**
+ * How far apart two vertices on the same street have to end up, in metres.
+ *
+ * The project already had a number for this and this is it: adding a vertex
+ * within ten metres of an existing one is refused, so ten metres is what a
+ * reviewer already expects two distinct points on a route to look like. Reusing
+ * it rather than inventing a second figure is why this is not a setting.
+ *
+ * It applies *within one street* and nowhere else, and that is the rule that
+ * makes a corner work. Where a route turns, the street it came along ends and
+ * the street it turned onto begins a metre or two away, and those two vertices
+ * belong exactly where they are. Enforcing the minimum across a street change
+ * would shove them ten metres down their own streets and flatten every turn in
+ * the selection into a rounded corner that is not on the map.
+ */
+export const RELAY_MIN_SPACING_METERS = 10;
+
+export interface RelayLimits {
+    /**
+     * Furthest a vertex may sit from a street and still be moved onto it, in
+     * metres.
+     *
+     * The snap preset's threshold, for the same reason it is on a propagation: it
+     * is the one number the reviewer has already calibrated. A vertex beyond it is
+     * somewhere the imported network does not reach, and those are left exactly
+     * where they are rather than pulled towards the nearest thing that happens to
+     * be nearby.
+     */
+    maxOffset: number;
+    /** The separation enforced between two vertices on the same street. */
+    minSpacing: number;
+}
+
+export function relayLimitsFor(threshold: number): RelayLimits {
+    return {
+        maxOffset: threshold,
+        minSpacing: RELAY_MIN_SPACING_METERS,
+    };
+}
+
+/** What one street was asked to do, for the message the reviewer reads. */
+export interface RelayStreetReport {
+    roadId: number;
+    name: string | null;
+    /** How many vertices were moved onto it. */
+    placed: number;
+    /**
+     * The smallest separation actually achieved between two vertices on it, or
+     * null while only one has been placed and there is no pair to measure.
+     *
+     * Reported because the target cannot always be met: a street shorter than the
+     * number of vertices put on it cannot give them ten metres each. Printing the
+     * target when the result was four metres would be a claim about the geometry
+     * that the reviewer has no way to check.
+     */
+    closestSpacing: number | null;
+}
+
+export interface RelayResult {
+    coordinates: Coordinates;
+    /** Every vertex that moved, in the order the selection was re-laid. */
+    moved: VertexRef[];
+    /** One entry per street used, in the order first reached. */
+    streets: RelayStreetReport[];
+    /** How many selected vertices had no street to move onto. */
+    unmatched: number;
+}
+
+/**
+ * A position a given number of metres along a street, clamped to its end.
+ *
+ * Distinct from pointAtChainage, which is told which segment to look in and is
+ * used where the segment is already known. This one does not know, and answers
+ * the question a caller placing a vertex actually has: put it here, and if that
+ * is past the end of the way then put it at the end. Clamping is the right
+ * answer for that caller, because it has already decided the vertex belongs on
+ * this street, and the alternative is leaving it off the street entirely.
+ */
+function positionAtChainage(part: StreetPart, chainage: number): Position {
+    const last = part.points.length - 2;
+
+    for (let i = 0; i < last; i++) {
+        if (chainage <= part.chainage[i + 1]) {
+            return pointAtChainage(part, i, chainage);
+        }
+    }
+
+    return pointAtChainage(part, Math.max(0, last), part.chainage[last + 1]);
+}
+
+/**
+ * Re-lay a selected stretch of route onto the street network, one vertex at a
+ * time.
+ *
+ * The two things that came before this both *move* geometry. A drag applies one
+ * rigid offset to the selection; a propagation walks a few vertices onto the
+ * street a dropped vertex happened to land on. Neither can reshape anything, and
+ * that is precisely why a straight run drawn over a road that curves cannot be
+ * fixed by either � no offset turns a line into a curve. This projects each
+ * vertex onto its own street, so the shape comes from the network rather than
+ * from the drag.
+ *
+ * Per vertex is also what lets a selection that turns a corner come out right.
+ * The point before the corner belongs to the street the route came along, the
+ * point after belongs to the one it turned onto, and neither is wrong. A rule
+ * insisting on one street for the whole selection would have to be wrong about
+ * one of them.
+ *
+ * Two invariants make the result a route rather than a pile of points.
+ *
+ * Each street keeps a cursor, so a vertex can never land behind one already
+ * placed on that same street � including when it is not adjacent in the route,
+ * since a street can be left and rejoined further along. Without it, a vertex
+ * sitting nearer the start of its street would send the route backwards down the
+ * road it is already on.
+ *
+ * And two vertices on one street are kept `minSpacing` apart, which is the
+ * answer to a reviewer's worry about points piling up. The rule is per street
+ * precisely so that a corner is exempt, because there two vertices legitimately
+ * a metre apart *are* the turn.
+ *
+ * The target can be unmeetable � a street shorter than the vertices put on it �
+ * and then it is reduced to what fits rather than refused, because the
+ * alternatives are overlapping points or a correction the reviewer cannot make
+ * in one action. What was really achieved is reported, so the number on screen
+ * is the number in the geometry.
+ *
+ * A vertex with no street inside the limit keeps its position and does not move
+ * any street's cursor. Nothing is invented for it, so a selection that turns out
+ * to be mostly off-network comes back mostly untouched.
+ *
+ * Never adds or removes a vertex, so point indexes survive and precomputed
+ * transfers stay valid � the property that makes this safe to offer on a route
+ * of five hundred vertices.
+ *
+ * Returns the input untouched when nothing is moved, by identity rather than a
+ * copy, for the same reason the propagation does.
+ */
+export function relaySelectionOntoNetwork(
+    coordinates: Coordinates,
+    selection: VertexRef[],
+    lookups: StreetLookup[],
+    limits: RelayLimits,
+): RelayResult {
+    const nothing = (unmatched: number): RelayResult => ({
+        coordinates,
+        moved: [],
+        streets: [],
+        unmatched,
+    });
+
+    if (selection.length === 0 || lookups.length === 0) {
+        return nothing(0);
+    }
+
+    // In route order, because both invariants are statements about order: a
+    // cursor is about what came before, and a corner is about what comes next. A
+    // selection arrives from a box gesture, which has no order at all until one
+    // is given to it.
+    const ordered = [...selection].sort((a, b) =>
+        a.segment !== b.segment ? a.segment - b.segment : a.index - b.index,
+    );
+
+    // Where each street's walk has reached, keyed by road id. Two ways of the
+    // same named street are two rows in the network and get two cursors: a cursor
+    // that crossed between them would be a cursor on no street at all, since the
+    // ways are not connected in the data.
+    const cursors = new Map<number, number>();
+    const reportByRoad = new Map<number, RelayStreetReport>();
+    const streets: RelayStreetReport[] = [];
+    const placed = new Map<string, Position>();
+    const moved: VertexRef[] = [];
+    let unmatched = 0;
+
+    for (const [i, ref] of ordered.entries()) {
+        // Matched by position, not by identity. The reply is a list in the order
+        // the points were sent and the selection was sorted above, so the position
+        // in the sorted selection is the only thing the two share.
+        const lookup = lookups[i];
+        const point = positionAt(coordinates, ref);
+
+        if (!point || !lookup || lookup.line === null) {
+            unmatched += 1;
+            continue;
+        }
+
+        if (lookup.distance > limits.maxOffset) {
+            unmatched += 1;
+            continue;
+        }
+
+        const parts = measureStreet(lookup.line, point[1]);
+
+        if (parts.length === 0) {
+            unmatched += 1;
+            continue;
+        }
+
+        const scale = longitudeScale(point[1]);
+        const start = locateOnStreet(parts, point, scale);
+
+        if (start === null) {
+            unmatched += 1;
+            continue;
+        }
+
+        // Bounded to the part of the street this vertex may occupy rather than
+        // the whole way, and that bound is what keeps the cursor meaningful.
+        // Without it a vertex near the far end of a street would project back onto
+        // its near end and the route would fold onto itself. The floor is the
+        // cursor itself, so a first vertex on this street is unconstrained and a
+        // later one cannot be placed behind an earlier one.
+        const found = closestOnPart(
+            start.part,
+            [point[0] * scale, point[1]],
+            cursors.get(lookup.roadId) ?? 0,
+            1,
+            Number.POSITIVE_INFINITY,
+        );
+
+        if (found === null) {
+            unmatched += 1;
+            continue;
+        }
+
+        // Where the street would put it, and where the spacing rule will not let
+        // it sit. The two are the same number when the projection is already
+        // clear, which is the common case and the reason this does not distort a
+        // route that is merely a little off.
+        const end = start.part.chainage[start.part.chainage.length - 1];
+        const previous = cursors.get(lookup.roadId);
+        const wanted =
+            previous === undefined
+                ? found.chainage
+                : Math.max(found.chainage, previous + limits.minSpacing);
+        const target = Math.min(wanted, end);
+        const separation = previous === undefined ? null : target - previous;
+
+        const position = positionAtChainage(start.part, target);
+        const next: Position = [position[0] / scale, position[1]];
+
+        cursors.set(lookup.roadId, target);
+        placed.set(`${ref.segment}:${ref.index}`, next);
+        moved.push(ref);
+
+        const report = reportByRoad.get(lookup.roadId);
+
+        if (report) {
+            report.placed += 1;
+            report.closestSpacing =
+                separation === null
+                    ? report.closestSpacing
+                    : report.closestSpacing === null
+                      ? separation
+                      : Math.min(report.closestSpacing, separation);
+        } else {
+            const fresh: RelayStreetReport = {
+                roadId: lookup.roadId,
+                name: lookup.name,
+                placed: 1,
+                closestSpacing: null,
+            };
+
+            reportByRoad.set(lookup.roadId, fresh);
+            streets.push(fresh);
+        }
+    }
+
+    if (moved.length === 0) {
+        return nothing(unmatched);
+    }
+
+    const next = coordinates.map((part) => [...part]);
+
+    for (const ref of moved) {
+        const position = placed.get(`${ref.segment}:${ref.index}`);
+
+        if (position) {
+            next[ref.segment][ref.index] = position;
+        }
+    }
+
+    return { coordinates: next, moved, streets, unmatched };
+}
