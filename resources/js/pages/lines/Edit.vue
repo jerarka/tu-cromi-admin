@@ -4,6 +4,7 @@ import {
     ArrowLeft,
     ArrowLeftRight,
     ArrowRightLeft,
+    ChevronDown,
     ChevronLeft,
     ChevronRight,
     Redo2,
@@ -19,14 +20,31 @@ import LineMap from '@/components/lines/LineMap.vue';
 import RouteModePicker from '@/components/lines/RouteModePicker.vue';
 import RouteStats from '@/components/lines/RouteStats.vue';
 import { Button } from '@/components/ui/button';
+import {
+    Collapsible,
+    CollapsibleContent,
+    CollapsibleTrigger,
+} from '@/components/ui/collapsible';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import {
+    Tooltip,
+    TooltipContent,
+    TooltipProvider,
+    TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { usePropagation } from '@/composables/usePropagation';
 import { useResampleSpacing } from '@/composables/useResampleSpacing';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
-import { RESAMPLE_SPACING_METERS, SNAP_PRESET_NAMES } from '@/lib/routeEditing';
-import type { ResampleSpacing, SnapPreset } from '@/lib/routeEditing';
+import {
+    describePropagationTooltip,
+    describeSnapPreset,
+    describeSnapTooltip,
+    SNAP_PRESET_NAMES,
+    snapOptionsFor,
+} from '@/lib/routeEditing';
+import type { SnapPreset } from '@/lib/routeEditing';
 import {
     canRedo,
     canUndo,
@@ -37,20 +55,6 @@ import {
 } from '@/lib/undoStack';
 import lines from '@/routes/lines';
 import type { DirectionOperation, Line, LineNav } from '@/types/line';
-
-/**
- * The presets as the reviewer reads them.
- *
- * Kept beside the settings themselves rather than inside them: the numbers are
- * domain, the wording is presentation, and a preset table carrying both would
- * make a copy change look like a behaviour change.
- */
-const SNAP_PRESET_LABELS: Record<SnapPreset, string> = {
-    off: 'Off',
-    subtle: 'Subtle',
-    normal: 'Normal',
-    aggressive: 'Aggressive',
-};
 
 /**
  * How many geometry states to keep. Deep enough to walk back through a whole
@@ -153,6 +157,16 @@ watch(
 );
 
 const canChangeDirection = computed(() => Boolean(props.counterpart));
+
+/**
+ * Whether the direction card is open.
+ *
+ * Local rather than shared because it is the only disclosure on the page and it
+ * has nothing to coordinate with. Open by default on nothing: the card used to
+ * be the first thing on screen and it was carrying fifty-six words for three
+ * rarely-pressed buttons, so the reviewer paid that cost before seeing the map.
+ */
+const directionOpen = ref(false);
 
 const directionActions: {
     operation: DirectionOperation;
@@ -272,6 +286,30 @@ const canRedoGeometry = computed(() => canRedo(history.value));
 const { snapPreset, updateSnapPreset } = useSnapPreset();
 const { propagationEnabled, updatePropagation } = usePropagation();
 const { resampleSpacing, updateResampleSpacing } = useResampleSpacing();
+
+/**
+ * What the snap will do with a drop, in detail.
+ *
+ * A tooltip on the preset rather than a paragraph under it. The distance that
+ * decides whether a drop snaps at all is printed on the control itself, and what
+ * is left to say is the part a reviewer needs *after* something went somewhere
+ * unexpected — chiefly the crossing rule, which only becomes observable at an
+ * intersection and is useless until then.
+ */
+const snapTooltip = computed(() => describeSnapTooltip(snapPreset.value));
+
+/**
+ * What propagation does around a drop.
+ *
+ * Both limits come from the snap's own threshold rather than a second figure, so
+ * the checkbox cannot appear to disagree with the select about how far a vertex
+ * has to be to count as on the street.
+ */
+const propagationTooltip = computed(() => {
+    const options = snapOptionsFor(snapPreset.value);
+
+    return describePropagationTooltip(options?.threshold ?? 0);
+});
 
 /**
  * Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z, deferring to the browser's own text undo
@@ -449,7 +487,6 @@ const pageTitle = computed(
     </div>
     <Heading
         :title="pageTitle"
-        description="Update line name, color, syndicate, or route geometry"
     />
 
     <div class="grid gap-8 lg:grid-cols-5">
@@ -563,62 +600,94 @@ const pageTitle = computed(
 
         <!-- Map preview / editor -->
         <div class="space-y-4 lg:col-span-3">
-            <div class="rounded-md border p-4">
-                <div class="flex items-center justify-between">
-                    <Label>Direction</Label>
-                    <span
-                        v-if="props.line.geometry_adjusted"
-                        class="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300"
-                    >
-                        Manually corrected
-                    </span>
-                </div>
-                <p class="mt-2 text-sm text-muted-foreground">
-                    The source data does not record which end a bus departs
-                    from, so this is a manual correction. Both actions cover
-                    this line and its counterpart, and both are undone by
-                    repeating them.
-                </p>
-                <div class="mt-3 flex flex-wrap gap-2">
-                    <Button
-                        v-for="action in directionActions"
-                        :key="action.operation"
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        :disabled="!canChangeDirection"
-                        :title="
-                            canChangeDirection
-                                ? undefined
-                                : 'This line has no counterpart to re-orient.'
-                        "
-                        @click="
-                            applyDirection(action.operation, action.confirm)
-                        "
-                    >
-                        <component :is="action.icon" class="size-4" />
-                        {{ action.label }}
-                    </Button>
-                    <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        title="Restore this line's geometry from the source GeoJSON"
-                        @click="refreshGeometry"
-                    >
-                        <RotateCcw class="size-4" />
-                        Reset to source
-                    </Button>
-                </div>
-                <p
-                    v-if="!canChangeDirection"
-                    class="mt-2 text-sm text-muted-foreground"
+            <!--
+                Collapsed, and the reason is volume rather than tidiness. This
+                card was carrying fifty-six words of prose for three buttons that
+                are rarely pressed — it out-weighed the entire map toolbar above,
+                while being about the line rather than about its geometry. The
+                trigger row keeps both badges visible, because the state is what a
+                reviewer has to see without opening anything.
+            -->
+            <Collapsible v-model:open="directionOpen" class="rounded-md border">
+                <CollapsibleTrigger
+                    class="flex w-full items-center justify-between px-4 py-3 text-left"
                 >
-                    A line with no counterpart cannot be re-oriented. Circular
-                    routes such as 72 and 73 are legitimately alone in their
-                    direction.
-                </p>
-            </div>
+                    <span class="flex items-center gap-2">
+                        <Label>Direction</Label>
+                        <span
+                            v-if="props.line.geometry_adjusted"
+                            class="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                        >
+                            Manually corrected
+                        </span>
+                        <!--
+                            On the trigger rather than inside the panel, and that
+                            placement is not cosmetic. The two direction buttons are
+                            disabled without a counterpart, and the codebase has
+                            already written down why that reason cannot live
+                            behind a disclosure: hiding the action must not hide
+                            the reason it cannot be used.
+                        -->
+                        <span
+                            v-if="!canChangeDirection"
+                            class="rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground"
+                        >
+                            No counterpart
+                        </span>
+                    </span>
+                    <ChevronDown
+                        class="size-4 shrink-0 text-muted-foreground transition-transform"
+                        :class="{ 'rotate-180': directionOpen }"
+                    />
+                </CollapsibleTrigger>
+                <CollapsibleContent class="px-4 pb-4">
+                    <p class="text-sm text-muted-foreground">
+                        The source data does not record which end a bus departs
+                        from, so this is a manual correction. Both actions cover
+                        this line and its counterpart, and both are undone by
+                        repeating them.
+                    </p>
+                    <div class="mt-3 flex flex-wrap gap-2">
+                        <Button
+                            v-for="action in directionActions"
+                            :key="action.operation"
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            :disabled="!canChangeDirection"
+                            :title="
+                                canChangeDirection
+                                    ? undefined
+                                    : 'This line has no counterpart to re-orient.'
+                            "
+                            @click="
+                                applyDirection(action.operation, action.confirm)
+                            "
+                        >
+                            <component :is="action.icon" class="size-4" />
+                            {{ action.label }}
+                        </Button>
+                        <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            title="Restore this line's geometry from the source GeoJSON"
+                            @click="refreshGeometry"
+                        >
+                            <RotateCcw class="size-4" />
+                            Reset to source
+                        </Button>
+                    </div>
+                    <p
+                        v-if="!canChangeDirection"
+                        class="mt-2 text-sm text-muted-foreground"
+                    >
+                        A line with no counterpart cannot be re-oriented.
+                        Circular routes such as 72 and 73 are legitimately alone
+                        in their direction.
+                    </p>
+                </CollapsibleContent>
+            </Collapsible>
 
             <div class="flex items-center justify-between">
                 <div class="flex items-center gap-2">
@@ -632,7 +701,7 @@ const pageTitle = computed(
                         variant="ghost"
                         size="sm"
                         :disabled="!canUndoGeometry"
-                        title="Undo the last geometry edit (Ctrl+Z)"
+                        title="Undo the last geometry edit (Ctrl+Z). The map keeps its framing, so you stay where you were looking."
                         @click="undo"
                     >
                         <Undo2 class="size-4" />
@@ -661,105 +730,6 @@ const pageTitle = computed(
                     </Button>
                 </div>
             </div>
-            <RouteModePicker v-if="isEditingMap" v-model="mode">
-                <div
-                    v-if="mode === 'move'"
-                    class="ms-1 flex flex-wrap items-center gap-4"
-                >
-                    <div class="flex items-center gap-2">
-                        <Label for="snap-preset">Snap</Label>
-                        <select
-                            id="snap-preset"
-                            :value="snapPreset"
-                            class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
-                            @change="
-                                updateSnapPreset(
-                                    ($event.target as HTMLSelectElement)
-                                        .value as SnapPreset,
-                                )
-                            "
-                        >
-                            <option
-                                v-for="preset in SNAP_PRESET_NAMES"
-                                :key="preset"
-                                :value="preset"
-                            >
-                                {{ SNAP_PRESET_LABELS[preset] }}
-                            </option>
-                        </select>
-                    </div>
-
-                    <!--
-                        A checkbox rather than another preset value, and gated on
-                        snapping being on at all: with the preset at "off" there is
-                        no street for a drop to be pulled onto, so leaving the box
-                        ticked would be a setting that says it is doing something
-                        when it provably is not.
-                    -->
-                    <div
-                        v-if="snapPreset !== 'off'"
-                        class="flex items-center gap-2"
-                    >
-                        <input
-                            id="snap-propagate"
-                            type="checkbox"
-                            class="size-4 rounded border-input accent-primary"
-                            :checked="propagationEnabled"
-                            @change="
-                                updatePropagation(
-                                    ($event.target as HTMLInputElement).checked,
-                                )
-                            "
-                        />
-                        <Label for="snap-propagate" class="font-normal">
-                            Pull neighbouring points onto the same street
-                        </Label>
-                    </div>
-                </div>
-
-                <!--
-                    Its own control rather than another snap preset value,
-                    because it is a question about the vertices the route
-                    already has rather than about where a drop should land. A
-                    preset would read as a snap setting and would inherit the
-                    threshold that governs it.
-
-                    Gated on move mode like the snap controls beside it, and for
-                    the same reason the propagation checkbox is gated on the
-                    preset: the button this feeds only exists in move mode, so a
-                    picker left on screen in add or delete is a setting that
-                    says it is doing something when it provably is not.
-                -->
-                <div
-                    v-if="mode === 'move'"
-                    class="ms-1 flex flex-wrap items-center gap-4"
-                >
-                    <div class="flex items-center gap-2">
-                        <Label for="resample-spacing">Re-space</Label>
-                        <select
-                            id="resample-spacing"
-                            :value="resampleSpacing"
-                            class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
-                            @change="
-                                updateResampleSpacing(
-                                    Number(
-                                        ($event.target as HTMLSelectElement)
-                                            .value,
-                                    ) as ResampleSpacing,
-                                )
-                            "
-                        >
-                            <option
-                                v-for="spacing in RESAMPLE_SPACING_METERS"
-                                :key="spacing"
-                                :value="spacing"
-                            >
-                                {{ spacing }} m
-                            </option>
-                        </select>
-                    </div>
-                </div>
-            </RouteModePicker>
             <LineMap
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
@@ -770,13 +740,117 @@ const pageTitle = computed(
                 :resample-spacing="resampleSpacing"
                 :preserve-view-token="preserveViewToken"
                 @update:geo-json="onMapUpdate"
-            />
-            <p
-                v-if="isEditingMap && mode === 'move'"
-                class="text-sm text-blue-600 dark:text-blue-500"
+                @update:resample-spacing="updateResampleSpacing"
             >
-                Undo takes back the last geometry edit, without moving the map.
-            </p>
+                <!--
+                    Handed to the map rather than rendered beside it, so the mode
+                    picker, the settings and the action buttons all land in one
+                    toolbar above the map. The map holds the selection state the
+                    actions act on, and a toolbar that was half in the page and
+                    half in the map is how they end up on opposite sides of the
+                    thing they control.
+                -->
+                <template #toolbar>
+                    <RouteModePicker v-if="isEditingMap" v-model="mode">
+                        <div
+                            v-if="mode === 'move'"
+                            class="flex flex-wrap items-center gap-4"
+                        >
+                            <!--
+                                The threshold is on the control rather than in a
+                                paragraph under it. "Normal" alone says nothing
+                                about whether a drop will snap, which is why there
+                                used to be fifty-eight words explaining what the
+                                preset would do � and why they could never be
+                                removed, since the reviewer had nowhere else to
+                                find the number.
+                            -->
+                            <div class="flex items-center gap-2">
+                                <Label for="snap-preset">Snap</Label>
+                                <TooltipProvider :delay-duration="0">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <span class="inline-flex">
+                                                <select
+                                                    id="snap-preset"
+                                                    :value="snapPreset"
+                                                    class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+                                                    @change="
+                                                        updateSnapPreset(
+                                                            (
+                                                                $event.target as HTMLSelectElement
+                                                            )
+                                                                .value as SnapPreset,
+                                                        )
+                                                    "
+                                                >
+                                                    <option
+                                                        v-for="preset in SNAP_PRESET_NAMES"
+                                                        :key="preset"
+                                                        :value="preset"
+                                                    >
+                                                        {{
+                                                            describeSnapPreset(
+                                                                preset,
+                                                            )
+                                                        }}
+                                                    </option>
+                                                </select>
+                                            </span>
+                                        </TooltipTrigger>
+                                        <TooltipContent class="max-w-xs">
+                                            <p>{{ snapTooltip }}</p>
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </TooltipProvider>
+                            </div>
+
+                            <!--
+                                A checkbox rather than another preset value, and
+                                gated on snapping being on at all: with the preset
+                                at "off" there is no street for a drop to be pulled
+                                onto, so leaving the box ticked would be a setting
+                                that says it is doing something when it provably
+                                is not.
+                            -->
+                            <div
+                                v-if="snapPreset !== 'off'"
+                                class="flex items-center gap-2"
+                            >
+                                <TooltipProvider :delay-duration="0">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <span class="inline-flex">
+                                                <input
+                                                    id="snap-propagate"
+                                                    type="checkbox"
+                                                    class="size-4 rounded border-input accent-primary"
+                                                    :checked="
+                                                        propagationEnabled
+                                                    "
+                                                    @change="
+                                                        updatePropagation(
+                                                            (
+                                                                $event.target as HTMLInputElement
+                                                            ).checked,
+                                                        )
+                                                    "
+                                                />
+                                            </span>
+                                        </TooltipTrigger>
+                                        <TooltipContent class="max-w-xs">
+                                            <p>{{ propagationTooltip }}</p>
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </TooltipProvider>
+                                <Label for="snap-propagate" class="font-normal">
+                                    Snap nearby points to same street
+                                </Label>
+                            </div>
+                        </div>
+                    </RouteModePicker>
+                </template>
+            </LineMap>
             <p
                 v-if="!parsedGeoJson && geoJsonText"
                 class="text-sm text-red-600 dark:text-red-500"

@@ -1,9 +1,14 @@
 <script setup lang="ts">
-import { Waves, Ruler, Trash2 } from '@lucide/vue';
+import { HelpCircle, Ruler, Trash2, Waves } from '@lucide/vue';
 import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
 import { Button } from '@/components/ui/button';
+import {
+    Collapsible,
+    CollapsibleContent,
+    CollapsibleTrigger,
+} from '@/components/ui/collapsible';
 import {
     Tooltip,
     TooltipContent,
@@ -16,11 +21,12 @@ import {
     applyDeltaToSelection,
     clampRange,
     decideSnap,
+    describeModeHelp,
     describeRelayHint,
     describeRemoval,
     describeResample,
     describeResampleHint,
-    describeSnapSummary,
+    describeSelectionState,
     findClosestSegment,
     insertVertexAt,
     projectOnSegment,
@@ -31,6 +37,7 @@ import {
     relaySelectionOntoNetwork,
     removeVertexAt,
     removeVertices,
+    RESAMPLE_SPACING_METERS,
     resampleBlock,
     resampleSelection,
     routeEndpoints,
@@ -122,6 +129,16 @@ const emit = defineEmits<{
         value: NonNullable<typeof props.geoJson>,
         meta?: { snap?: boolean; propagated?: number },
     ): void;
+    /**
+     * The re-space interval changed from the toolbar.
+     *
+     * An emit rather than a local ref, so the stored preference stays the page's
+     * business. The picker sits next to the button it governs because reading up
+     * to a settings group and back down is how a reviewer ends up re-spacing at
+     * the wrong interval, and a local copy of the value would be a second source
+     * of truth for the distance the next press will actually use.
+     */
+    (e: 'update:resampleSpacing', value: ResampleSpacing): void;
 }>();
 
 /**
@@ -1270,21 +1287,27 @@ function announceResample(label: string | null): void {
 }
 
 /**
- * What the snap will do with a drop, stated in full.
+ * How to select vertices in the mode on, behind a toggle rather than in prose.
  *
- * Owned here rather than by the page, because the snap is this component's
- * behaviour: it is the one holding the preset, applying the offset and walking
- * the propagation. The page can describe what it asked for; only the map knows
- * what came of it.
- *
- * Living here also gives the create page the sentence it never had. It mounts
- * this map with snapping already on and no preset picker above it, so before
- * this moved the reviewer was being snapped at with no visible explanation
- * anywhere on the screen.
+ * Instruction moved out of the way because it was never short enough to scan,
+ * because it was the same three gestures repeated in three modes, and because a
+ * reviewer who has used the editor twice already knows it. The audience a help
+ * button actually serves is the one who has not.
  */
-const snapSummary = computed(() =>
-    describeSnapSummary(props.snapPreset ?? 'normal', propagationEnabled.value),
+const modeHelp = computed(() => describeModeHelp(props.mode ?? 'move'));
+
+/**
+ * The selection, said when there is something to say about it.
+ *
+ * The one piece of the old hints that survives on screen, because it is state
+ * and not instruction: it changes with what the reviewer just did, and it is
+ * what tells them the next press will act on the set they can see highlighted.
+ */
+const selectionState = computed(() =>
+    describeSelectionState(props.mode ?? 'move', selection.value.length),
 );
+
+const helpOpen = ref(false);
 
 /**
  * Whether the selection is a stretch a re-spacing can actually walk.
@@ -1315,6 +1338,20 @@ const resampleHint = computed(() =>
 );
 
 /**
+ * The interval a re-space will use, with the default applied in one place.
+ *
+ * The picker next to the button and the press of the button have to agree, and
+ * they read from this rather than each carrying their own fallback — two
+ * defaults that drift apart produce a control showing 200 m and a re-space at
+ * the prop it was not given.
+ */
+const DEFAULT_RESAMPLE_SPACING: ResampleSpacing = 200;
+
+const resampleInterval = computed<ResampleSpacing>(
+    () => props.resampleSpacing ?? DEFAULT_RESAMPLE_SPACING,
+);
+
+/**
  * Why the re-lay is unavailable, or what it will do.
  *
  * The re-lay has no segment rule of its own — a selection of two vertices on
@@ -1341,7 +1378,7 @@ const relayHint = computed(() =>
  */
 function applyResample(): void {
     const coordinates = props.geoJson?.coordinates;
-    const spacing = props.resampleSpacing ?? 200;
+    const spacing = resampleInterval.value;
 
     if (!canResample.value || !coordinates) {
         return;
@@ -1569,6 +1606,234 @@ onUnmounted(() => {
 
 <template>
     <div>
+        <!--
+            The toolbar, above the map.
+
+            Everything the reviewer sets and everything they press lives here, and
+            only what happened lives below. It used to be the other way round: the
+            modes and the settings sat above, the three action buttons sat below,
+            and every instruction was on the far side of the map from the control
+            it explained — so reaching Re-lay meant scrolling past four hundred
+            pixels of tile to get to it, and the sentence about Shift-click was a
+            screen away from the mode picker that decides it.
+
+            The split is deliberate rather than tidiness. A control and the words
+            describing it belong in the same field of view as the thing they act
+            on; a result belongs next to that thing because it is a report about
+            it. Nothing below the map here is a control.
+        -->
+        <div v-if="editable || $slots.toolbar" class="space-y-3">
+            <!--
+                The help toggle, last in the row and quiet on purpose. It is the
+                least interesting control on screen until someone needs it, and a
+                help button that draws attention to itself defeats the reason the
+                instructions moved behind it.
+
+                A real CollapsibleTrigger rather than a click handler with a
+                hand-written aria-expanded: the trigger already owns the expanded
+                state, the aria-controls link and the keyboard handling, and a
+                second copy of any of those is one that quietly stops matching.
+            -->
+            <Collapsible v-if="editable" v-model:open="helpOpen">
+                <div class="flex flex-wrap items-center gap-3">
+                    <slot name="toolbar" />
+
+                    <TooltipProvider :delay-duration="0">
+                        <Tooltip>
+                            <TooltipTrigger as-child>
+                                <CollapsibleTrigger as-child>
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon-sm"
+                                    >
+                                        <HelpCircle class="size-4" />
+                                        <span class="sr-only">
+                                            How to select vertices in this mode
+                                        </span>
+                                    </Button>
+                                </CollapsibleTrigger>
+                            </TooltipTrigger>
+                            <TooltipContent class="max-w-xs">
+                                <p>{{ modeHelp }}</p>
+                            </TooltipContent>
+                        </Tooltip>
+                    </TooltipProvider>
+                </div>
+
+                <CollapsibleContent
+                    class="mt-3 rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+                >
+                    {{ modeHelp }}
+                </CollapsibleContent>
+            </Collapsible>
+
+            <div v-else class="flex flex-wrap items-center gap-3">
+                <slot name="toolbar" />
+            </div>
+
+            <div v-if="editable" class="flex flex-wrap items-center gap-3">
+                <!--
+                    The selection readout, the one piece of the old hints that
+                    stayed on screen. It is state rather than instruction: it
+                    changes with what the reviewer just did, and it is what tells
+                    them the next press will act on the set they can see
+                    highlighted. Empty for an add mode or an empty selection,
+                    which is the common case and prints nothing at all.
+                -->
+                <p
+                    v-if="selectionState"
+                    class="min-w-48 flex-1 text-sm text-muted-foreground"
+                >
+                    {{ selectionState }}
+                </p>
+                <div v-else class="flex-1" />
+
+                <div class="flex flex-wrap items-center gap-2">
+                    <template v-if="mode === 'move'">
+                        <!--
+                            The trigger is a span around the button rather than
+                            the button, which is the whole reason these tooltips
+                            can do their job. A disabled button fires no pointer
+                            events, so a title or a trigger placed on it stays
+                            silent — and the disabled state is exactly when the
+                            explanation is wanted, because it is the reason the
+                            button cannot be pressed.
+                        -->
+                        <TooltipProvider :delay-duration="0">
+                            <Tooltip>
+                                <TooltipTrigger as-child>
+                                    <span class="inline-flex">
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            :disabled="selection.length < 2"
+                                            @click="relaySelection"
+                                        >
+                                            <Waves class="size-4" />
+                                            Re-lay on the street network
+                                        </Button>
+                                    </span>
+                                </TooltipTrigger>
+                                <TooltipContent class="max-w-xs">
+                                    <p>{{ relayHint }}</p>
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
+
+                        <!--
+                            The interval sits next to the button it governs rather
+                            than up in the settings group. "Re-space at 200 m" is
+                            one decision, and splitting it across two groups meant
+                            looking up to check the number and back down to press
+                            the thing that used it.
+                        -->
+                        <div v-if="resample" class="flex items-center gap-2">
+                            <TooltipProvider :delay-duration="0">
+                                <Tooltip>
+                                    <TooltipTrigger as-child>
+                                        <span class="inline-flex">
+                                            <Button
+                                                type="button"
+                                                variant="outline"
+                                                size="sm"
+                                                :disabled="!canResample"
+                                                @click="applyResample"
+                                            >
+                                                <Ruler class="size-4" />
+                                                Re-space
+                                            </Button>
+                                        </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent class="max-w-xs">
+                                        <p>{{ resampleHint }}</p>
+                                    </TooltipContent>
+                                </Tooltip>
+                            </TooltipProvider>
+                            <select
+                                :value="resampleInterval"
+                                aria-label="Re-space interval"
+                                class="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm shadow-xs"
+                                @change="
+                                    emit(
+                                        'update:resampleSpacing',
+                                        Number(
+                                            ($event.target as HTMLSelectElement)
+                                                .value,
+                                        ) as ResampleSpacing,
+                                    )
+                                "
+                            >
+                                <option
+                                    v-for="spacing in RESAMPLE_SPACING_METERS"
+                                    :key="spacing"
+                                    :value="spacing"
+                                >
+                                    {{ spacing }} m
+                                </option>
+                            </select>
+                        </div>
+                    </template>
+
+                    <!--
+                        Pushed to the far end of the row, and the reason is the
+                        one thing colour alone cannot carry. Destructive stands
+                        apart from safe by shade; what keeps a re-space from
+                        becoming a mass delete is the distance between the two
+                        buttons when both are live. Never hidden — a button that
+                        is not on screen is a button nobody learns exists, and the
+                        tooltip that explains a disabled state is only useful to
+                        someone who can already see it.
+                    -->
+                    <template v-if="mode === 'delete'">
+                        <TooltipProvider :delay-duration="0">
+                            <Tooltip>
+                                <TooltipTrigger as-child>
+                                    <span class="ms-auto inline-flex">
+                                        <Button
+                                            type="button"
+                                            variant="destructive"
+                                            size="sm"
+                                            :disabled="selection.length === 0"
+                                            @click="deleteSelection"
+                                        >
+                                            <Trash2 class="size-4" />
+                                            <template
+                                                v-if="selection.length > 0"
+                                            >
+                                                Delete {{ selection.length }}
+                                                {{
+                                                    selection.length === 1
+                                                        ? 'vertex'
+                                                        : 'vertices'
+                                                }}
+                                            </template>
+                                            <template v-else>Delete</template>
+                                        </Button>
+                                    </span>
+                                </TooltipTrigger>
+                                <!--
+                                    Static, so it lives in the template rather
+                                    than in a function in lib/. There is nothing
+                                    here to compute and nothing to assert; a
+                                    no-argument function would only make the
+                                    wording harder to find.
+                                -->
+                                <TooltipContent class="max-w-xs">
+                                    <p>
+                                        One undo step takes all of them back. A
+                                        stretch left with fewer than two points
+                                        is dropped rather than kept as a stub.
+                                    </p>
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
+                    </template>
+                </div>
+            </div>
+        </div>
+
         <div
             :class="{
                 'cursor-crosshair': editable && mode === 'add',
@@ -1603,173 +1868,6 @@ onUnmounted(() => {
             class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
         >
             {{ removalLabel }}
-        </p>
-        <p
-            v-if="editable && mode === 'move'"
-            class="mt-2 text-sm text-muted-foreground"
-        >
-            <template v-if="selection.length > 1">
-                {{ selection.length }} vertices selected. Drag any of them to
-                move the whole stretch. Escape to deselect.
-            </template>
-            <!--
-                Alt is mentioned here and not in the branch above, because these
-                two are the same hint in two states rather than two hints, and a
-                modifier that is explained twice on one screen is a modifier
-                nobody remembers reading. This is the state a reviewer is in first.
-            -->
-            <template v-else>
-                Shift-click two vertices to grab everything between them, or
-                Shift-drag on the map to box one out. Then drag any selected
-                vertex to move them together. A drop snaps onto the nearest
-                street — hold Alt to place it off the centreline.
-            </template>
-        </p>
-        <p
-            v-if="editable && mode === 'add'"
-            class="mt-2 text-sm text-muted-foreground"
-        >
-            Click on the route to add a vertex. A click within about 10 m of one
-            already there is ignored, so a second click on the same spot does
-            nothing.
-        </p>
-        <p
-            v-if="editable && mode === 'delete'"
-            class="mt-2 text-sm text-muted-foreground"
-        >
-            <template v-if="selection.length > 0">
-                {{ selection.length }}
-                {{ selection.length === 1 ? 'vertex' : 'vertices' }} selected.
-                Use the button below to remove
-                {{ selection.length === 1 ? 'it' : 'them all' }}, or Escape to
-                deselect.
-            </template>
-            <template v-else>
-                Click a vertex to delete just that one. To delete several,
-                Shift-click two vertices to take everything between them, or
-                Shift-drag on the map to box a set out.
-            </template>
-        </p>
-        <!--
-            The three actions that act on a selection, one row each with nothing
-            but the button.
-
-            Each explanation went into a tooltip rather than into a paragraph
-            beside its button, and the deciding test was whether the reviewer
-            needs it *before* acting or only when a result surprises them. These
-            three are the latter. The two things that are the former — how to
-            make a selection at all, and what the snap is about to do to a drop
-            — stayed visible below, because a tooltip cannot be the only place a
-            reviewer learns a gesture exists.
-        -->
-        <div v-if="relay && editable && mode === 'move'" class="mt-3">
-            <!--
-                The trigger is a span around the button rather than the button,
-                which is the whole reason this tooltip can do its job. A disabled
-                button fires no pointer events, so a title or a trigger placed on
-                it stays silent — and the disabled state is exactly when the
-                explanation is wanted, because it is the reason the button cannot
-                be pressed.
-            -->
-            <TooltipProvider :delay-duration="0">
-                <Tooltip>
-                    <TooltipTrigger as-child>
-                        <span class="inline-flex">
-                            <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                :disabled="selection.length < 2"
-                                @click="relaySelection"
-                            >
-                                <Waves class="size-4" />
-                                Re-lay on the street network
-                            </Button>
-                        </span>
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-xs">
-                        <p>{{ relayHint }}</p>
-                    </TooltipContent>
-                </Tooltip>
-            </TooltipProvider>
-        </div>
-        <div v-if="resample && editable && mode === 'move'" class="mt-3">
-            <TooltipProvider :delay-duration="0">
-                <Tooltip>
-                    <TooltipTrigger as-child>
-                        <span class="inline-flex">
-                            <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                :disabled="!canResample"
-                                @click="applyResample"
-                            >
-                                <Ruler class="size-4" />
-                                Re-space
-                            </Button>
-                        </span>
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-xs">
-                        <p>{{ resampleHint }}</p>
-                    </TooltipContent>
-                </Tooltip>
-            </TooltipProvider>
-        </div>
-        <div
-            v-if="editable && mode === 'delete' && selection.length > 0"
-            class="mt-3"
-        >
-            <TooltipProvider :delay-duration="0">
-                <Tooltip>
-                    <TooltipTrigger as-child>
-                        <span class="inline-flex">
-                            <Button
-                                type="button"
-                                variant="destructive"
-                                size="sm"
-                                @click="deleteSelection"
-                            >
-                                <Trash2 class="size-4" />
-                                Delete {{ selection.length }}
-                                {{
-                                    selection.length === 1
-                                        ? 'vertex'
-                                        : 'vertices'
-                                }}
-                            </Button>
-                        </span>
-                    </TooltipTrigger>
-                    <!--
-                        Static, so it lives in the template rather than in a
-                        function in lib/. There is nothing here to compute and
-                        nothing to assert; a no-argument function would only make
-                        the wording harder to find.
-                    -->
-                    <TooltipContent class="max-w-xs">
-                        <p>
-                            One undo step takes all of them back. A stretch left
-                            with fewer than two points is dropped rather than
-                            kept as a stub.
-                        </p>
-                    </TooltipContent>
-                </Tooltip>
-            </TooltipProvider>
-        </div>
-        <!--
-            The snap, stated in full and visible rather than in a tooltip. It is
-            the setting itself — the distance that decides whether a drop snaps
-            at all — and a reviewer calibrating against an unfamiliar street has
-            to be able to read it without first discovering that hovering reveals
-            it. The propagation clause is part of the same sentence for the same
-            reason: it is governed by the number above it, and printing it once
-            keeps the two from looking like independent settings.
-        -->
-        <p
-            v-if="editable && mode === 'move' && snapOptions"
-            class="mt-3 text-sm text-muted-foreground"
-        >
-            {{ snapSummary }}
         </p>
         <p
             v-if="!geoJson && !editable"

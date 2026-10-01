@@ -26,24 +26,50 @@ const modes: { value: EditMode; label: string }[] = [
 </script>
 
 <template>
-    <div class="flex flex-wrap gap-2">
-        <Button
-            v-for="option in modes"
-            :key="option.value"
-            type="button"
-            :variant="props.modelValue === option.value ? 'default' : 'outline'"
-            size="sm"
-            @click="emit('update:modelValue', option.value)"
+    <div class="flex flex-wrap items-center gap-3">
+        <!--
+            A name for the group, invisible on screen. The settings beside it
+            have visible labels, so the three mode buttons were the only
+            controls in the editor with nothing naming what the group is — which
+            is the kind of gap that makes a segmented control unusable with a
+            screen reader, since "Move, Add vertex, Delete vertex" is three
+            buttons and no indication that they are alternatives to each other.
+        -->
+        <div
+            class="flex flex-wrap gap-2"
+            role="group"
+            aria-label="Editing mode"
         >
-            {{ option.label }}
-        </Button>
+            <Button
+                v-for="option in modes"
+                :key="option.value"
+                type="button"
+                :variant="
+                    props.modelValue === option.value ? 'default' : 'outline'
+                "
+                size="sm"
+                @click="emit('update:modelValue', option.value)"
+            >
+                {{ option.label }}
+            </Button>
+        </div>
 
         <!--
-            Anything a caller wants beside the modes, in the same row. The edit
-            page keeps the snap preset here, and it belongs in this row rather
-            than below it: it only applies to one mode, and the reviewer reads
-            it as a property of moving rather than as a separate control.
+            Its own group rather than more buttons in the same row, because the
+            slot holds settings and the buttons are modes: "what a click does"
+            against "how much". Flattened into one row the two read as a single
+            list, and the reviewer cannot tell which control changes the gesture
+            and which only calibrates it.
+
+            Bordered and muted rather than split with a vertical rule, because
+            this row wraps on a narrow column and a divider that ends up leading
+            a wrapped line looks like a mistake.
         -->
-        <slot />
+        <div
+            v-if="$slots.default"
+            class="flex flex-wrap items-center gap-4 rounded-md border border-dashed bg-muted/40 px-3 py-1.5"
+        >
+            <slot />
+        </div>
     </div>
 </template>

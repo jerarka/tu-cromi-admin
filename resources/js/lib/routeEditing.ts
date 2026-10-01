@@ -1755,49 +1755,6 @@ export function describeResample(
 
 /** What a route is measured by, for the reviewer to read off the map. */
 /**
- * What the snap will do with a drop, in the reviewer's terms.
- *
- * Shown next to the preset rather than hidden behind a tooltip, and that is a
- * considered choice rather than an accident. "Subtle" and "aggressive" mean
- * nothing on their own, while the distance is what decides whether a given drop
- * snaps at all — and being able to read it is how anyone calibrates a setting on
- * a street they do not know yet, instead of guessing from a label and then
- * blaming the tool.
- *
- * The numbers are in the sentence for the same reason. A drop pulling "up to a
- * few" neighbouring vertices is a claim nobody can check; four of them, within
- * twenty-five metres and two hundred and fifty along, is something to decide
- * against. A tooltip is the right home for a detail, and this is not one — it is
- * the setting itself, written out.
- */
-export function describeSnapSummary(
-    preset: SnapPreset,
-    propagation: boolean,
-): string {
-    const options = snapOptionsFor(preset);
-
-    if (options === null) {
-        return 'Drops land exactly where you release them, with no street lookup.';
-    }
-
-    const base =
-        `Moves a drop onto a street within ${options.threshold} m of where you ` +
-        'released it. When a selection is dropped on a crossing, the street ' +
-        'more of the moved vertices are already on wins.';
-
-    if (!propagation) {
-        return base;
-    }
-
-    return (
-        `${base} A drop also pulls up to ${PROPAGATION_MAX_VERTICES} ` +
-        'vertices either side of it onto that street, as long as each is within ' +
-        `${options.threshold} m of it and no more than ${PROPAGATION_MAX_ARC_METERS} m ` +
-        'along it.'
-    );
-}
-
-/**
  * Why a selection cannot be acted on, or null when it can.
  *
  * Named rather than left as a boolean because the two failures are not
@@ -1868,6 +1825,153 @@ export function describeResampleHint(block: SelectionBlock | null): string {
         'dropping the vertices that are too close and adding the ones that are ' +
         'missing. The line itself does not move, only the points on it.'
     );
+}
+
+/**
+ * How each preset reads to a reviewer, beside the distance it actually means.
+ *
+ * Kept apart from `SNAP_PRESETS` rather than folded into it: the numbers are
+ * domain and the wording is presentation, and one table carrying both would make
+ * a copy change look like a behaviour change.
+ */
+export const SNAP_PRESET_LABELS: Record<SnapPreset, string> = {
+    off: 'Off',
+    subtle: 'Subtle',
+    normal: 'Normal',
+    aggressive: 'Aggressive',
+};
+
+/**
+ * The preset as the picker shows it: a name, and the distance behind it.
+ *
+ * The distance is the part that matters, and "Normal" alone does not say it. It
+ * is also the whole reason there used to be a paragraph under this control
+ * explaining what the preset would do — a reviewer could not calibrate from the
+ * name, so the number was printed somewhere else and had to be found. Putting it
+ * on the control is the difference between reading the setting and reading about
+ * it, and it deleted thirty-one words of screen to do it.
+ *
+ * Derived from the preset's own threshold rather than from a second table, so the
+ * number in the label cannot drift away from the number the snap will enforce.
+ */
+export function describeSnapPreset(preset: SnapPreset): string {
+    const options = snapOptionsFor(preset);
+
+    if (options === null) {
+        return SNAP_PRESET_LABELS.off;
+    }
+
+    return `${SNAP_PRESET_LABELS[preset]} · ${options.threshold} m`;
+}
+
+/**
+ * What the snap does with a drop, in detail.
+ *
+ * A tooltip because it is reference rather than setting: the distance is on the
+ * control, and what is left here is the part a reviewer needs when a drop landed
+ * somewhere unexpected and they have to work out why. The crossing rule is the
+ * clearest case — it only becomes observable at an intersection where two streets
+ * overlap, which is exactly when a reviewer wants the explanation and never
+ * before.
+ */
+export function describeSnapTooltip(preset: SnapPreset): string {
+    const options = snapOptionsFor(preset);
+
+    if (options === null) {
+        return 'Drops land exactly where you release them, with no street lookup.';
+    }
+
+    return (
+        `Moves a drop onto a street within ${options.threshold} m of where you ` +
+        'released it. When a selection is dropped on a crossing, the street more ' +
+        'of the moved vertices are already on wins.'
+    );
+}
+
+/**
+ * What propagation does to the vertices around a drop.
+ *
+ * Its own function because the threshold is the snap's, not propagation's: both
+ * are printed from one number so the two controls cannot appear to disagree
+ * about how far a vertex has to be to count as "on the street".
+ */
+export function describePropagationTooltip(threshold: number): string {
+    return (
+        `A drop also pulls up to ${PROPAGATION_MAX_VERTICES} vertices either ` +
+        `side of it onto that street, as long as each is within ${threshold} m ` +
+        `of it and no more than ${PROPAGATION_MAX_ARC_METERS} m along it. Hold ` +
+        'Alt on a drop to skip this along with the snap.'
+    );
+}
+
+/**
+ * How to select vertices in the mode currently on.
+ *
+ * Behind the help toggle rather than printed under the map, which is where it
+ * used to live. It was never short enough to be worth scanning — thirty-six
+ * words of the same three instructions in three different modes — and a reviewer
+ * who has used the editor twice already knows it. Someone who does not is the
+ * audience a help button exists for.
+ *
+ * The mode is spelled as a literal union rather than imported from the composable
+ * that defines `EditMode`, because that type is a Vue-adjacent concern and this
+ * module has no business importing it. The two are structurally identical, so a
+ * new mode fails to compile at the call site rather than quietly falling through
+ * to the default branch below.
+ */
+export function describeModeHelp(mode: 'move' | 'add' | 'delete'): string {
+    if (mode === 'add') {
+        return (
+            'Click on the route to add a vertex. A click within about 10 m of one ' +
+            'already there is ignored, so a second click on the same spot does ' +
+            'nothing.'
+        );
+    }
+
+    if (mode === 'delete') {
+        return (
+            'Click a vertex to delete just that one. To delete several, Shift-click ' +
+            'two vertices to take everything between them, or Shift-drag on the map ' +
+            'to box a set out, then press Delete.'
+        );
+    }
+
+    return (
+        'Drag a vertex to move it. Shift-click two vertices to grab everything ' +
+        'between them, or Shift-drag on the map to box a set out, then drag any of ' +
+        'them to move the whole stretch together. A drop snaps onto the nearest ' +
+        'street — hold Alt to place it off the centreline.'
+    );
+}
+
+/**
+ * What the current selection is doing, when there is something to say.
+ *
+ * The one piece of the old hints that stays on screen, and it stays because it
+ * is state rather than instruction: it changes with what the reviewer just did,
+ * and it is what tells them the next press will act on the set they can see
+ * highlighted. An empty string means print nothing — "0 vertices selected" under
+ * a move instruction nobody asked for is noise, and the help toggle is one click
+ * away.
+ */
+export function describeSelectionState(
+    mode: 'move' | 'add' | 'delete',
+    selected: number,
+): string {
+    if (mode === 'add' || selected === 0) {
+        return '';
+    }
+
+    if (mode === 'delete') {
+        const what = selected === 1 ? 'vertex' : 'vertices';
+
+        return (
+            `${selected} ${what} selected — press Delete to remove ` +
+            `${selected === 1 ? 'it' : 'them all'}, or Escape to deselect.`
+        );
+    }
+
+    return `${selected} vertices selected — drag any of them to move the whole stretch.`;
 }
 
 export interface RouteStats {

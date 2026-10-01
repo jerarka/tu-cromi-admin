@@ -167,13 +167,16 @@ const {
                     {{ editToggleLabel }}
                 </Button>
             </div>
-            <RouteModePicker v-if="isEditingMap" v-model="mode" />
             <LineMap
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
                 :mode="mode"
                 @update:geo-json="setGeometry"
-            />
+            >
+                <template #toolbar>
+                    <RouteModePicker v-if="isEditingMap" v-model="mode" />
+                </template>
+            </LineMap>
             <p
                 v-if="!parsedGeoJson && geoJsonText"
                 class="text-sm text-red-600 dark:text-red-500"

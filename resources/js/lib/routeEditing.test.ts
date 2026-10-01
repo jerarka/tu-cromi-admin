@@ -4,11 +4,15 @@ import {
     clampRange,
     decideSnap,
     describeRelayHint,
+    describeModeHelp,
     describeRemoval,
+    describePropagationTooltip,
     describeResample,
     describeResampleHint,
     describeRouteStats,
-    describeSnapSummary,
+    describeSelectionState,
+    describeSnapPreset,
+    describeSnapTooltip,
     distanceMeters,
     findClosestSegment,
     formatDistance,
@@ -30,6 +34,8 @@ import {
     routeStats,
     routeEndpoints,
     SNAP_PRESETS,
+    SNAP_PRESET_LABELS,
+    SNAP_PRESET_NAMES,
     SNAP_SAMPLE_LIMIT,
     snapSample,
     snapOptionsFor,
@@ -1356,8 +1362,8 @@ describe('propagationLimitsFor', () => {
  *
  * A degree of longitude there is ~106 000 m, so a thousandth of a degree is
  * about 106 m and a ten-thousandth about 10.6 m. The route sits 11 m south of
- * the centreline, which is a real offset on a real route � the imported data
- * averages 3.6 m from a centreline with a p90 of 8.2 m � and comfortably inside
+ * the centreline, which is a real offset on a real route · the imported data
+ * averages 3.6 m from a centreline with a p90 of 8.2 m · and comfortably inside
  * the 25 m the normal preset allows.
  */
 describe('propagateAlongStreet', () => {
@@ -1464,7 +1470,7 @@ describe('propagateAlongStreet', () => {
         // every drop on a long route would scribble the geometry back over
         // itself. Here the reference is at the far end and the next vertex sits
         // beside the near end, so the only thing the walk may consider is the
-        // single point where the street runs out � 318 m away, and refused.
+        // single point where the street runs out · 318 m away, and refused.
         const folded: Coordinates = [
             [
                 [-63.18, CENTRELINE_LAT],
@@ -1482,7 +1488,7 @@ describe('propagateAlongStreet', () => {
     });
 
     test('stops at the first vertex too far off the centreline', () => {
-        // The route announcing it has left this street � a turn, or the end of
+        // The route announcing it has left this street · a turn, or the end of
         // the block. Everything past it is a different street's business, so the
         // vertices after it are left alone even though they are perfectly placed.
         const turning: Coordinates = [
@@ -1860,7 +1866,7 @@ describe('relaySelectionOntoNetwork', () => {
     test('lets a corner be two streets', () => {
         // The reason this is per vertex rather than per selection. The point
         // before the corner belongs to the street the route came along, the point
-        // after belongs to the one it turned onto, and neither is wrong � so a
+        // after belongs to the one it turned onto, and neither is wrong · so a
         // rule that demanded one street for the whole selection would have to be
         // wrong about one of them.
         const line: Coordinates = [
@@ -1875,14 +1881,14 @@ describe('relaySelectionOntoNetwork', () => {
         const result = run(line, selection(0, 1, 2, 3), [
             lookup(street(4), { roadId: 1, name: 'Calle Mercado' }),
             lookup(street(4), { roadId: 1, name: 'Calle Mercado' }),
-            lookup(crossStreet, { roadId: 2, name: 'Av. Ca�oto' }),
-            lookup(crossStreet, { roadId: 2, name: 'Av. Ca�oto' }),
+            lookup(crossStreet, { roadId: 2, name: 'Av. Ca·oto' }),
+            lookup(crossStreet, { roadId: 2, name: 'Av. Ca·oto' }),
         ]);
 
         expect(result.moved).toHaveLength(4);
         expect(result.streets.map((s) => s.name)).toEqual([
             'Calle Mercado',
-            'Av. Ca�oto',
+            'Av. Ca·oto',
         ]);
         expect(result.streets.map((s) => s.placed)).toEqual([2, 2]);
     });
@@ -2631,7 +2637,7 @@ describe('resampleBlock', () => {
     /**
      * A route's MultiLineString parts are not a continuation of each other, so
      * there is no leg to interpolate between them. And the reason it has to be
-     * named separately is that it cannot be fixed by selecting more � which is
+     * named separately is that it cannot be fixed by selecting more · which is
      * what a "select at least two vertices" message tells the reviewer to do.
      */
     test('blocks a selection crossing a segment boundary', () => {
@@ -2692,49 +2698,150 @@ describe('describeRelayHint', () => {
     });
 });
 
-describe('describeSnapSummary', () => {
+describe('describeSnapPreset', () => {
+    test('carries the distance the preset actually enforces', () => {
+        // The whole reason it exists. "Normal" on its own does not say whether a
+        // drop will snap, which is why fifty-eight words used to sit under this
+        // control explaining it.
+        expect(describeSnapPreset('normal')).toBe('Normal · 25 m');
+        expect(describeSnapPreset('subtle')).toBe('Subtle · 12 m');
+        expect(describeSnapPreset('aggressive')).toBe('Aggressive · 50 m');
+    });
+
+    test('keeps the vocabulary beside the number', () => {
+        // Both, not one or the other: the names are what a reviewer learns once,
+        // the distance is what they calibrate against.
+        for (const preset of SNAP_PRESET_NAMES) {
+            expect(describeSnapPreset(preset)).toContain(
+                SNAP_PRESET_LABELS[preset],
+            );
+        }
+    });
+
+    test('prints no distance for off, because there is none', () => {
+        // "Off" is deliberately not a row in the preset table, so there is no
+        // threshold behind it. A label reading "Off · 0 m" would be a claim the
+        // snap does not honour · it declines the lookup entirely.
+        expect(describeSnapPreset('off')).toBe('Off');
+        expect(describeSnapPreset('off')).not.toContain('m');
+    });
+
+    test('agrees with the table it is derived from', () => {
+        for (const preset of ['subtle', 'normal', 'aggressive'] as const) {
+            expect(describeSnapPreset(preset)).toContain(
+                `${snapOptionsFor(preset)?.threshold} m`,
+            );
+        }
+    });
+});
+
+describe('describeSnapTooltip', () => {
     test('says snapping is off rather than describing a threshold of zero', () => {
-        // "off" is not a row in the preset table, so there is no number to print,
-        // and printing zero would be a lie a reviewer could act on.
-        expect(describeSnapSummary('off', false)).toBe(
+        expect(describeSnapTooltip('off')).toBe(
             'Drops land exactly where you release them, with no street lookup.',
         );
     });
 
-    test('carries the threshold the preset actually uses', () => {
-        // The number is the setting. A reviewer calibrating against a street they
-        // do not know has to read it, which is why this stays visible.
-        expect(describeSnapSummary('normal', false)).toContain('25 m');
-        expect(describeSnapSummary('subtle', false)).toContain('12 m');
-        expect(describeSnapSummary('aggressive', false)).toContain('50 m');
-    });
-
-    test('explains what happens on a crossing', () => {
-        expect(describeSnapSummary('normal', false)).toContain('crossing');
-    });
-
-    test('omits the propagation clause when it is off', () => {
-        const off = describeSnapSummary('normal', false);
-
-        expect(off).not.toContain('pulls up to');
+    test('restates the threshold for reference', () => {
+        expect(describeSnapTooltip('aggressive')).toContain('50 m');
     });
 
     /**
-     * The propagation sentence is part of the same one rather than a paragraph of
-     * its own, because it is governed by the number above it. Printing the
-     * distance once is what stops the two from looking like independent settings.
+     * The crossing rule is the part that earns the tooltip. It is unobservable
+     * everywhere except an intersection where two streets overlap, so printing
+     * it under the control was occupying the screen to explain a case a reviewer
+     * cannot act on until it happens to them.
      */
-    test('folds the propagation into the same sentence, with its own limits', () => {
-        const on = describeSnapSummary('normal', true);
-
-        expect(on).toContain('pulls up to 4');
-        expect(on).toContain('250 m');
-        expect(on).toContain('25 m');
+    test('carries the crossing rule', () => {
+        expect(describeSnapTooltip('normal')).toContain('crossing');
     });
 
-    test('propagation is off even when the create page never asked', () => {
-        expect(describeSnapSummary('normal', false)).not.toContain(
-            'pulls up to',
-        );
+    test('does not repeat what the control already shows', () => {
+        // The distance is on the label now. Repeating it here is the kind of
+        // duplication that survives three rounds of tidying.
+        expect(describeSnapTooltip('normal')).not.toContain('Normal');
+    });
+});
+
+describe('describePropagationTooltip', () => {
+    test('carries both of its limits', () => {
+        const hint = describePropagationTooltip(25);
+
+        expect(hint).toContain('4 vertices');
+        expect(hint).toContain('250 m');
+    });
+
+    test('uses the threshold it is given, so it cannot disagree with the select', () => {
+        // Both numbers come from one place on purpose: the checkbox and the
+        // preset describe the same street with the same distance.
+        expect(describePropagationTooltip(12)).toContain('12 m');
+        expect(describePropagationTooltip(50)).toContain('50 m');
+    });
+
+    test('points at Alt, the way out of both behaviours at once', () => {
+        expect(describePropagationTooltip(25)).toContain('Alt');
+    });
+});
+
+describe('describeModeHelp', () => {
+    test('covers every mode, none of them empty', () => {
+        for (const mode of ['move', 'add', 'delete'] as const) {
+            expect(describeModeHelp(mode).length).toBeGreaterThan(40);
+        }
+    });
+
+    test('names the selection gesture that is shared by two modes', () => {
+        expect(describeModeHelp('move')).toContain('Shift-click');
+        expect(describeModeHelp('delete')).toContain('Shift-click');
+    });
+
+    test('tells a single add click what it will refuse', () => {
+        // The add mode has no button and no tooltip, so this sentence is the only
+        // place the ten-metre rule is written down.
+        expect(describeModeHelp('add')).toContain('10 m');
+    });
+
+    test('points delete at the button rather than at a position', () => {
+        expect(describeModeHelp('delete')).toContain('press Delete');
+    });
+
+    test('keeps Alt in move, where a drop is what skips the snap', () => {
+        expect(describeModeHelp('move')).toContain('Alt');
+    });
+});
+
+describe('describeSelectionState', () => {
+    test('says nothing for an empty selection', () => {
+        // The common case. Printing "0 vertices selected" under a map is noise,
+        // and the help toggle is one click away.
+        expect(describeSelectionState('move', 0)).toBe('');
+        expect(describeSelectionState('delete', 0)).toBe('');
+    });
+
+    test('says nothing in add mode, which has nothing to select', () => {
+        expect(describeSelectionState('add', 3)).toBe('');
+    });
+
+    test('reports a move selection and what dragging it will do', () => {
+        const state = describeSelectionState('move', 5);
+
+        expect(state).toContain('5 vertices selected');
+        expect(state).toContain('drag any of them');
+    });
+
+    test('reports a delete selection and which button takes it', () => {
+        expect(describeSelectionState('delete', 5)).toContain('press Delete');
+    });
+
+    test('uses the singular for one vertex', () => {
+        const state = describeSelectionState('delete', 1);
+
+        expect(state).toContain('1 vertex selected');
+        expect(state).not.toContain('vertices');
+    });
+
+    test('mentions Escape in both modes that can deselect', () => {
+        expect(describeSelectionState('move', 2)).toContain('drag');
+        expect(describeSelectionState('delete', 2)).toContain('Escape');
     });
 });
