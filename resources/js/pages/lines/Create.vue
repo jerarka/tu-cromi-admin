@@ -6,6 +6,7 @@ import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
 import LineMap from '@/components/lines/LineMap.vue';
 import RouteModePicker from '@/components/lines/RouteModePicker.vue';
+import RouteStats from '@/components/lines/RouteStats.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -153,7 +154,10 @@ const {
         <!-- Map preview / editor -->
         <div class="space-y-4">
             <div class="flex items-center justify-between">
-                <Label>Route preview</Label>
+                <div class="flex items-center gap-2">
+                    <Label>Route preview</Label>
+                    <RouteStats :geo-json="parsedGeoJson" />
+                </div>
                 <Button
                     type="button"
                     variant="outline"
@@ -170,22 +174,6 @@ const {
                 :mode="mode"
                 @update:geo-json="setGeometry"
             />
-            <p
-                v-if="isEditingMap"
-                class="text-sm text-blue-600 dark:text-blue-500"
-            >
-                <template v-if="!parsedGeoJson">
-                    Click on the map to place the first vertex, then keep
-                    clicking to build the route.
-                </template>
-                <template v-else-if="mode === 'move'">
-                    Drag the white dots to adjust the route geometry.
-                </template>
-                <template v-else-if="mode === 'add'">
-                    Click on the route to add a new vertex.
-                </template>
-                <template v-else> Click a vertex to delete it. </template>
-            </p>
             <p
                 v-if="!parsedGeoJson && geoJsonText"
                 class="text-sm text-red-600 dark:text-red-500"

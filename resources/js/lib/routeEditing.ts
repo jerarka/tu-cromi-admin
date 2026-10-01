@@ -1752,3 +1752,246 @@ export function describeResample(
 
     return `Re-spaced to ${spacing} m: ${parts.join(', ')}.${tail}`;
 }
+
+/** What a route is measured by, for the reviewer to read off the map. */
+/**
+ * What the snap will do with a drop, in the reviewer's terms.
+ *
+ * Shown next to the preset rather than hidden behind a tooltip, and that is a
+ * considered choice rather than an accident. "Subtle" and "aggressive" mean
+ * nothing on their own, while the distance is what decides whether a given drop
+ * snaps at all — and being able to read it is how anyone calibrates a setting on
+ * a street they do not know yet, instead of guessing from a label and then
+ * blaming the tool.
+ *
+ * The numbers are in the sentence for the same reason. A drop pulling "up to a
+ * few" neighbouring vertices is a claim nobody can check; four of them, within
+ * twenty-five metres and two hundred and fifty along, is something to decide
+ * against. A tooltip is the right home for a detail, and this is not one — it is
+ * the setting itself, written out.
+ */
+export function describeSnapSummary(
+    preset: SnapPreset,
+    propagation: boolean,
+): string {
+    const options = snapOptionsFor(preset);
+
+    if (options === null) {
+        return 'Drops land exactly where you release them, with no street lookup.';
+    }
+
+    const base =
+        `Moves a drop onto a street within ${options.threshold} m of where you ` +
+        'released it. When a selection is dropped on a crossing, the street ' +
+        'more of the moved vertices are already on wins.';
+
+    if (!propagation) {
+        return base;
+    }
+
+    return (
+        `${base} A drop also pulls up to ${PROPAGATION_MAX_VERTICES} ` +
+        'vertices either side of it onto that street, as long as each is within ' +
+        `${options.threshold} m of it and no more than ${PROPAGATION_MAX_ARC_METERS} m ` +
+        'along it.'
+    );
+}
+
+/**
+ * Why a selection cannot be acted on, or null when it can.
+ *
+ * Named rather than left as a boolean because the two failures are not
+ * interchangeable to a reviewer. "Not enough selected" is fixed by selecting
+ * more; "crosses a segment" cannot be fixed by selecting more, and a button that
+ * says "select at least two vertices" while six are selected is a tool
+ * confidently reporting the wrong reason.
+ */
+export type SelectionBlock = 'too-few' | 'spans-segments';
+
+/**
+ * What stands between a selection and a re-spacing, if anything.
+ *
+ * Pure, so the rule is testable away from the map. Two conditions: a single
+ * vertex has no stretch to re-space, and a selection straddling two segments has
+ * no leg to interpolate along — a route's MultiLineString parts are not a
+ * continuation of each other, and a walk that crossed the gap would lay points
+ * over ground the route never touches.
+ */
+export function resampleBlock(selection: VertexRef[]): SelectionBlock | null {
+    if (selection.length < 2) {
+        return 'too-few';
+    }
+
+    return new Set(selection.map((ref) => ref.segment)).size === 1
+        ? null
+        : 'spans-segments';
+}
+
+/**
+ * What the re-lay will do, or why it cannot be applied.
+ *
+ * The blocked case leads. A tooltip the reviewer only reaches for because the
+ * button is greyed out has already failed to do its job if it opens by
+ * explaining what the button would do.
+ */
+export function describeRelayHint(block: SelectionBlock | null): string {
+    if (block === 'too-few') {
+        return 'Select at least two vertices to re-lay.';
+    }
+
+    return (
+        'Move each selected vertex onto the street it belongs to, which is how ' +
+        'a straight run drawn over a curving road gets its shape back. Points ' +
+        'with no street in range stay where they are.'
+    );
+}
+
+/**
+ * What the re-space will do, or why it cannot be applied.
+ *
+ * The two refusals are spelled out rather than collapsed into "unavailable",
+ * because they need different things from the reviewer: one needs a selection,
+ * the other needs a different one. A hint that named only the first would send
+ * someone off to select more vertices that they already have.
+ */
+export function describeResampleHint(block: SelectionBlock | null): string {
+    if (block === 'too-few') {
+        return 'Select at least two vertices to re-space.';
+    }
+
+    if (block === 'spans-segments') {
+        return 'A re-space walks one segment, so the selection cannot cross a segment boundary.';
+    }
+
+    return (
+        'Spread the selected stretch at even intervals along the route, ' +
+        'dropping the vertices that are too close and adding the ones that are ' +
+        'missing. The line itself does not move, only the points on it.'
+    );
+}
+
+export interface RouteStats {
+    /**
+     * Every position the route holds, degenerate segments included.
+     *
+     * A one-position segment is not drawable and does not look like a vertex on
+     * the map, but it still occupies a slot in the coordinates array — and that
+     * array is what `line_transfers` addresses by index, so excluding it would
+     * make this number disagree with the thing it exists to inform.
+     */
+    vertices: number;
+    /**
+     * Average spacing between consecutive vertices, in metres.
+     *
+     * Null below two positions: one vertex has no gap to average, and reporting
+     * zero would read as "the points are on top of each other" rather than as
+     * "there is nothing to measure yet".
+     */
+    spacingMeters: number | null;
+    /**
+     * The walked length, in metres.
+     *
+     * The length of the route as it is travelled, not the straight line between
+     * its ends. Only ever accumulated within a segment, so it never reports
+     * distance across a gap the route does not cover.
+     */
+    lengthMeters: number;
+}
+
+/**
+ * Measure a route: how many points, how long, how far apart.
+ *
+ * The three numbers are one measurement shown three ways rather than three
+ * facts. The count alone is not readable — 591 could be dense or sparse
+ * depending on the route — while 591 vertices, 30 km and 51 m apart tell the
+ * reviewer at a glance that this route is heavily sampled, which is what makes
+ * the re-space interval a decision instead of a guess.
+ *
+ * Every sum here is per segment, and that is the part worth stating twice. A
+ * route's MultiLineString parts are not a continuation of each other: there can
+ * be a real gap between them, and accumulating across it would report distance
+ * and spacing for ground the route never runs over. It is also why the spacing
+ * is measured per leg rather than derived as `length / (vertices - 1)` — the two
+ * agree exactly for a single-segment route and quietly disagree for a route of
+ * several, which is the only case where being wrong looks like being right.
+ */
+export function routeStats(coordinates: Coordinates): RouteStats {
+    let vertices = 0;
+    let lengthMeters = 0;
+    let legs = 0;
+
+    for (const segment of coordinates) {
+        vertices += segment.length;
+
+        for (let i = 0; i < segment.length - 1; i += 1) {
+            const a = segment[i];
+            const b = segment[i + 1];
+
+            lengthMeters += distanceMeters([a[0], a[1]], [b[0], b[1]]);
+            legs += 1;
+        }
+    }
+
+    return {
+        vertices,
+        spacingMeters: legs === 0 ? null : lengthMeters / legs,
+        lengthMeters,
+    };
+}
+
+/**
+ * A distance in the unit that makes it readable.
+ *
+ * Three cuts, chosen so no magnitude is rendered in a unit that makes it sound
+ * more precise or less legible than it is. Below a kilometre the metres are the
+ * honest unit — "0.6 km" is harder to picture and to check against the map than
+ * "640 m" — and past a hundred kilometres the decimal is noise on a number the
+ * reviewer is not going to measure.
+ */
+export function formatDistance(meters: number): string {
+    if (meters < 1000) {
+        return `${Math.round(meters)} m`;
+    }
+
+    const km = meters / 1000;
+
+    if (km < 100) {
+        return `${km.toFixed(1)} km`;
+    }
+
+    return `${Math.round(km)} km`;
+}
+
+/**
+ * The three measurements as one line, or an empty string for a route with
+ * nothing on it.
+ *
+ * A function rather than template markup because vitest runs without a DOM, so
+ * anything worth asserting has to live here and the component is left with
+ * nothing to do but print it. The plural of "vertex", the omitted spacing clause
+ * and the distance unit are all decided in one place, which is the only way they
+ * stay decided the same way on the two pages that show them.
+ */
+export function describeRouteStats(stats: RouteStats): string {
+    if (stats.vertices === 0) {
+        return '';
+    }
+
+    const parts = [
+        `${stats.vertices} ${stats.vertices === 1 ? 'vertex' : 'vertices'}`,
+    ];
+
+    if (stats.spacingMeters !== null) {
+        // Whole metres, always. A tenth of a metre of spacing is a fiction the
+        // imported network cannot resolve and nobody needs to read.
+        parts.push(`${Math.round(stats.spacingMeters)} m apart`);
+    }
+
+    // Omitted for a single vertex, which is a route of no length rather than a
+    // route of zero metres, and the two read very differently.
+    if (stats.lengthMeters > 0) {
+        parts.push(formatDistance(stats.lengthMeters));
+    }
+
+    return parts.join(' · ');
+}

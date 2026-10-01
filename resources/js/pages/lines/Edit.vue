@@ -17,6 +17,7 @@ import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
 import LineMap from '@/components/lines/LineMap.vue';
 import RouteModePicker from '@/components/lines/RouteModePicker.vue';
+import RouteStats from '@/components/lines/RouteStats.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -24,13 +25,7 @@ import { usePropagation } from '@/composables/usePropagation';
 import { useResampleSpacing } from '@/composables/useResampleSpacing';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
-import {
-    PROPAGATION_MAX_ARC_METERS,
-    PROPAGATION_MAX_VERTICES,
-    RESAMPLE_SPACING_METERS,
-    SNAP_PRESET_NAMES,
-    snapOptionsFor,
-} from '@/lib/routeEditing';
+import { RESAMPLE_SPACING_METERS, SNAP_PRESET_NAMES } from '@/lib/routeEditing';
 import type { ResampleSpacing, SnapPreset } from '@/lib/routeEditing';
 import {
     canRedo,
@@ -277,42 +272,6 @@ const canRedoGeometry = computed(() => canRedo(history.value));
 const { snapPreset, updateSnapPreset } = useSnapPreset();
 const { propagationEnabled, updatePropagation } = usePropagation();
 const { resampleSpacing, updateResampleSpacing } = useResampleSpacing();
-
-/**
- * What the active preset actually does, in the reviewer's terms.
- *
- * Shown next to the picker deliberately. "Aggressive" and "subtle" are words
- * that mean nothing on their own, while the distance is what decides whether a
- * given drop snaps at all — and being able to read it is how anyone calibrates a
- * setting on a street they do not know yet, instead of guessing from a label
- * and then blaming the tool.
- *
- * The propagation sentence is part of the same paragraph rather than a line of
- * its own, because it is governed by the number above it: a following vertex
- * has to be within that same distance to be pulled along. Printing the distance
- * once and letting it govern both is what stops the two controls from looking
- * like independent settings when they are not.
- */
-const snapSummary = computed(() => {
-    const options = snapOptionsFor(snapPreset.value);
-
-    if (options === null) {
-        return 'Drops land exactly where you release them, with no street lookup.';
-    }
-
-    const base = `Moves a drop onto a street within ${options.threshold} m of where you released it. When a selection is dropped on a crossing, the street more of the moved vertices are already on wins.`;
-
-    if (!propagationEnabled.value) {
-        return base;
-    }
-
-    return (
-        `${base} A drop also pulls up to ${PROPAGATION_MAX_VERTICES} ` +
-        'vertices either side of it onto that street, as long as each is within ' +
-        `${options.threshold} m of it and no more than ${PROPAGATION_MAX_ARC_METERS} m ` +
-        'along it.'
-    );
-});
 
 /**
  * Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z, deferring to the browser's own text undo
@@ -662,7 +621,10 @@ const pageTitle = computed(
             </div>
 
             <div class="flex items-center justify-between">
-                <Label>Route preview</Label>
+                <div class="flex items-center gap-2">
+                    <Label>Route preview</Label>
+                    <RouteStats :geo-json="parsedGeoJson" />
+                </div>
                 <div class="flex items-center gap-2">
                     <Button
                         v-if="isEditingMap"
@@ -798,12 +760,6 @@ const pageTitle = computed(
                     </div>
                 </div>
             </RouteModePicker>
-            <p
-                v-if="isEditingMap && mode === 'move'"
-                class="text-xs text-muted-foreground"
-            >
-                {{ snapSummary }}
-            </p>
             <LineMap
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
@@ -816,28 +772,10 @@ const pageTitle = computed(
                 @update:geo-json="onMapUpdate"
             />
             <p
-                v-if="isEditingMap"
+                v-if="isEditingMap && mode === 'move'"
                 class="text-sm text-blue-600 dark:text-blue-500"
             >
-                <template v-if="mode === 'move'">
-                    Drag a dot to move it. Shift-click two dots to grab
-                    everything between them, or Shift-drag on the map to box a
-                    selection out; then drag any selected dot to move them all
-                    together. A drop snaps onto a street near the dot you
-                    dragged; on a crossing it takes the street more of the moved
-                    dots are already on. Hold Alt to place it off the centreline
-                    instead. Undo takes back the last geometry edit, without
-                    moving the map.
-                </template>
-                <template v-else-if="mode === 'add'">
-                    Click on the route to add a new vertex.
-                </template>
-                <template v-else>
-                    Click a vertex to delete it. To delete several at once,
-                    Shift-click two vertices to take everything between them, or
-                    Shift-drag on the map to box a set out, then press Delete
-                    under the map.
-                </template>
+                Undo takes back the last geometry edit, without moving the map.
             </p>
             <p
                 v-if="!parsedGeoJson && geoJsonText"

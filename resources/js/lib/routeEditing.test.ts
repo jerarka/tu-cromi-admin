@@ -3,10 +3,15 @@ import {
     applyDeltaToSelection,
     clampRange,
     decideSnap,
+    describeRelayHint,
     describeRemoval,
     describeResample,
+    describeResampleHint,
+    describeRouteStats,
+    describeSnapSummary,
     distanceMeters,
     findClosestSegment,
+    formatDistance,
     insertVertexAt,
     longitudeScale,
     projectOnSegment,
@@ -20,7 +25,9 @@ import {
     relaySelectionOntoNetwork,
     removeVertexAt,
     removeVertices,
+    resampleBlock,
     resampleSelection,
+    routeStats,
     routeEndpoints,
     SNAP_PRESETS,
     SNAP_SAMPLE_LIMIT,
@@ -454,6 +461,222 @@ describe('describeRemoval', () => {
         });
 
         expect(message).not.toContain('vertices');
+    });
+});
+
+describe('routeStats', () => {
+    const LAT = -17.78;
+
+    const DEG = distanceMeters([-63.18, LAT], [-63.18 + 1, LAT]);
+
+    /** Degrees of longitude covering `metres` here. */
+    const deg = (metres: number): number => metres / DEG;
+
+    /**
+     * Degrees of *latitude* covering `metres`.
+     *
+     * Separate from `deg` because a longitude degree in Santa Cruz is about 5%
+     * shorter than a latitude degree, and a fixture that reuses the longitude
+     * figure to build a north-south leg asks for 600 m and gets 630. That reads
+     * as a rounding artefact in the code under test and is really a fixture
+     * measuring the wrong axis.
+     */
+    const degLat = (metres: number): number =>
+        metres / distanceMeters([0, 0], [0, 1]);
+
+    test('counts every position the route holds', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+            ],
+            [
+                [3, 0],
+                [4, 0],
+            ],
+        ];
+
+        expect(routeStats(line).vertices).toBe(5);
+    });
+
+    /**
+     * A one-position segment is not drawable and does not look like a vertex on
+     * the map, but it still occupies a slot in the coordinates array — the array
+     * `line_transfers` addresses by index. Counting only what looks like a vertex
+     * would make this number disagree with the thing it exists to inform.
+     */
+    test('counts a one-position segment', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+            ],
+            [[9, 9]],
+        ];
+
+        expect(routeStats(line).vertices).toBe(3);
+    });
+
+    test('reports nothing measurable for a route with no legs', () => {
+        const single: Coordinates = [[[0, 0]]];
+
+        const stats = routeStats(single);
+
+        expect(stats.vertices).toBe(1);
+        expect(stats.spacingMeters).toBeNull();
+        expect(stats.lengthMeters).toBe(0);
+    });
+
+    test('is zero for no geometry at all', () => {
+        const stats = routeStats([]);
+
+        expect(stats.vertices).toBe(0);
+        expect(stats.spacingMeters).toBeNull();
+        expect(stats.lengthMeters).toBe(0);
+    });
+
+    test('measures a uniform route at its own interval', () => {
+        const line: Coordinates = [
+            Array.from({ length: 5 }, (_, i) => [-63.18 + i * deg(100), LAT]),
+        ];
+
+        const stats = routeStats(line);
+
+        expect(stats.vertices).toBe(5);
+        expect(stats.lengthMeters).toBeCloseTo(400, 6);
+        expect(stats.spacingMeters).toBeCloseTo(100, 6);
+    });
+
+    test('measures a corner as the length walked, not the line across it', () => {
+        const corner: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(600), LAT],
+                [-63.18 + deg(600), LAT + degLat(600)],
+            ],
+        ];
+
+        // Two 600 m legs, not the single 848 m chord between the ends.
+        expect(routeStats(corner).lengthMeters).toBeCloseTo(1200, 3);
+    });
+
+    /**
+     * The test this whole function exists to be honest about.
+     *
+     * A route's MultiLineString parts are not a continuation of each other, so
+     * accumulating across the gap would report distance and spacing over ground
+     * the route never runs. Deriving the spacing as `length / (vertices - 1)`
+     * instead would agree exactly here and on any single-segment route, and
+     * quietly disagree on this one — which is the worst kind of wrong, because it
+     * passes every case that looks like the common case.
+     */
+    test('does not measure across the gap between two segments', () => {
+        // The second segment is a different city entirely, so any measurement
+        // that bridges the two would be off by thousands of kilometres.
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(100), LAT],
+            ],
+            [
+                [0, 40],
+                [0, 40 + degLat(100)],
+            ],
+        ];
+
+        const stats = routeStats(line);
+
+        expect(stats.vertices).toBe(4);
+        expect(stats.lengthMeters).toBeCloseTo(200, 3);
+        expect(stats.spacingMeters).toBeCloseTo(100, 3);
+    });
+
+    test('averages legs, not the span from the first vertex to the last', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(100), LAT],
+            ],
+            [
+                [-63.18 + deg(100), LAT],
+                [-63.18 + deg(300), LAT],
+            ],
+        ];
+
+        // One 100 m leg and one 200 m leg: the mean is 150, where dividing the
+        // total by the vertex count would have said 100.
+        expect(routeStats(line).spacingMeters).toBeCloseTo(150, 3);
+    });
+});
+
+describe('formatDistance', () => {
+    test('reads metres below a kilometre', () => {
+        // "0.6 km" is harder to picture and to check against the map.
+        expect(formatDistance(640)).toBe('640 m');
+    });
+
+    test('switches to kilometres at exactly a kilometre', () => {
+        expect(formatDistance(999)).toBe('999 m');
+        expect(formatDistance(1000)).toBe('1.0 km');
+    });
+
+    test('keeps one decimal up to a hundred kilometres', () => {
+        expect(formatDistance(99900)).toBe('99.9 km');
+    });
+
+    test('drops the decimal past a hundred kilometres', () => {
+        // The decimal is noise on a number nobody is going to measure.
+        expect(formatDistance(100000)).toBe('100 km');
+        expect(formatDistance(412300)).toBe('412 km');
+    });
+
+    test('rounds to whole metres rather than claiming decimals', () => {
+        expect(formatDistance(640.6)).toBe('641 m');
+    });
+});
+
+describe('describeRouteStats', () => {
+    test('says nothing about a route with no vertices', () => {
+        expect(
+            describeRouteStats({
+                vertices: 0,
+                spacingMeters: null,
+                lengthMeters: 0,
+            }),
+        ).toBe('');
+    });
+
+    test('leads with the count and carries all three readings', () => {
+        const line: Coordinates = [
+            Array.from({ length: 5 }, (_, i) => [-63.18 + i * 0.001, -17.78]),
+        ];
+
+        const message = describeRouteStats(routeStats(line));
+
+        expect(message).toBe('5 vertices · 106 m apart · 424 m');
+    });
+
+    test('uses the singular for one vertex', () => {
+        const line: Coordinates = [[[0, 0]]];
+
+        expect(describeRouteStats(routeStats(line))).toBe('1 vertex');
+    });
+
+    test('carries all three readings for a route of two vertices', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, -17.78],
+                [-63.18 + 0.001, -17.78],
+            ],
+        ];
+
+        // One leg, so the length and the spacing are the same number, and the
+        // point of asserting the whole string is that the clause order and the
+        // units are decided in one place rather than per page.
+        expect(describeRouteStats(routeStats(line))).toBe(
+            '2 vertices · 106 m apart · 106 m',
+        );
     });
 });
 
@@ -2388,5 +2611,130 @@ describe('describeResample', () => {
 
         expect(message).toContain('Re-spaced to 100 m');
         expect(message).toContain('added');
+    });
+});
+
+describe('resampleBlock', () => {
+    const selection = (...indices: number[]): VertexRef[] =>
+        indices.map((index) => ({ segment: 0, index }));
+
+    test('lets a single-segment selection through', () => {
+        expect(resampleBlock(selection(0, 1))).toBeNull();
+        expect(resampleBlock(selection(0, 1, 2, 3))).toBeNull();
+    });
+
+    test('blocks a selection too short to have a stretch', () => {
+        expect(resampleBlock([])).toBe('too-few');
+        expect(resampleBlock(selection(2))).toBe('too-few');
+    });
+
+    /**
+     * A route's MultiLineString parts are not a continuation of each other, so
+     * there is no leg to interpolate between them. And the reason it has to be
+     * named separately is that it cannot be fixed by selecting more � which is
+     * what a "select at least two vertices" message tells the reviewer to do.
+     */
+    test('blocks a selection crossing a segment boundary', () => {
+        const across: VertexRef[] = [
+            { segment: 0, index: 1 },
+            { segment: 1, index: 0 },
+        ];
+
+        expect(resampleBlock(across)).toBe('spans-segments');
+    });
+
+    test('does not treat a sparse selection as a boundary crossing', () => {
+        // Skipping vertices is not the same as crossing segments.
+        expect(resampleBlock(selection(0, 9))).toBeNull();
+    });
+});
+
+describe('describeResampleHint', () => {
+    test('names the missing selection', () => {
+        expect(describeResampleHint('too-few')).toContain('at least two');
+    });
+
+    test('names the boundary, and not the count to select more of', () => {
+        const hint = describeResampleHint('spans-segments');
+
+        expect(hint).toContain('segment boundary');
+        expect(hint).not.toContain('at least two');
+    });
+
+    test('says what the action does when nothing blocks it', () => {
+        const hint = describeResampleHint(null);
+
+        expect(hint).toContain('even intervals');
+        expect(hint).toContain('line itself does not move');
+    });
+});
+
+describe('describeRelayHint', () => {
+    test('names the missing selection', () => {
+        expect(describeRelayHint('too-few')).toContain('at least two');
+    });
+
+    /**
+     * The blocked case has to lead. A tooltip the reviewer only opens because the
+     * button is greyed out has already failed if it opens by explaining what the
+     * button would have done.
+     */
+    test('leads with the refusal rather than the action', () => {
+        const blocked = describeRelayHint('too-few');
+        const open = describeRelayHint(null);
+
+        expect(blocked.length).toBeLessThan(open.length);
+        expect(blocked).not.toContain('straight run');
+    });
+
+    test('explains the case the re-lay exists for', () => {
+        expect(describeRelayHint(null)).toContain('straight run');
+    });
+});
+
+describe('describeSnapSummary', () => {
+    test('says snapping is off rather than describing a threshold of zero', () => {
+        // "off" is not a row in the preset table, so there is no number to print,
+        // and printing zero would be a lie a reviewer could act on.
+        expect(describeSnapSummary('off', false)).toBe(
+            'Drops land exactly where you release them, with no street lookup.',
+        );
+    });
+
+    test('carries the threshold the preset actually uses', () => {
+        // The number is the setting. A reviewer calibrating against a street they
+        // do not know has to read it, which is why this stays visible.
+        expect(describeSnapSummary('normal', false)).toContain('25 m');
+        expect(describeSnapSummary('subtle', false)).toContain('12 m');
+        expect(describeSnapSummary('aggressive', false)).toContain('50 m');
+    });
+
+    test('explains what happens on a crossing', () => {
+        expect(describeSnapSummary('normal', false)).toContain('crossing');
+    });
+
+    test('omits the propagation clause when it is off', () => {
+        const off = describeSnapSummary('normal', false);
+
+        expect(off).not.toContain('pulls up to');
+    });
+
+    /**
+     * The propagation sentence is part of the same one rather than a paragraph of
+     * its own, because it is governed by the number above it. Printing the
+     * distance once is what stops the two from looking like independent settings.
+     */
+    test('folds the propagation into the same sentence, with its own limits', () => {
+        const on = describeSnapSummary('normal', true);
+
+        expect(on).toContain('pulls up to 4');
+        expect(on).toContain('250 m');
+        expect(on).toContain('25 m');
+    });
+
+    test('propagation is off even when the create page never asked', () => {
+        expect(describeSnapSummary('normal', false)).not.toContain(
+            'pulls up to',
+        );
     });
 });

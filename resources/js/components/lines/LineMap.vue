@@ -4,14 +4,23 @@ import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
 import { Button } from '@/components/ui/button';
+import {
+    Tooltip,
+    TooltipContent,
+    TooltipProvider,
+    TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { usePropagation } from '@/composables/usePropagation';
 import { consumePreserveToken } from '@/lib/mapView';
 import {
     applyDeltaToSelection,
     clampRange,
     decideSnap,
+    describeRelayHint,
     describeRemoval,
     describeResample,
+    describeResampleHint,
+    describeSnapSummary,
     findClosestSegment,
     insertVertexAt,
     projectOnSegment,
@@ -22,6 +31,7 @@ import {
     relaySelectionOntoNetwork,
     removeVertexAt,
     removeVertices,
+    resampleBlock,
     resampleSelection,
     routeEndpoints,
     snapOptionsFor,
@@ -1260,25 +1270,38 @@ function announceResample(label: string | null): void {
 }
 
 /**
+ * What the snap will do with a drop, stated in full.
+ *
+ * Owned here rather than by the page, because the snap is this component's
+ * behaviour: it is the one holding the preset, applying the offset and walking
+ * the propagation. The page can describe what it asked for; only the map knows
+ * what came of it.
+ *
+ * Living here also gives the create page the sentence it never had. It mounts
+ * this map with snapping already on and no preset picker above it, so before
+ * this moved the reviewer was being snapped at with no visible explanation
+ * anywhere on the screen.
+ */
+const snapSummary = computed(() =>
+    describeSnapSummary(props.snapPreset ?? 'normal', propagationEnabled.value),
+);
+
+/**
  * Whether the selection is a stretch a re-spacing can actually walk.
  *
- * Two refusals, and both have to be visible. A single vertex has no stretch
- * between it and anything. And a selection straddling two segments has no leg
- * between them to interpolate along — a route's MultiLineString parts are not a
- * continuation of each other, so a walk that crossed the gap would lay points
- * over ground the route never touches.
+ * The rule itself is resampleBlock's, in lib/. What is left here is the part that
+ * is genuinely about this component: whether the feature is on and whether the
+ * mode is the one that offers it. Keeping the two apart is what stops the button
+ * from needing its own copy of the two refusals.
  */
-const canResample = computed(() => {
-    if (!props.resample || (props.mode ?? 'move') !== 'move') {
-        return false;
-    }
+const resampleBlockReason = computed(() => resampleBlock(selection.value));
 
-    if (selection.value.length < 2) {
-        return false;
-    }
-
-    return new Set(selection.value.map((ref) => ref.segment)).size === 1;
-});
+const canResample = computed(
+    () =>
+        props.resample === true &&
+        (props.mode ?? 'move') === 'move' &&
+        resampleBlockReason.value === null,
+);
 
 /**
  * Why the re-space button is unavailable, or what it will do.
@@ -1287,17 +1310,20 @@ const canResample = computed(() => {
  * reviewer who cannot use a button has no way to tell whether it is waiting for
  * a selection, waiting for a contiguous one, or broken.
  */
-const resampleHint = computed(() => {
-    if (selection.value.length < 2) {
-        return 'Select at least two vertices to re-space.';
-    }
+const resampleHint = computed(() =>
+    describeResampleHint(resampleBlockReason.value),
+);
 
-    if (!canResample.value) {
-        return 'A re-space walks one segment, so the selection cannot cross a segment boundary.';
-    }
-
-    return 'Spread the selected stretch at even intervals, leaving the route the same shape.';
-});
+/**
+ * Why the re-lay is unavailable, or what it will do.
+ *
+ * The re-lay has no segment rule of its own — a selection of two vertices on
+ * different segments is still two vertices it can look up streets for — so the
+ * only thing standing in the way is not having two yet.
+ */
+const relayHint = computed(() =>
+    describeRelayHint(selection.value.length < 2 ? 'too-few' : null),
+);
 
 /**
  * Re-space the selected stretch to even intervals.
@@ -1584,15 +1610,28 @@ onUnmounted(() => {
         >
             <template v-if="selection.length > 1">
                 {{ selection.length }} vertices selected. Drag any of them to
-                move the whole stretch. Hold Alt to skip snapping, Escape to
-                deselect.
+                move the whole stretch. Escape to deselect.
             </template>
+            <!--
+                Alt is mentioned here and not in the branch above, because these
+                two are the same hint in two states rather than two hints, and a
+                modifier that is explained twice on one screen is a modifier
+                nobody remembers reading. This is the state a reviewer is in first.
+            -->
             <template v-else>
                 Shift-click two vertices to grab everything between them, or
                 Shift-drag on the map to box one out. Then drag any selected
-                vertex to move them together. A dropped vertex snaps onto the
-                nearest street — hold Alt to place it off the centreline.
+                vertex to move them together. A drop snaps onto the nearest
+                street — hold Alt to place it off the centreline.
             </template>
+        </p>
+        <p
+            v-if="editable && mode === 'add'"
+            class="mt-2 text-sm text-muted-foreground"
+        >
+            Click on the route to add a vertex. A click within about 10 m of one
+            already there is ignored, so a second click on the same spot does
+            nothing.
         </p>
         <p
             v-if="editable && mode === 'delete'"
@@ -1611,84 +1650,126 @@ onUnmounted(() => {
                 Shift-drag on the map to box a set out.
             </template>
         </p>
-        <div
-            v-if="relay && editable && mode === 'move'"
-            class="mt-3 flex items-center gap-3"
-        >
-            <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                :disabled="selection.length < 2"
-                :title="
-                    selection.length < 2
-                        ? 'Select at least two vertices to re-lay.'
-                        : 'Move each selected vertex onto the street it belongs to, which is how a straight run drawn over a curving road gets its shape back.'
-                "
-                @click="relaySelection"
-            >
-                <Waves class="size-4" />
-                Re-lay on the street network
-            </Button>
-            <p class="text-xs text-muted-foreground">
-                Works on the shape, not just the position: each selected vertex
-                moves onto its own street, so a stretch that turns a corner
-                comes out right. Points with no street in range stay put.
-            </p>
+        <!--
+            The three actions that act on a selection, one row each with nothing
+            but the button.
+
+            Each explanation went into a tooltip rather than into a paragraph
+            beside its button, and the deciding test was whether the reviewer
+            needs it *before* acting or only when a result surprises them. These
+            three are the latter. The two things that are the former — how to
+            make a selection at all, and what the snap is about to do to a drop
+            — stayed visible below, because a tooltip cannot be the only place a
+            reviewer learns a gesture exists.
+        -->
+        <div v-if="relay && editable && mode === 'move'" class="mt-3">
+            <!--
+                The trigger is a span around the button rather than the button,
+                which is the whole reason this tooltip can do its job. A disabled
+                button fires no pointer events, so a title or a trigger placed on
+                it stays silent — and the disabled state is exactly when the
+                explanation is wanted, because it is the reason the button cannot
+                be pressed.
+            -->
+            <TooltipProvider :delay-duration="0">
+                <Tooltip>
+                    <TooltipTrigger as-child>
+                        <span class="inline-flex">
+                            <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                :disabled="selection.length < 2"
+                                @click="relaySelection"
+                            >
+                                <Waves class="size-4" />
+                                Re-lay on the street network
+                            </Button>
+                        </span>
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs">
+                        <p>{{ relayHint }}</p>
+                    </TooltipContent>
+                </Tooltip>
+            </TooltipProvider>
         </div>
-        <div
-            v-if="resample && editable && mode === 'move'"
-            class="mt-3 flex items-center gap-3"
-        >
-            <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                :disabled="!canResample"
-                :title="resampleHint"
-                @click="applyResample"
-            >
-                <Ruler class="size-4" />
-                Re-space
-            </Button>
-            <p class="text-xs text-muted-foreground">
-                Spreads the selected stretch at even intervals along the route,
-                dropping the vertices that are too close and adding the ones
-                that are missing. The line itself is unchanged, only the points
-                on it.
-            </p>
+        <div v-if="resample && editable && mode === 'move'" class="mt-3">
+            <TooltipProvider :delay-duration="0">
+                <Tooltip>
+                    <TooltipTrigger as-child>
+                        <span class="inline-flex">
+                            <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                :disabled="!canResample"
+                                @click="applyResample"
+                            >
+                                <Ruler class="size-4" />
+                                Re-space
+                            </Button>
+                        </span>
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs">
+                        <p>{{ resampleHint }}</p>
+                    </TooltipContent>
+                </Tooltip>
+            </TooltipProvider>
         </div>
         <div
             v-if="editable && mode === 'delete' && selection.length > 0"
-            class="mt-3 flex items-center gap-3"
+            class="mt-3"
         >
-            <Button
-                type="button"
-                variant="destructive"
-                size="sm"
-                @click="deleteSelection"
-            >
-                <Trash2 class="size-4" />
-                Delete {{ selection.length }}
-                {{ selection.length === 1 ? 'vertex' : 'vertices' }}
-            </Button>
-            <p class="text-xs text-muted-foreground">
-                One undo step takes all of them back. A stretch left with fewer
-                than two points is dropped rather than kept as a stub.
-            </p>
+            <TooltipProvider :delay-duration="0">
+                <Tooltip>
+                    <TooltipTrigger as-child>
+                        <span class="inline-flex">
+                            <Button
+                                type="button"
+                                variant="destructive"
+                                size="sm"
+                                @click="deleteSelection"
+                            >
+                                <Trash2 class="size-4" />
+                                Delete {{ selection.length }}
+                                {{
+                                    selection.length === 1
+                                        ? 'vertex'
+                                        : 'vertices'
+                                }}
+                            </Button>
+                        </span>
+                    </TooltipTrigger>
+                    <!--
+                        Static, so it lives in the template rather than in a
+                        function in lib/. There is nothing here to compute and
+                        nothing to assert; a no-argument function would only make
+                        the wording harder to find.
+                    -->
+                    <TooltipContent class="max-w-xs">
+                        <p>
+                            One undo step takes all of them back. A stretch left
+                            with fewer than two points is dropped rather than
+                            kept as a stub.
+                        </p>
+                    </TooltipContent>
+                </Tooltip>
+            </TooltipProvider>
         </div>
         <!--
-            Its own paragraph rather than a clause in the one above, because it
-            only applies with the feature on and the reviewer who just turned it
-            on needs to know what the button did to their route.
+            The snap, stated in full and visible rather than in a tooltip. It is
+            the setting itself — the distance that decides whether a drop snaps
+            at all — and a reviewer calibrating against an unfamiliar street has
+            to be able to read it without first discovering that hovering reveals
+            it. The propagation clause is part of the same sentence for the same
+            reason: it is governed by the number above it, and printing it once
+            keeps the two from looking like independent settings.
         -->
         <p
-            v-if="editable && mode === 'move' && propagationEnabled"
-            class="mt-2 text-sm text-muted-foreground"
+            v-if="editable && mode === 'move' && snapOptions"
+            class="mt-3 text-sm text-muted-foreground"
         >
-            A drop also pulls the vertices either side of it onto the same
-            street, and stops at the first one too far off it to tell. Hold Alt
-            to skip that along with the snap.
+            {{ snapSummary }}
         </p>
         <p
             v-if="!geoJson && !editable"
