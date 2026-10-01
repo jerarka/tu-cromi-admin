@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Waves } from '@lucide/vue';
+import { Waves, Ruler, Trash2 } from '@lucide/vue';
 import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
@@ -10,6 +10,8 @@ import {
     applyDeltaToSelection,
     clampRange,
     decideSnap,
+    describeRemoval,
+    describeResample,
     findClosestSegment,
     insertVertexAt,
     projectOnSegment,
@@ -19,6 +21,8 @@ import {
     relayLimitsFor,
     relaySelectionOntoNetwork,
     removeVertexAt,
+    removeVertices,
+    resampleSelection,
     routeEndpoints,
     snapOptionsFor,
     snapSample,
@@ -27,6 +31,7 @@ import {
 import type {
     Coordinates,
     Position,
+    ResampleSpacing,
     SnapPreset,
     VertexRef,
 } from '@/lib/routeEditing';
@@ -70,6 +75,22 @@ const props = defineProps<{
      * a type error.
      */
     relay?: boolean;
+    /**
+     * Whether to offer re-spacing a selected stretch to even intervals.
+     *
+     * A prop for the same reason `relay` is one: the create page mounts this map
+     * with no controls above it, so a resample control it cannot offer a
+     * context for would be a button that appears with nothing to calibrate it.
+     */
+    resample?: boolean;
+    /**
+     * The interval a re-spacing is asked for.
+     *
+     * Defaults to the middle of the table rather than being required, so a
+     * caller that turns the feature on without wiring a picker still gets a
+     * working action instead of a disabled one nobody can explain.
+     */
+    resampleSpacing?: ResampleSpacing;
 }>();
 
 /**
@@ -219,9 +240,14 @@ function verticesWithin(bounds: L.LatLngBounds): VertexRef[] {
  * Shift rather than a plain drag because a plain drag pans, and a tool that
  * fights the map for the same gesture is a tool nobody uses. Modifying it is
  * the convention in every editor that has both.
+ *
+ * Available in delete mode as well as move, because picking a set of vertices
+ * and acting on the set is a separate question from what the mode does to one
+ * vertex. Excluded in add mode, where a box has no meaning: that mode is about
+ * placing vertices, and a selection there would have nothing to select for.
  */
 function startMarquee(e: L.LeafletMouseEvent): void {
-    if (!map || !props.editable || (props.mode ?? 'move') !== 'move') {
+    if (!map || !props.editable || (props.mode ?? 'move') === 'add') {
         return;
     }
 
@@ -436,7 +462,7 @@ function updateMapClickListener(mode: 'move' | 'add' | 'delete'): void {
         map.on('click', handleAddVertexClick);
     }
 
-    if (props.editable && mode === 'move') {
+    if (props.editable && (mode === 'move' || mode === 'delete')) {
         map.on('mousedown', startMarquee);
     }
 }
@@ -655,12 +681,21 @@ function vertexStyle(
     mode: 'move' | 'add' | 'delete',
 ): L.CircleMarkerOptions {
     if (mode === 'delete') {
+        /**
+         * A selected vertex is filled rather than a second colour.
+         *
+         * Green is what "selected" means everywhere else in this editor, and
+         * using it here would put two meanings on one colour. Filling the dot
+         * keeps the destructive mode reading as destructive while still showing
+         * the selection — which it has to, or a box gesture in delete mode looks
+         * like it did nothing and the next click removes an unchosen vertex.
+         */
         return {
-            radius: 6,
+            radius: selected ? 7 : 6,
             color: '#dc2626',
-            fillColor: '#ffffff',
+            fillColor: selected ? '#dc2626' : '#ffffff',
             fillOpacity: 1,
-            weight: 2,
+            weight: selected ? 3 : 2,
         };
     }
 
@@ -739,12 +774,31 @@ function addVertexMarkers(
                     refreshMarkerStyles();
                 });
             } else if (mode === 'delete') {
+                // Selection lives on click here too, for the same reason it does
+                // in move mode: Leaflet only fires click when the pointer barely
+                // moved, which is the distinction that lets a shift-click pick a
+                // range and a plain click act on one vertex.
                 marker.on('click', (e: L.LeafletMouseEvent) => {
                     L.DomEvent.stopPropagation(e.originalEvent);
 
+                    if (e.originalEvent.shiftKey) {
+                        selectRangeTo(ref);
+                        refreshMarkerStyles();
+
+                        return;
+                    }
+
+                    // A plain click still takes that one vertex and nothing else,
+                    // which is the whole of what this mode used to do. Deleting a
+                    // set is the button's job, not something a bare click should
+                    // do to whatever happened to be selected.
                     const newCoords = removeVertexAt(coords, segIdx, pointIdx);
 
-                    if (newCoords.length === 0) {
+                    // By identity, because that is what a refused removal returns.
+                    // It used to be a length check against an empty array, which
+                    // meant the primitive handed back a route with nothing on it
+                    // and correctness depended on this call remembering to look.
+                    if (newCoords === coords) {
                         return;
                     }
 
@@ -1187,6 +1241,175 @@ async function relaySelection(): Promise<void> {
     });
 }
 
+/** What a re-spacing did, said in full because it rewrote the vertex list. */
+const resampleLabel = ref<string | null>(null);
+let resampleLabelTimer: ReturnType<typeof setTimeout> | null = null;
+
+function announceResample(label: string | null): void {
+    if (resampleLabelTimer) {
+        clearTimeout(resampleLabelTimer);
+    }
+
+    resampleLabel.value = label;
+
+    if (label !== null) {
+        resampleLabelTimer = setTimeout(() => {
+            resampleLabel.value = null;
+        }, 9000);
+    }
+}
+
+/**
+ * Whether the selection is a stretch a re-spacing can actually walk.
+ *
+ * Two refusals, and both have to be visible. A single vertex has no stretch
+ * between it and anything. And a selection straddling two segments has no leg
+ * between them to interpolate along — a route's MultiLineString parts are not a
+ * continuation of each other, so a walk that crossed the gap would lay points
+ * over ground the route never touches.
+ */
+const canResample = computed(() => {
+    if (!props.resample || (props.mode ?? 'move') !== 'move') {
+        return false;
+    }
+
+    if (selection.value.length < 2) {
+        return false;
+    }
+
+    return new Set(selection.value.map((ref) => ref.segment)).size === 1;
+});
+
+/**
+ * Why the re-space button is unavailable, or what it will do.
+ *
+ * The refusals are spelled out rather than left to a disabled control. A
+ * reviewer who cannot use a button has no way to tell whether it is waiting for
+ * a selection, waiting for a contiguous one, or broken.
+ */
+const resampleHint = computed(() => {
+    if (selection.value.length < 2) {
+        return 'Select at least two vertices to re-space.';
+    }
+
+    if (!canResample.value) {
+        return 'A re-space walks one segment, so the selection cannot cross a segment boundary.';
+    }
+
+    return 'Spread the selected stretch at even intervals, leaving the route the same shape.';
+});
+
+/**
+ * Re-space the selected stretch to even intervals.
+ *
+ * Written like any other map edit and emitted as one, so the parent's history
+ * records it as a single undo step. That matters more here than for the other
+ * actions: this one can drop a hundred vertices and add two hundred, and undoing
+ * that a few vertices at a time is not a recovery.
+ *
+ * The selection is cleared here rather than left to the watcher on `geoJson`,
+ * which fires on the next tick. A selection addresses vertices by index, and a
+ * re-spacing renumbers every vertex after the one it inserted, so a second press
+ * landing in the gap would re-space a different stretch than the one the
+ * reviewer picked. Clearing the ref is free and takes the reasoning out of it.
+ */
+function applyResample(): void {
+    const coordinates = props.geoJson?.coordinates;
+    const spacing = props.resampleSpacing ?? 200;
+
+    if (!canResample.value || !coordinates) {
+        return;
+    }
+
+    const result = resampleSelection(coordinates, selection.value, spacing);
+
+    // Unchanged geometry still gets a sentence, because pressing the button and
+    // seeing nothing happen is indistinguishable from a broken one. Nothing is
+    // emitted, so the page does not become dirty for a no-op.
+    if (result.coordinates === coordinates) {
+        announceResample(describeResample(result, spacing));
+
+        return;
+    }
+
+    // Bumped so a street lookup still in flight from an earlier drop is
+    // discarded rather than applied to geometry it was not computed for. Same
+    // guard the snap and the re-lay both use.
+    geometryRevision += 1;
+    clearSelection();
+    announceResample(describeResample(result, spacing));
+    skipNextFitBounds = true;
+    emit('update:geoJson', {
+        type: 'MultiLineString' as const,
+        coordinates: result.coordinates,
+    });
+}
+
+/** What a bulk deletion took, said in full because it can take a segment. */
+const removalLabel = ref<string | null>(null);
+let removalLabelTimer: ReturnType<typeof setTimeout> | null = null;
+
+function announceRemoval(label: string | null): void {
+    if (removalLabelTimer) {
+        clearTimeout(removalLabelTimer);
+    }
+
+    removalLabel.value = label;
+
+    if (label !== null) {
+        removalLabelTimer = setTimeout(() => {
+            removalLabel.value = null;
+        }, 9000);
+    }
+}
+
+/**
+ * Delete every selected vertex in one step.
+ *
+ * The button is the only thing in this mode that touches a set. A plain click
+ * still removes the one vertex it landed on, so the single-vertex gesture nobody
+ * has to learn keeps working and a bulk deletion is always deliberate.
+ *
+ * Emitted as one change so the parent's history records it as one undo step. That
+ * is the whole safety net here, and it is also the reason there is no
+ * confirmation: a reviewer who deletes sixty vertices gets one Ctrl+Z, not sixty
+ * of them, and a dialog asking them to confirm a change that is one keystroke
+ * away from being undone is a worse trade.
+ *
+ * The selection is cleared here rather than left to the watcher on `geoJson`,
+ * which fires on the next tick. That is not good enough for this action: a
+ * selection addresses vertices by index, and every removal renumbers the ones
+ * after it, so a second press landing in the gap would delete a different set of
+ * vertices than the one the reviewer picked. Clearing the ref is free and removes
+ * the reasoning entirely.
+ */
+function deleteSelection(): void {
+    const coordinates = props.geoJson?.coordinates;
+
+    if (!coordinates || selection.value.length === 0) {
+        return;
+    }
+
+    const result = removeVertices(coordinates, selection.value);
+
+    // A selection the route no longer has, or one that would empty it. Either
+    // way nothing is emitted, so the page does not become dirty for a refusal.
+    if (result.coordinates === coordinates) {
+        announceRemoval(describeRemoval(result));
+
+        return;
+    }
+
+    clearSelection();
+    geometryRevision += 1;
+    announceRemoval(describeRemoval(result));
+    skipNextFitBounds = true;
+    emit('update:geoJson', {
+        type: 'MultiLineString' as const,
+        coordinates: result.coordinates,
+    });
+}
+
 function clearVertexMarkers(): void {
     vertexMarkers.forEach((m) => map?.removeLayer(m));
     vertexMarkers = [];
@@ -1294,6 +1517,16 @@ onUnmounted(() => {
         relayLabelTimer = null;
     }
 
+    if (resampleLabelTimer) {
+        clearTimeout(resampleLabelTimer);
+        resampleLabelTimer = null;
+    }
+
+    if (removalLabelTimer) {
+        clearTimeout(removalLabelTimer);
+        removalLabelTimer = null;
+    }
+
     clearLayers();
 
     if (map) {
@@ -1334,6 +1567,18 @@ onUnmounted(() => {
             {{ relayLabel }}
         </p>
         <p
+            v-if="resampleLabel"
+            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
+        >
+            {{ resampleLabel }}
+        </p>
+        <p
+            v-if="removalLabel"
+            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
+        >
+            {{ removalLabel }}
+        </p>
+        <p
             v-if="editable && mode === 'move'"
             class="mt-2 text-sm text-muted-foreground"
         >
@@ -1347,6 +1592,23 @@ onUnmounted(() => {
                 Shift-drag on the map to box one out. Then drag any selected
                 vertex to move them together. A dropped vertex snaps onto the
                 nearest street — hold Alt to place it off the centreline.
+            </template>
+        </p>
+        <p
+            v-if="editable && mode === 'delete'"
+            class="mt-2 text-sm text-muted-foreground"
+        >
+            <template v-if="selection.length > 0">
+                {{ selection.length }}
+                {{ selection.length === 1 ? 'vertex' : 'vertices' }} selected.
+                Use the button below to remove
+                {{ selection.length === 1 ? 'it' : 'them all' }}, or Escape to
+                deselect.
+            </template>
+            <template v-else>
+                Click a vertex to delete just that one. To delete several,
+                Shift-click two vertices to take everything between them, or
+                Shift-drag on the map to box a set out.
             </template>
         </p>
         <div
@@ -1372,6 +1634,47 @@ onUnmounted(() => {
                 Works on the shape, not just the position: each selected vertex
                 moves onto its own street, so a stretch that turns a corner
                 comes out right. Points with no street in range stay put.
+            </p>
+        </div>
+        <div
+            v-if="resample && editable && mode === 'move'"
+            class="mt-3 flex items-center gap-3"
+        >
+            <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                :disabled="!canResample"
+                :title="resampleHint"
+                @click="applyResample"
+            >
+                <Ruler class="size-4" />
+                Re-space
+            </Button>
+            <p class="text-xs text-muted-foreground">
+                Spreads the selected stretch at even intervals along the route,
+                dropping the vertices that are too close and adding the ones
+                that are missing. The line itself is unchanged, only the points
+                on it.
+            </p>
+        </div>
+        <div
+            v-if="editable && mode === 'delete' && selection.length > 0"
+            class="mt-3 flex items-center gap-3"
+        >
+            <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                @click="deleteSelection"
+            >
+                <Trash2 class="size-4" />
+                Delete {{ selection.length }}
+                {{ selection.length === 1 ? 'vertex' : 'vertices' }}
+            </Button>
+            <p class="text-xs text-muted-foreground">
+                One undo step takes all of them back. A stretch left with fewer
+                than two points is dropped rather than kept as a stub.
             </p>
         </div>
         <!--

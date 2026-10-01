@@ -21,15 +21,17 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { usePropagation } from '@/composables/usePropagation';
+import { useResampleSpacing } from '@/composables/useResampleSpacing';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
 import {
     PROPAGATION_MAX_ARC_METERS,
     PROPAGATION_MAX_VERTICES,
+    RESAMPLE_SPACING_METERS,
     SNAP_PRESET_NAMES,
     snapOptionsFor,
 } from '@/lib/routeEditing';
-import type { SnapPreset } from '@/lib/routeEditing';
+import type { ResampleSpacing, SnapPreset } from '@/lib/routeEditing';
 import {
     canRedo,
     canUndo,
@@ -274,6 +276,7 @@ const canRedoGeometry = computed(() => canRedo(history.value));
 
 const { snapPreset, updateSnapPreset } = useSnapPreset();
 const { propagationEnabled, updatePropagation } = usePropagation();
+const { resampleSpacing, updateResampleSpacing } = useResampleSpacing();
 
 /**
  * What the active preset actually does, in the reviewer's terms.
@@ -751,6 +754,49 @@ const pageTitle = computed(
                         </Label>
                     </div>
                 </div>
+
+                <!--
+                    Its own control rather than another snap preset value,
+                    because it is a question about the vertices the route
+                    already has rather than about where a drop should land. A
+                    preset would read as a snap setting and would inherit the
+                    threshold that governs it.
+
+                    Gated on move mode like the snap controls beside it, and for
+                    the same reason the propagation checkbox is gated on the
+                    preset: the button this feeds only exists in move mode, so a
+                    picker left on screen in add or delete is a setting that
+                    says it is doing something when it provably is not.
+                -->
+                <div
+                    v-if="mode === 'move'"
+                    class="ms-1 flex flex-wrap items-center gap-4"
+                >
+                    <div class="flex items-center gap-2">
+                        <Label for="resample-spacing">Re-space</Label>
+                        <select
+                            id="resample-spacing"
+                            :value="resampleSpacing"
+                            class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
+                            @change="
+                                updateResampleSpacing(
+                                    Number(
+                                        ($event.target as HTMLSelectElement)
+                                            .value,
+                                    ) as ResampleSpacing,
+                                )
+                            "
+                        >
+                            <option
+                                v-for="spacing in RESAMPLE_SPACING_METERS"
+                                :key="spacing"
+                                :value="spacing"
+                            >
+                                {{ spacing }} m
+                            </option>
+                        </select>
+                    </div>
+                </div>
             </RouteModePicker>
             <p
                 v-if="isEditingMap && mode === 'move'"
@@ -764,6 +810,8 @@ const pageTitle = computed(
                 :mode="mode"
                 :snap-preset="snapPreset"
                 :relay="snapPreset !== 'off'"
+                :resample="true"
+                :resample-spacing="resampleSpacing"
                 :preserve-view-token="preserveViewToken"
                 @update:geo-json="onMapUpdate"
             />
@@ -784,7 +832,12 @@ const pageTitle = computed(
                 <template v-else-if="mode === 'add'">
                     Click on the route to add a new vertex.
                 </template>
-                <template v-else> Click a vertex to delete it. </template>
+                <template v-else>
+                    Click a vertex to delete it. To delete several at once,
+                    Shift-click two vertices to take everything between them, or
+                    Shift-drag on the map to box a set out, then press Delete
+                    under the map.
+                </template>
             </p>
             <p
                 v-if="!parsedGeoJson && geoJsonText"

@@ -169,30 +169,159 @@ export function insertVertexAt(
     return next;
 }
 
+/** What a deletion took, said in full because it can take a segment with it. */
+export interface RemovalResult {
+    coordinates: Coordinates;
+    /** How many vertices actually left the route. */
+    removed: number;
+    /**
+     * How many segments went with them, for having been left too short to draw.
+     *
+     * Reported because it is not visible in the vertex count: a reviewer who
+     * selected six vertices and lost a whole stretch of route deserves to be
+     * told that, rather than to notice it on the map.
+     */
+    droppedSegments: number;
+}
+
+/**
+ * Drop a set of vertices, all at once.
+ *
+ * Deleting one vertex at a time is not an option past a certain size. Every
+ * removal renumbers the ones after it, so a reviewer working down a stretch
+ * would be deleting indexes that have already moved — and the twentieth click
+ * is the one that removes a vertex they had not chosen.
+ *
+ * The degenerate-segment rule is the interesting part, and it is inherited
+ * rather than restated: a segment left with fewer than two positions is dropped
+ * outright. A one-position segment cannot be drawn, and ST_DumpPoints would
+ * still report a position for it, inventing a stop that does not exist. Kept
+ * for the single-vertex case by delegation, so the rule has one implementation
+ * and a bulk deletion cannot quietly disagree with a single one about what
+ * happens to the segment they have in common.
+ *
+ * Refuses a deletion that would empty the route. A route with no segments
+ * cannot be drawn or reviewed, and the alternative is a twenty-click setup that
+ * ends with nothing to undo back onto.
+ *
+ * Returns the input untouched, by identity, when the selection holds nothing
+ * the route still has. A selection addresses vertices by index, so one picked
+ * against a previous geometry is stale rather than wrong, and the honest answer
+ * to it is to do nothing.
+ */
+export function removeVertices(
+    coordinates: Coordinates,
+    selection: VertexRef[],
+): RemovalResult {
+    const nothing: RemovalResult = {
+        coordinates,
+        removed: 0,
+        droppedSegments: 0,
+    };
+
+    if (selection.length === 0) {
+        return nothing;
+    }
+
+    const doomed = new Set(
+        selection.map((ref) => `${ref.segment}:${ref.index}`),
+    );
+
+    // Counted against the route before anything is written, so a selection made
+    // against a geometry the route no longer has reports nothing removed instead
+    // of rebuilding the route around it.
+    let matched = 0;
+
+    for (const ref of selection) {
+        if (coordinates[ref.segment]?.[ref.index]) {
+            matched += 1;
+        }
+    }
+
+    if (matched === 0) {
+        return nothing;
+    }
+
+    const next: Coordinates = [];
+    let removed = 0;
+    let droppedSegments = 0;
+
+    coordinates.forEach((segment, segIdx) => {
+        const kept = segment.filter(
+            (_, index) => !doomed.has(`${segIdx}:${index}`),
+        );
+        const dropped = segment.length - kept.length;
+
+        removed += dropped;
+
+        // Only when this deletion is what left the segment that short. A segment
+        // that arrived already degenerate is not this function's to tidy up, and
+        // repairing it here would change geometry nobody selected.
+        if (dropped > 0 && kept.length < 2) {
+            droppedSegments += 1;
+
+            return;
+        }
+
+        next.push(dropped === 0 ? [...segment] : kept);
+    });
+
+    if (next.length === 0) {
+        return nothing;
+    }
+
+    return { coordinates: next, removed, droppedSegments };
+}
+
 /**
  * Drop a vertex.
  *
- * A segment that already holds only two positions is removed outright rather
- * than reduced to a single point: a one-position segment cannot be drawn, and
- * ST_DumpPoints would still report a position for it, inventing a stop that
- * does not exist. A longer segment keeps the vertex it loses, because two
- * positions is still a drawable line.
+ * One call into the bulk deletion rather than a second implementation of the
+ * same rule. It used to branch here on the segment's length, and the branch is
+ * exactly the one a bulk deletion also has to make — a segment that cannot be
+ * drawn is dropped either way, whether one vertex or six went missing — so
+ * having it in one place is what keeps the two actions from disagreeing about
+ * the segment they share.
+ *
+ * A segment that keeps two positions keeps them: two points is still a drawable
+ * line.
  */
 export function removeVertexAt(
     coordinates: Coordinates,
     segIdx: number,
     pointIdx: number,
 ): Coordinates {
-    const next = coordinates.map((segment) => [...segment]);
-    const segment = next[segIdx];
+    return removeVertices(coordinates, [{ segment: segIdx, index: pointIdx }])
+        .coordinates;
+}
 
-    if (segment.length <= 2) {
-        next.splice(segIdx, 1);
-    } else {
-        segment.splice(pointIdx, 1);
+/**
+ * What a deletion took, in the reviewer's terms.
+ *
+ * The dropped segments lead the sentence when there are any. They are the part
+ * that is not visible in the count of vertices removed, and the part a reviewer
+ * has no other way of learning about.
+ */
+export function describeRemoval(result: RemovalResult): string {
+    if (result.removed === 0) {
+        return 'Nothing was selected to delete.';
     }
 
-    return next;
+    const deleted =
+        result.removed === 1
+            ? 'Deleted 1 vertex.'
+            : `Deleted ${result.removed} vertices.`;
+
+    if (result.droppedSegments === 0) {
+        return deleted;
+    }
+
+    const noun = result.droppedSegments === 1 ? 'segment' : 'segments';
+
+    return (
+        `${deleted} ${result.droppedSegments} ${noun} went too, ` +
+        'left with too few points to draw.'
+    );
 }
 
 /**
@@ -1294,4 +1423,332 @@ export function relaySelectionOntoNetwork(
     }
 
     return { coordinates: next, moved, streets, unmatched };
+}
+
+/**
+ * The spacings a resample may be asked for, in metres.
+ *
+ * The type is derived from this rather than written beside it, for the reason
+ * the snap presets are: the set the UI offers, the set a stored preference is
+ * checked against, and the set a handler narrows to cannot disagree. A spacing
+ * missing from this list does not exist anywhere else either.
+ *
+ * Every one of them is an order of magnitude above `RELAY_MIN_SPACING_METERS`,
+ * and that is a constraint rather than a coincidence. A resample able to place
+ * vertices ten metres apart would contradict the separation the re-lay
+ * enforces, and a reviewer could build a route that the re-lay then reported as
+ * too crowded and asked them to fix.
+ */
+export const RESAMPLE_SPACING_METERS = [100, 200, 300] as const;
+
+/** How far apart a resample is asked to leave two vertices, in metres. */
+export type ResampleSpacing = (typeof RESAMPLE_SPACING_METERS)[number];
+
+/**
+ * Below this, in degrees, two positions count as the same point.
+ *
+ * Interpolation error on a boundary that lands exactly on a vertex is a few
+ * parts in a hundred million, which is a fraction of a millimetre — so this is
+ * about refusing to call a vertex duplicated because of float noise, not about
+ * being precise.
+ */
+const RESAMPLE_EPSILON = 1e-7;
+
+/**
+ * Distance in metres between two route positions, given as raw `[lng, lat]`.
+ *
+ * Distinct from metricDistance, which takes positions already in the metric
+ * frame and says so in its name precisely because reading them the other way is
+ * silent: a raw pair treated as metric is a point at the wrong longitude, and
+ * the only symptom is a resample that spaces its new vertices by the wrong
+ * amount. The frame is applied here, once, at the point of comparison, which is
+ * where this module says a limit in metres has to be decided.
+ *
+ * Scaled at the midpoint latitude of the pair rather than at either end, so a
+ * leg is measured on the scale that applies to the ground it actually covers
+ * instead of whichever of its two ends the code happened to read first. Over one
+ * block the difference is centimetres; along a route that climbs out of the
+ * city it is not, and a per-pair average is the honest answer at both.
+ */
+export function distanceMeters(a: Position, b: Position): number {
+    const scale = longitudeScale((a[1] + b[1]) / 2);
+
+    return metricDistance([a[0] * scale, a[1]], [b[0] * scale, b[1]]);
+}
+
+/**
+ * A position `metres` along the leg from `a` to `b`, or null past its end.
+ *
+ * Null rather than a clamp, for the reason projectOnSegment reports its
+ * parameter unclamped: overshooting a leg is how the caller knows to stop
+ * walking, and a clamped answer would place a point on the vertex the route
+ * already has.
+ */
+function pointAlongLeg(
+    a: Position,
+    b: Position,
+    metres: number,
+): Position | null {
+    const legLength = distanceMeters(a, b);
+
+    if (legLength <= 0 || metres > legLength) {
+        return null;
+    }
+
+    const t = metres / legLength;
+
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+}
+
+/** What a re-spacing did, said in full because it rewrites the vertex list. */
+export interface ResampleResult {
+    coordinates: Coordinates;
+    /** How many vertices the re-spacing introduced. */
+    added: number;
+    /** How many of the selected vertices it dropped. */
+    removed: number;
+    /**
+     * True when the stretch could not be filled in whole spacings and the last
+     * leg came out short.
+     *
+     * The honest answer to a target the geometry cannot meet: the tail is
+     * whatever is left over, and saying so is better than a reviewer measuring
+     * the final gap, finding eighteen metres, and concluding the tool rounds
+     * silently.
+     */
+    raggedTail: boolean;
+}
+
+/**
+ * Re-space a selected stretch of route to roughly equal intervals.
+ *
+ * The one action in this editor that changes how many vertices a route has
+ * without changing where the line runs. A drag moves geometry, a propagation
+ * walks a few vertices onto a street, a re-lay bends a straight run into a
+ * curve — none of them touch how the vertices are distributed along it. This
+ * does, which is what makes it the answer to a stretch a reviewer placed by hand
+ * at four metres and then twelve hundred.
+ *
+ * It is a re-spacing and deliberately not a simplification. Nothing is dropped
+ * for carrying no shape: a vertex at a corner survives even two metres from its
+ * neighbour, because a re-spacing that flattened corners would be a different
+ * tool wearing a destructive name. The interior vertices are cleared and the
+ * stretch is walked again from scratch.
+ *
+ * Because every new point is interpolated along a leg that already exists, all
+ * of them are collinear with the line the reviewer drew. The route's shape is
+ * untouched — this changes the sample rate, not the path. That is the property
+ * the re-lay does not have, and it is why this is safe to offer on a route of
+ * five hundred vertices and why it needs no network round trip at all.
+ *
+ * The cost is the thing worth knowing before pressing it. `line_transfers`
+ * addresses vertices by index, so re-spacing a line invalidates every transfer
+ * computed for it and `transfers:compute` has to run again before the offline
+ * bundle ships. No other edit here moves those indexes, which is exactly why the
+ * re-lay's own contract is that it never adds or removes a vertex.
+ *
+ * Measured along the route rather than between endpoints, because the
+ * difference is invisible right up until it is a disaster. A straight-line walk
+ * across a selection that turns a corner places the new vertices off the
+ * corner, cutting the inside of the turn and drawing a route nobody approved.
+ *
+ * The first and last selected vertices are held exactly where they are. They are
+ * shared with the stretches either side, so moving one edits geometry outside
+ * the selection — not what a reviewer who boxed a stretch and pressed a button
+ * asked for.
+ *
+ * Refuses a selection spanning two segments. A route's MultiLineString parts are
+ * not a continuation of each other, so there is no leg to walk between the end
+ * of one and the start of the next; bridging that gap is what a re-spacing must
+ * never do. Two vertices is the floor for the same reason — one vertex has no
+ * stretch to re-space.
+ *
+ * Returns the input untouched, by identity, when the stretch already complies.
+ * A reviewer who presses the button twice should get a page that is not dirty
+ * the second time, not a rewrite of coordinates that differ in the ninth
+ * decimal.
+ */
+export function resampleSelection(
+    coordinates: Coordinates,
+    selection: VertexRef[],
+    spacing: ResampleSpacing,
+): ResampleResult {
+    const nothing: ResampleResult = {
+        coordinates,
+        added: 0,
+        removed: 0,
+        raggedTail: false,
+    };
+
+    const sorted = [...selection].sort((a, b) =>
+        a.segment !== b.segment ? a.segment - b.segment : a.index - b.index,
+    );
+
+    // Deduplicated in route order. A marquee can hand back the same vertex only
+    // if two boxes overlapped, but the cost of finding out mid-walk is a
+    // duplicated endpoint rather than an error.
+    const ordered: VertexRef[] = [];
+
+    for (const ref of sorted) {
+        const previous = ordered[ordered.length - 1];
+
+        if (
+            previous === undefined ||
+            previous.segment !== ref.segment ||
+            previous.index !== ref.index
+        ) {
+            ordered.push(ref);
+        }
+    }
+
+    const segment = ordered[0]?.segment;
+    const source = segment === undefined ? undefined : coordinates[segment];
+
+    if (
+        ordered.length < 2 ||
+        source === undefined ||
+        ordered.some((ref) => ref.segment !== segment)
+    ) {
+        return nothing;
+    }
+
+    const from = ordered[0].index;
+    const to = ordered[ordered.length - 1].index;
+
+    if (from < 0 || to >= source.length || to <= from) {
+        return nothing;
+    }
+
+    const at = (index: number): Position | null => {
+        const point = source[index];
+
+        return point ? [point[0], point[1]] : null;
+    };
+
+    const start = at(from);
+    const end = at(to);
+
+    if (!start || !end) {
+        return nothing;
+    }
+
+    // The walk. `consumed` is the distance already placed as a vertex, `walked`
+    // the distance covered by legs so far, and a boundary belongs on the leg
+    // that crosses it — which is what keeps a new vertex on the road the
+    // reviewer drew rather than across it.
+    const resampled: Position[] = [start];
+    let consumed = 0;
+    let walked = 0;
+
+    for (let i = from; i < to; i += 1) {
+        const a = at(i);
+        const b = at(i + 1);
+
+        if (!a || !b) {
+            return nothing;
+        }
+
+        const leg = distanceMeters(a, b);
+
+        // A zero-length leg is not a road. Skipped without advancing, so a
+        // boundary that falls inside it is placed on the next real leg.
+        if (leg <= 0) {
+            continue;
+        }
+
+        while (consumed + spacing <= walked + leg) {
+            const point = pointAlongLeg(a, b, consumed + spacing - walked);
+
+            if (!point) {
+                break;
+            }
+
+            resampled.push(point);
+            consumed += spacing;
+        }
+
+        walked += leg;
+    }
+
+    // The end is a vertex the reviewer already had, so it is always kept — and
+    // it is the only one that can be a no-op, because the walk can land a point
+    // on it exactly.
+    const tail = distanceMeters(resampled[resampled.length - 1], end);
+    const raggedTail =
+        tail > RESAMPLE_EPSILON && tail < spacing - RESAMPLE_EPSILON;
+
+    if (tail > RESAMPLE_EPSILON) {
+        resampled.push(end);
+    } else {
+        resampled[resampled.length - 1] = end;
+    }
+
+    // Both endpoints are held, so every interior original is gone and every
+    // interior point now in the list is one this function created. Counting them
+    // off the ends is more reliable than tracking them through the walk.
+    const removed = to - from - 1;
+    const added = resampled.length - 2;
+
+    const next = coordinates.map((part) => [...part]);
+
+    next[segment] = [
+        ...source.slice(0, from),
+        ...resampled,
+        ...source.slice(to + 1),
+    ];
+
+    // Whether anything actually moved. Not by count: a stretch already at the
+    // interval still gets its interior vertices replaced — with copies of
+    // themselves — so both counts are non-zero and the only honest test is
+    // whether the geometry came out the same. A reviewer who presses the button
+    // twice gets a page that is not dirty the second time.
+    const unchanged =
+        next[segment].length === source.length &&
+        next[segment].every(
+            (point, index) =>
+                Math.abs(point[0] - source[index][0]) < RESAMPLE_EPSILON &&
+                Math.abs(point[1] - source[index][1]) < RESAMPLE_EPSILON,
+        );
+
+    if (unchanged) {
+        return nothing;
+    }
+
+    return { coordinates: next, added, removed, raggedTail };
+}
+
+/**
+ * What a re-spacing did, in the reviewer's terms.
+ *
+ * The two counts lead rather than the interval, because those are what the
+ * reviewer can check against the map — the interval is the number they chose.
+ *
+ * A no-op says so instead of reporting two zeroes, which would read like a
+ * failure rather than like an answer.
+ */
+export function describeResample(
+    result: ResampleResult,
+    spacing: ResampleSpacing,
+): string {
+    if (result.added === 0 && result.removed === 0) {
+        return `This stretch was already spaced every ${spacing} m.`;
+    }
+
+    const parts: string[] = [];
+
+    if (result.removed > 0) {
+        parts.push(
+            `${result.removed} vertex${result.removed === 1 ? '' : 'es'} dropped`,
+        );
+    }
+
+    if (result.added > 0) {
+        parts.push(`${result.added} added`);
+    }
+
+    const tail = result.raggedTail
+        ? ` The stretch is not a whole number of ${spacing} m intervals, so the last leg is short.`
+        : '';
+
+    return `Re-spaced to ${spacing} m: ${parts.join(', ')}.${tail}`;
 }

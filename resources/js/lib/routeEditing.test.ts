@@ -3,6 +3,9 @@ import {
     applyDeltaToSelection,
     clampRange,
     decideSnap,
+    describeRemoval,
+    describeResample,
+    distanceMeters,
     findClosestSegment,
     insertVertexAt,
     longitudeScale,
@@ -16,6 +19,8 @@ import {
     relayLimitsFor,
     relaySelectionOntoNetwork,
     removeVertexAt,
+    removeVertices,
+    resampleSelection,
     routeEndpoints,
     SNAP_PRESETS,
     SNAP_SAMPLE_LIMIT,
@@ -178,7 +183,34 @@ describe('removeVertexAt', () => {
         ]);
     });
 
-    test('removes the whole segment when it holds only two vertices', () => {
+    test('drops the whole segment when it would be left with one vertex', () => {
+        const pair: Coordinates = [
+            [
+                [0, 0],
+                [10, 0],
+            ],
+            [
+                [0, 0],
+                [0, 10],
+            ],
+        ];
+
+        expect(removeVertexAt(pair, 0, 0)).toEqual([
+            [
+                [0, 0],
+                [0, 10],
+            ],
+        ]);
+    });
+
+    /**
+     * The contract this used to break. Removing from a route's only segment used
+     * to hand back `[]` and leave the caller to notice, which meant the primitive
+     * returned something that cannot be drawn or reviewed and every call site had
+     * to remember to check. It now declines and returns its input by identity,
+     * which is the same signal the bulk deletion and the re-space already use.
+     */
+    test('declines rather than returning a route with nothing on it', () => {
         const stub: Coordinates = [
             [
                 [0, 0],
@@ -186,7 +218,7 @@ describe('removeVertexAt', () => {
             ],
         ];
 
-        expect(removeVertexAt(stub, 0, 0)).toEqual([]);
+        expect(removeVertexAt(stub, 0, 0)).toBe(stub);
     });
 
     test('does not mutate the input', () => {
@@ -195,6 +227,233 @@ describe('removeVertexAt', () => {
         removeVertexAt(square, 0, 1);
 
         expect(square).toEqual(before);
+    });
+});
+
+describe('removeVertices', () => {
+    const selection = (...indices: number[]): VertexRef[] =>
+        indices.map((index) => ({ segment: 0, index }));
+
+    test('removes a whole set in one pass', () => {
+        // The reason this exists. Removing four vertices one click at a time
+        // renumbers the ones after each removal, so the fourth click is working
+        // against indexes that have already moved.
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+                [3, 0],
+                [4, 0],
+                [5, 0],
+            ],
+        ];
+
+        const result = removeVertices(line, selection(1, 2, 3));
+
+        expect(result.removed).toBe(3);
+        expect(result.coordinates[0]).toEqual([
+            [0, 0],
+            [4, 0],
+            [5, 0],
+        ]);
+    });
+
+    test('drops a segment left with too few points, and says so', () => {
+        const pair: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+            ],
+            [
+                [0, 5],
+                [1, 5],
+                [2, 5],
+            ],
+        ];
+
+        const result = removeVertices(pair, [
+            { segment: 0, index: 0 },
+            { segment: 1, index: 1 },
+        ]);
+
+        // The vertex is not in the vertex count, so the dropped segment is the
+        // only way a reviewer learns a stretch of route went with it.
+        expect(result.droppedSegments).toBe(1);
+        expect(result.removed).toBe(2);
+        expect(result.coordinates).toEqual([
+            [
+                [0, 5],
+                [2, 5],
+            ],
+        ]);
+    });
+
+    test('keeps a segment that is left with exactly two points', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+            ],
+        ];
+
+        const result = removeVertices(line, selection(1));
+
+        expect(result.droppedSegments).toBe(0);
+        expect(result.coordinates[0]).toEqual([
+            [0, 0],
+            [2, 0],
+        ]);
+    });
+
+    test('declines a deletion that would empty the route', () => {
+        const stub: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+            ],
+        ];
+
+        // A reviewer sets this up with two clicks and gets nothing. Better than a
+        // route that cannot be drawn, and there is no state to undo back onto.
+        expect(removeVertices(stub, selection(0, 1)).coordinates).toBe(stub);
+    });
+
+    test('is a no-op for an empty selection', () => {
+        expect(removeVertices(square, []).coordinates).toBe(square);
+    });
+
+    /**
+     * A selection addresses vertices by index, so one picked against a previous
+     * geometry is stale rather than wrong. Rebuilding the route around indexes
+     * that no longer exist would be worse than doing nothing.
+     */
+    test('is a no-op for a selection the route no longer has', () => {
+        const result = removeVertices(square, [
+            { segment: 0, index: 99 },
+            { segment: 7, index: 0 },
+        ]);
+
+        expect(result.coordinates).toBe(square);
+        expect(result.removed).toBe(0);
+    });
+
+    test('removes from two segments in one selection', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+                [3, 0],
+            ],
+            [
+                [3, 0],
+                [4, 0],
+                [5, 0],
+                [6, 0],
+            ],
+        ];
+
+        const result = removeVertices(line, [
+            { segment: 0, index: 1 },
+            { segment: 1, index: 1 },
+        ]);
+
+        expect(result.removed).toBe(2);
+        expect(result.coordinates[0]).toEqual([
+            [0, 0],
+            [2, 0],
+            [3, 0],
+        ]);
+        expect(result.coordinates[1]).toEqual([
+            [3, 0],
+            [5, 0],
+            [6, 0],
+        ]);
+    });
+
+    test('leaves a segment that arrived too short exactly as it found it', () => {
+        const mixed: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+            ],
+            [[0, 5]],
+        ];
+
+        const result = removeVertices(mixed, selection(1));
+
+        // Nothing was selected from the second segment, so repairing it would be
+        // changing geometry the reviewer never indicated.
+        expect(result.coordinates[1]).toEqual([[0, 5]]);
+        expect(result.droppedSegments).toBe(0);
+    });
+
+    test('counts a repeated vertex once', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+                [3, 0],
+            ],
+        ];
+
+        const result = removeVertices(line, selection(1, 1, 1));
+
+        expect(result.removed).toBe(1);
+        expect(result.coordinates[0].length).toBe(3);
+    });
+
+    test('does not mutate the input', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+                [3, 0],
+            ],
+        ];
+        const before = snapshot(line);
+
+        removeVertices(line, selection(1, 2));
+
+        expect(line).toEqual(before);
+    });
+});
+
+describe('describeRemoval', () => {
+    test('says so when nothing was selected', () => {
+        expect(
+            describeRemoval({
+                coordinates: [],
+                removed: 0,
+                droppedSegments: 0,
+            }),
+        ).toContain('Nothing was selected');
+    });
+
+    test('leads with the dropped segments, which the count hides', () => {
+        const message = describeRemoval({
+            coordinates: [],
+            removed: 1,
+            droppedSegments: 1,
+        });
+
+        expect(message).toContain('Deleted 1 vertex.');
+        expect(message).toContain('1 segment');
+    });
+
+    test('uses the singular for one of each', () => {
+        const message = describeRemoval({
+            coordinates: [],
+            removed: 1,
+            droppedSegments: 1,
+        });
+
+        expect(message).not.toContain('vertices');
     });
 });
 
@@ -1782,5 +2041,352 @@ describe('the walk stays inside the street it is given', () => {
         for (const position of result.coordinates[0]) {
             expect(position[0]).toBeLessThanOrEqual(-63.175 + 1e-9);
         }
+    });
+});
+
+describe('distanceMeters', () => {
+    const LAT = -17.78;
+
+    test('measures a degree of latitude as about 111 km', () => {
+        expect(distanceMeters([0, LAT], [0, LAT + 0.01])).toBeCloseTo(1113, 0);
+    });
+
+    /**
+     * The reason this helper exists at all. A degree of longitude in Santa Cruz
+     * is about 5% shorter than a degree of latitude, and reading a raw `[lng,
+     * lat]` pair as if it were already scaled overstates the distance by exactly
+     * that much — a resample then places the wrong number of points.
+     */
+    test('a degree of longitude is shorter than a degree of latitude', () => {
+        const alongLatitude = distanceMeters([0, LAT], [0, LAT + 0.01]);
+        const alongLongitude = distanceMeters([-63.18, LAT], [-63.17, LAT]);
+
+        expect(alongLongitude).toBeLessThan(alongLatitude);
+
+        // Against the cosine itself rather than a rounded figure, so the test
+        // states the actual contract and does not go stale when a rounding in
+        // the fixture drifts.
+        expect(alongLongitude).toBeCloseTo(
+            alongLatitude * longitudeScale(LAT),
+            6,
+        );
+    });
+
+    test('is zero for the same point and symmetric otherwise', () => {
+        expect(distanceMeters([1, 2], [1, 2])).toBe(0);
+        expect(distanceMeters([1, 2], [4, 6])).toBeCloseTo(
+            distanceMeters([4, 6], [1, 2]),
+            9,
+        );
+    });
+
+    test('scales by the latitude of the pair rather than of the equator', () => {
+        const nearEquator = distanceMeters([0, 0], [0, 0.01]);
+        const nearPole = distanceMeters([0, 60], [0, 60.01]);
+
+        // Latitude degrees do not shrink, so these agree. It is the longitude
+        // comparison that has to move with the cosine.
+        expect(nearEquator).toBeCloseTo(nearPole, 0);
+    });
+});
+
+describe('resampleSelection', () => {
+    const LAT = -17.78;
+
+    /**
+     * Metres in one degree of longitude at this latitude, measured rather than
+     * hard-coded so the fixtures below cannot drift out of agreement with
+     * `distanceMeters`.
+     */
+    const DEG_LNG = distanceMeters([-63.18, LAT], [-63.18 + 1, LAT]);
+
+    /** Degrees of longitude covering `metres` here. */
+    const deg = (metres: number): number => metres / DEG_LNG;
+
+    /**
+     * Degrees of *latitude* covering `metres`.
+     *
+     * Separate from `deg` on purpose. Latitude degrees do not shrink with the
+     * cosine of the latitude, so a fixture that reused the longitude figure to
+     * build a north-south leg would be asking for 600 m and getting 630 — which
+     * reads as a rounding artefact in the code under test and is really a
+     * fixture measuring the wrong axis.
+     */
+    const degLat = (metres: number): number =>
+        metres / distanceMeters([0, 0], [0, 1]);
+
+    /** A straight east-bound route with `legs` legs of `step` metres. */
+    const straight = (step: number, legs: number): Coordinates => [
+        Array.from({ length: legs + 1 }, (_, i) => [
+            -63.18 + i * deg(step),
+            LAT,
+        ]),
+    ];
+
+    const selection = (...indices: number[]): VertexRef[] =>
+        indices.map((index) => ({ segment: 0, index }));
+
+    /**
+     * Every vertex of a route built with `legs` legs.
+     *
+     * Derived from the leg count rather than spelled out, because the two
+     * off-by-one that invites — a vertex list of `legs` for a route of `legs + 1`
+     * vertices, and an `Array(n)` that spreads to `undefined` rather than to
+     * indices — both produce a selection that quietly selects nothing.
+     */
+    const every = (legs: number): VertexRef[] =>
+        selection(...Array.from({ length: legs + 1 }, (_, i) => i));
+
+    test('drops a vertex sitting inside the interval', () => {
+        // Four 150 m legs: 600 m of route, so at a 200 m interval the three
+        // interior vertices cannot all survive.
+        const line = straight(150, 4);
+
+        const result = resampleSelection(line, every(4), 200);
+
+        expect(result.removed).toBe(3);
+        expect(result.added).toBe(2);
+        expect(result.coordinates[0].length).toBe(4);
+    });
+
+    test('adds the points a wide gap is missing', () => {
+        // Two vertices 900 m apart: a 300 m interval needs two between them.
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(900), LAT],
+            ],
+        ];
+
+        const result = resampleSelection(line, selection(0, 1), 300);
+
+        expect(result.added).toBe(2);
+        expect(result.coordinates[0].length).toBe(4);
+    });
+
+    test('holds both endpoints exactly where the reviewer put them', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(900), LAT],
+            ],
+        ];
+
+        const result = resampleSelection(line, selection(0, 1), 200);
+
+        expect(result.coordinates[0][0]).toEqual([-63.18, LAT]);
+        expect(result.coordinates[0][result.coordinates[0].length - 1]).toEqual(
+            [-63.18 + deg(900), LAT],
+        );
+    });
+
+    /**
+     * The whole reason the walk follows the route instead of joining the
+     * endpoints. A chord across this selection would place the new points above
+     * the corner, on ground the route never touches.
+     */
+    test('places new points on the route rather than across a corner', () => {
+        const corner: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(600), LAT],
+                [-63.18 + deg(600), LAT + degLat(600)],
+            ],
+        ];
+
+        const result = resampleSelection(corner, selection(0, 2), 200);
+        const placed = result.coordinates[0];
+
+        for (const point of placed) {
+            const onTheFirstLeg = Math.abs(point[1] - LAT) < 1e-9;
+            const onTheSecondLeg =
+                Math.abs(point[0] - (-63.18 + deg(600))) < 1e-9;
+
+            expect(onTheFirstLeg || onTheSecondLeg).toBe(true);
+        }
+
+        // Two 600 m legs at a 200 m interval: six intervals, so seven points.
+        expect(placed.length).toBe(7);
+    });
+
+    test('reports a tail too short to be a whole interval', () => {
+        // 250 m into a 200 m interval: one interior point and a 50 m leg.
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(250), LAT],
+            ],
+        ];
+
+        const result = resampleSelection(line, selection(0, 1), 200);
+
+        expect(result.added).toBe(1);
+        expect(result.raggedTail).toBe(true);
+    });
+
+    test('does not report a tail when the stretch divides exactly', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(400), LAT],
+            ],
+        ];
+
+        const result = resampleSelection(line, selection(0, 1), 200);
+
+        expect(result.added).toBe(1);
+        expect(result.raggedTail).toBe(false);
+    });
+
+    /**
+     * A stretch already at the interval is a state a reviewer reaches by
+     * pressing the button twice, and the second press must not dirty the page
+     * with a rewrite of coordinates that differ in the ninth decimal.
+     */
+    test('is a no-op by identity when the stretch already complies', () => {
+        const line = straight(100, 6);
+        const result = resampleSelection(line, every(6), 100);
+
+        expect(result.coordinates).toBe(line);
+        expect(result.added).toBe(0);
+        expect(result.removed).toBe(0);
+    });
+
+    test('refuses a single vertex', () => {
+        const line = straight(100, 4);
+        const result = resampleSelection(line, selection(2), 200);
+
+        expect(result.coordinates).toBe(line);
+    });
+
+    /**
+     * A route's MultiLineString parts are not a continuation of each other, so
+     * there is no leg to interpolate across the gap between them.
+     */
+    test('refuses a selection that straddles two segments', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(400), LAT],
+            ],
+            [
+                [-63.18 + deg(400), LAT + 0.001],
+                [-63.18 + deg(800), LAT + 0.001],
+            ],
+        ];
+
+        const result = resampleSelection(
+            line,
+            [
+                { segment: 0, index: 1 },
+                { segment: 1, index: 0 },
+            ],
+            200,
+        );
+
+        expect(result.coordinates).toBe(line);
+    });
+
+    test('leaves the rest of the route alone', () => {
+        // 50 m legs, so a 100 m stretch cannot hold a 200 m interval: the one
+        // interior vertex goes and both endpoints stay.
+        const line = straight(50, 10);
+        const result = resampleSelection(line, selection(2, 3, 4), 200);
+
+        expect(result.coordinates[0].length).toBe(10);
+        expect(result.coordinates[0][0]).toEqual(line[0][0]);
+        expect(result.coordinates[0][1]).toEqual(line[0][1]);
+        expect(result.coordinates[0][2]).toEqual(line[0][2]);
+        expect(result.coordinates[0][3]).toEqual(line[0][4]);
+        expect(result.coordinates[0].slice(4)).toEqual(line[0].slice(5));
+    });
+
+    test('does not mutate the route it was given', () => {
+        const line = straight(50, 8);
+        const before = snapshot(line);
+
+        resampleSelection(line, every(8), 200);
+
+        expect(line).toEqual(before);
+    });
+
+    test('walks a selection given out of order', () => {
+        const line = straight(50, 8);
+
+        const ordered = resampleSelection(line, every(8), 200);
+        const shuffled = resampleSelection(line, [...every(8)].reverse(), 200);
+
+        expect(shuffled.coordinates).toEqual(ordered.coordinates);
+    });
+
+    test('ignores a repeated vertex rather than duplicating the endpoint', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.18 + deg(900), LAT],
+            ],
+        ];
+
+        const result = resampleSelection(line, selection(0, 0, 1), 200);
+
+        // 900 m at 200 m: four interior points plus the two endpoints.
+        expect(result.coordinates[0].length).toBe(6);
+        expect(result.coordinates[0][0]).toEqual([-63.18, LAT]);
+    });
+
+    test('keeps every fillable interval at the requested distance', () => {
+        const line = straight(37, 12);
+        const result = resampleSelection(line, every(12), 100);
+        const placed = result.coordinates[0];
+
+        // 444 m of route, so the tail after the last whole interval is short by
+        // construction. Only the legs the walk could fill are held to the
+        // interval; the tail is what `raggedTail` exists to report.
+        for (let i = 1; i < placed.length - 1; i += 1) {
+            const step = distanceMeters(
+                [placed[i - 1][0], placed[i - 1][1]],
+                [placed[i][0], placed[i][1]],
+            );
+
+            expect(step).toBeGreaterThanOrEqual(100 - 1e-6);
+        }
+
+        expect(result.raggedTail).toBe(true);
+    });
+});
+
+describe('describeResample', () => {
+    test('says so when nothing changed', () => {
+        const line: Coordinates = [
+            [
+                [0, 0],
+                [1, 0],
+            ],
+        ];
+        const result = resampleSelection(line, [{ segment: 0, index: 0 }], 100);
+
+        expect(describeResample(result, 100)).toContain('already spaced');
+    });
+
+    test('leads with the counts, which are what can be checked on the map', () => {
+        const line: Coordinates = [
+            [
+                [-63.18, -17.78],
+                [-63.17, -17.78],
+            ],
+        ];
+        const result = resampleSelection(
+            line,
+            [
+                { segment: 0, index: 0 },
+                { segment: 0, index: 1 },
+            ],
+            100,
+        );
+
+        const message = describeResample(result, 100);
+
+        expect(message).toContain('Re-spaced to 100 m');
+        expect(message).toContain('added');
     });
 });
