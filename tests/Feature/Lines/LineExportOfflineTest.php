@@ -277,4 +277,65 @@ class LineExportOfflineTest extends TestCase
         // double into an int exactly where the consumer expects a double.
         $this->assertStringContainsString('"walk_distance":0.0', $raw);
     }
+
+    public function test_the_bundle_is_emitted_in_a_deterministic_order()
+    {
+        Storage::fake('local');
+
+        // Created out of order on purpose, so an unordered cursor cannot pass
+        // by accident.
+        Line::factory()->outbound()->create(['code' => '2', 'geo_json' => self::geometry(self::points())]);
+        $first = Line::factory()->outbound()->create(['code' => '1', 'geo_json' => self::geometry(self::points())]);
+        $third = Line::factory()->outbound()->create(['code' => '3', 'geo_json' => self::geometry(self::points())]);
+
+        // Tied on (line_a_id, line_b_id) and deliberately shuffled, which is
+        // what the real table looks like: ~22 transfers per line pair, all tied
+        // on the id columns alone.
+        foreach ([3, 0, 2, 1] as $offset => $index) {
+            DB::table('line_transfers')->insert([
+                'line_a_id' => $first->id,
+                'line_b_id' => $third->id,
+                'point_a_lng' => -63.05 + $index / 1000,
+                'point_a_lat' => -17.84,
+                'point_a_index' => $index,
+                'point_b_lng' => -63.06,
+                'point_b_lat' => -17.84,
+                'point_b_index' => 100 - $index,
+                'walk_distance' => $index,
+            ]);
+        }
+
+        $records = $this->export();
+
+        $lineIds = array_column(
+            array_values(array_filter($records, static fn (array $r): bool => $r['type'] === 'line')),
+            'id',
+        );
+
+        $sorted = $lineIds;
+        sort($sorted);
+
+        $this->assertSame($sorted, $lineIds, 'line records must be ordered by id');
+
+        $transfers = array_values(array_filter($records, static fn (array $r): bool => $r['type'] === 'transfer'));
+
+        $this->assertCount(4, $transfers);
+
+        $keys = array_map(
+            static fn (array $t): string => implode('|', [$t['line_a_id'], $t['line_b_id'], $t['point_a_index'], $t['point_b_index']]),
+            $transfers,
+        );
+
+        $expected = $keys;
+        sort($expected, SORT_STRING);
+
+        $this->assertSame($expected, $keys, 'transfers must be ordered by (a, b, point_a_index, point_b_index)');
+
+        // The ordering is a travel order, not an arbitrary one: within a line
+        // pair the transfer points ascend along the line.
+        $this->assertSame(
+            [0, 1, 2, 3],
+            array_column($transfers, 'point_a_index'),
+        );
+    }
 }

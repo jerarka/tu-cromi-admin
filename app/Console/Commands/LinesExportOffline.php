@@ -129,7 +129,12 @@ class LinesExportOffline extends Command
         $bar->advance();
 
         // ── Lines ───────────────────────────────────────────────────────
-        foreach (Line::cursor() as $line) {
+        // Ordered by primary key, and the transfer loop below likewise, so
+        // that two runs over unchanged data emit byte-identical NDJSON. An
+        // unordered cursor hands the row order to whatever the query planner
+        // felt like, which makes the compressed bundle differ every time and
+        // defeats any content hash or diff on the client side.
+        foreach (Line::orderBy('id')->cursor() as $line) {
             $record = [
                 'type' => 'line',
                 'id' => $line->id,
@@ -160,7 +165,18 @@ class LinesExportOffline extends Command
         // than 0, so every float in the bundle is a JSON double and the
         // consumer can read them all as numbers without a per-field exception
         // for the zero case.
-        foreach (DB::table('line_transfers')->orderBy('line_a_id')->orderBy('line_b_id')->cursor() as $t) {
+        // The pair alone is not a total order: 1,35M transfers spread over
+        // ~60k line pairs leave ~22 rows tied on (line_a_id, line_b_id), and
+        // those would come out in an arbitrary order. Adding the two vertex
+        // indices — which together with the ids are unique — makes the order
+        // total, and happens to put each pair's transfer points in travel
+        // order along the line instead of scattered.
+        foreach (DB::table('line_transfers')
+            ->orderBy('line_a_id')
+            ->orderBy('line_b_id')
+            ->orderBy('point_a_index')
+            ->orderBy('point_b_index')
+            ->cursor() as $t) {
             $record = [
                 'type' => 'transfer',
                 'line_a_id' => $t->line_a_id,

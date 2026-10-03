@@ -1674,20 +1674,15 @@ onUnmounted(() => {
 
             <div v-if="editable" class="flex flex-wrap items-center gap-3">
                 <!--
-                    The selection readout, the one piece of the old hints that
-                    stayed on screen. It is state rather than instruction: it
-                    changes with what the reviewer just did, and it is what tells
-                    them the next press will act on the set they can see
-                    highlighted. Empty for an add mode or an empty selection,
-                    which is the common case and prints nothing at all.
+                    A spacer, and permanently rendered rather than standing in
+                    for a readout that is not there.
+
+                    It is zero-height and carries no text, so it cannot make
+                    this row change size — it exists only to hold the action
+                    buttons against the right edge, which is what the readout's
+                    `flex-1` used to do before the count moved over the map.
                 -->
-                <p
-                    v-if="selectionState"
-                    class="min-w-48 flex-1 text-sm text-muted-foreground"
-                >
-                    {{ selectionState }}
-                </p>
-                <div v-else class="flex-1" />
+                <div class="flex-1" />
 
                 <div class="flex flex-wrap items-center gap-2">
                     <template v-if="mode === 'move'">
@@ -1834,7 +1829,12 @@ onUnmounted(() => {
             </div>
         </div>
 
+        <!--
+            Relative, and only so the status overlay below has something to
+            position against. The wrapper itself is otherwise unchanged.
+        -->
         <div
+            class="relative"
             :class="{
                 'cursor-crosshair': editable && mode === 'add',
                 'cursor-pointer': editable && mode === 'delete',
@@ -1844,31 +1844,104 @@ onUnmounted(() => {
                 ref="mapContainer"
                 class="h-[clamp(400px,60vh,700px)] w-full rounded-md border"
             />
+
+            <!--
+                Everything the map reports back, in one overlay and one corner.
+
+                A selection count and four action messages, and they used to live
+                in two places: the count sat in the toolbar, the messages sat
+                below the map. Both were wrong, for the same underlying reason.
+                The map is up to seven hundred pixels tall, so a paragraph under
+                it is a long way from the click that caused it — and the
+                messages were worse than far, because they also pushed the
+                endpoint legend under the map down and pulled it back on every
+                snap, the same lurch this overlay exists to end.
+
+                One column in the top right, because these co-occur: you select,
+                you drag, it snaps, and the count is what tells you the next
+                press will act on the set you can see highlighted. Top right
+                rather than top left is Leaflet's doing — the zoom control is
+                enabled and sits there by default. This map has the attribution
+                control off and no layer control, which leaves this corner free.
+
+                `pointer-events-none` is on the wrapper rather than repeated per
+                child, and it is load-bearing: a click landing on a message
+                instead of on a vertex would be the toolbar's bug all over
+                again, one layer down.
+
+                `role="status"` on the wrapper rather than `aria-live` on each
+                child, for the same reason it is one region and not four. These
+                appear in response to something done elsewhere on the screen, so
+                without a live region a screen reader announces nothing at all —
+                and four independent regions announce over each other when two
+                messages land together.
+
+                `z-[1001]` is a magic number tied to Leaflet's stacking scale, so
+                the arithmetic is worth writing down. Its panes run 200 (tiles)
+                through 700 (popups), the controls are 800 and the control
+                corners 1000. None of it is contained: `.leaflet-container`
+                declares no z-index and so creates no stacking context, and
+                neither does the wrapper above, which is `relative` with
+                `z-index: auto`. Everything is in one shared context, which is
+                why the reflexive `z-10` leaves this overlay rendering perfectly
+                and invisible underneath the map. 1001 rather than 1000 so it
+                cannot tie with `.leaflet-top` and fall back to DOM order.
+
+                The width cap is doing two jobs. `85%` keeps a long message
+                inside a narrow map and lets it wrap; the `sm:` ceiling stops a
+                re-lay report — which covers a hundred vertices across several
+                streets — from running the full width of a wide screen.
+            -->
+            <div
+                v-if="editable"
+                role="status"
+                class="pointer-events-none absolute top-2 right-2 z-[1001] flex max-w-[85%] flex-col items-end gap-2 sm:max-w-[22rem]"
+            >
+                <!--
+                    Conditional rather than always rendered: `selectionState` is
+                    an empty string for an empty selection and in add mode, and
+                    an unconditional element here would leave an empty pill
+                    sitting in the corner of the map with padding and a
+                    background and nothing in it.
+                -->
+                <p
+                    v-if="selectionState"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs font-medium shadow-sm backdrop-blur-sm"
+                >
+                    {{ selectionState }}
+                </p>
+
+                <!--
+                    The emerald is what these had when they were plain text on
+                    the page background. Over map tiles, unbacked text is
+                    unreadable, so they take the same pill as the count above.
+                -->
+                <p
+                    v-if="snapLabel"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs text-emerald-700 shadow-sm backdrop-blur-sm dark:text-emerald-400"
+                >
+                    Snapped onto {{ snapLabel }}.
+                </p>
+                <p
+                    v-if="relayLabel"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs text-emerald-700 shadow-sm backdrop-blur-sm dark:text-emerald-400"
+                >
+                    {{ relayLabel }}
+                </p>
+                <p
+                    v-if="resampleLabel"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs text-emerald-700 shadow-sm backdrop-blur-sm dark:text-emerald-400"
+                >
+                    {{ resampleLabel }}
+                </p>
+                <p
+                    v-if="removalLabel"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs text-emerald-700 shadow-sm backdrop-blur-sm dark:text-emerald-400"
+                >
+                    {{ removalLabel }}
+                </p>
+            </div>
         </div>
-        <p
-            v-if="snapLabel"
-            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
-        >
-            Snapped onto {{ snapLabel }}.
-        </p>
-        <p
-            v-if="relayLabel"
-            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
-        >
-            {{ relayLabel }}
-        </p>
-        <p
-            v-if="resampleLabel"
-            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
-        >
-            {{ resampleLabel }}
-        </p>
-        <p
-            v-if="removalLabel"
-            class="mt-2 text-sm text-emerald-700 dark:text-emerald-400"
-        >
-            {{ removalLabel }}
-        </p>
         <p
             v-if="!geoJson && !editable"
             class="mt-2 text-sm text-muted-foreground"

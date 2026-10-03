@@ -48,11 +48,14 @@ Both commands have class-level docblocks with algorithm details.
 - **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `snapWire` and `snapTransport` (the lat/lng boundary and the street lookup), `mapView`, `undoStack`.
 - **`resources/js/composables/`**: Vue-aware shared state — `useRouteGeometry` (route editing state, shared by the create and edit pages), `useSnapPreset`, `useAppearance`. No DOM, so testable under `environment: 'node'`.
 - If logic is worth testing, it belongs in one of those two rather than in a component.
+- **`app/Geo/`**: pure, framework-free PHP. `GreatCircle` owns the distance model for the offline bundle — both `cumulative_distance` (ride lengths) and `walk_distance` (transfer legs) come from it, so a ride and a walk are on one scale by construction instead of by two copies of a formula agreeing.
+- **`EARTH_RADIUS_M` is load-bearing**: 6371000.0 (the mean radius), **not** WGS84's 6378137. The app measures with the same value; changing it shifts every ride length by ~0.1%, which is enough to reorder transfer rankings without failing anything visibly. Same for the operand order inside `metersBetween()` — reassociating a float sum moves the last bit.
+- Testable geometry belongs in `app/Geo/`, not inside a Command. A Command's data path is usually PostGIS and therefore unreachable from the SQLite suite; that is why the rounding policy in `walkMeters()` lives on the class.
 - **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests).
 - **SSR**: Enabled. Dev URL at `127.0.0.1:13714` (config/inertia.php).
 - **Auth**: Laravel Fortify — features: registration, password reset, email verification, 2FA, passkeys.
 - **Gated pages**: `dashboard` requires `auth` + `verified` middleware.
-- **No service layer**: Domain logic lives in Models and Commands.
+- **No service layer**: Domain logic lives in Models, Commands, and `app/Geo/` for pure geometry.
 - **Incomplete**: `IssueReport` migration exists but no Model or UI yet.
 
 ## Testing quirks

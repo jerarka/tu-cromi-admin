@@ -2822,15 +2822,19 @@ describe('describeSelectionState', () => {
         expect(describeSelectionState('add', 3)).toBe('');
     });
 
-    test('reports a move selection and what dragging it will do', () => {
-        const state = describeSelectionState('move', 5);
-
-        expect(state).toContain('5 vertices selected');
-        expect(state).toContain('drag any of them');
+    test('reports a move selection as a count', () => {
+        expect(describeSelectionState('move', 5)).toContain(
+            '5 vertices selected',
+        );
     });
 
-    test('reports a delete selection and which button takes it', () => {
-        expect(describeSelectionState('delete', 5)).toContain('press Delete');
+    test('reports a delete selection with the same wording', () => {
+        // The two modes used to disagree about what to append, which was the
+        // tell that the appended text belonged to the mode help rather than to
+        // the count. Nothing mode-specific is left to disagree about.
+        expect(describeSelectionState('delete', 5)).toBe(
+            describeSelectionState('move', 5),
+        );
     });
 
     test('uses the singular for one vertex', () => {
@@ -2840,8 +2844,18 @@ describe('describeSelectionState', () => {
         expect(state).not.toContain('vertices');
     });
 
-    test('mentions Escape in both modes that can deselect', () => {
-        expect(describeSelectionState('move', 2)).toContain('drag');
-        expect(describeSelectionState('delete', 2)).toContain('Escape');
+    test('carries no instruction, because the mode help already does', () => {
+        // This is the assertion that keeps the badge from wrapping. It is not
+        // about wording: any clause long enough to need a sentence is a clause
+        // that has to live in describeModeHelp instead.
+        for (const state of [
+            describeSelectionState('move', 2),
+            describeSelectionState('move', 17),
+            describeSelectionState('delete', 2),
+            describeSelectionState('delete', 17),
+        ]) {
+            expect(state).not.toContain('—');
+            expect(state.split(' ').length).toBeLessThanOrEqual(3);
+        }
     });
 });

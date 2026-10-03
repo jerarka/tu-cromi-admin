@@ -1945,7 +1945,7 @@ export function describeModeHelp(mode: 'move' | 'add' | 'delete'): string {
 }
 
 /**
- * What the current selection is doing, when there is something to say.
+ * How many vertices are selected, and nothing else.
  *
  * The one piece of the old hints that stays on screen, and it stays because it
  * is state rather than instruction: it changes with what the reviewer just did,
@@ -1953,6 +1953,23 @@ export function describeModeHelp(mode: 'move' | 'add' | 'delete'): string {
  * highlighted. An empty string means print nothing — "0 vertices selected" under
  * a move instruction nobody asked for is noise, and the help toggle is one click
  * away.
+ *
+ * The count is the whole of it, which is a change and not a trim. This used to
+ * append what to do next — "drag any of them to move the whole stretch", "press
+ * Delete to remove it, or Escape to deselect" — and both halves were already
+ * said by `describeModeHelp`, nearly word for word. So the sentence was paying
+ * for a line of vertical space, on a page whose layout moved every time it
+ * appeared, in order to repeat text one click away.
+ *
+ * What it buys is a string short enough to render anywhere. Sixty characters
+ * wrapped to two or three lines depending on how much width the action buttons
+ * left it, and the count changing altered the wrap, so the readout was never the
+ * same height twice. It now floats over the map as a badge, which cannot move
+ * anything at all — but only because it has nothing left to wrap.
+ *
+ * Keep it that way. A clause added back here has to be short enough not to wrap
+ * in a badge, and if there is a clause worth that much it belongs in
+ * `describeModeHelp` instead.
  */
 export function describeSelectionState(
     mode: 'move' | 'add' | 'delete',
@@ -1962,16 +1979,9 @@ export function describeSelectionState(
         return '';
     }
 
-    if (mode === 'delete') {
-        const what = selected === 1 ? 'vertex' : 'vertices';
+    const what = selected === 1 ? 'vertex' : 'vertices';
 
-        return (
-            `${selected} ${what} selected — press Delete to remove ` +
-            `${selected === 1 ? 'it' : 'them all'}, or Escape to deselect.`
-        );
-    }
-
-    return `${selected} vertices selected — drag any of them to move the whole stretch.`;
+    return `${selected} ${what} selected`;
 }
 
 export interface RouteStats {
