@@ -560,9 +560,9 @@ const editToggleIcon = computed(() =>
     </div>
     <Heading :title="pageTitle" />
 
-    <div class="grid gap-8 lg:grid-cols-5">
+    <div class="grid gap-8 lg:grid-cols-3">
         <!-- Form -->
-        <div class="space-y-4 lg:col-span-2">
+        <div class="space-y-4 lg:col-span-1">
             <Form
                 v-bind="LineController.update.form(line.id)"
                 class="grid grid-cols-2 gap-4"
@@ -704,7 +704,7 @@ const editToggleIcon = computed(() =>
         </div>
 
         <!-- Map preview / editor -->
-        <div class="space-y-4 lg:col-span-3">
+        <div class="space-y-4 lg:col-span-2">
             <!--
                 Collapsed, and the reason is volume rather than tidiness. This
                 card was carrying fifty-six words of prose for three buttons that
