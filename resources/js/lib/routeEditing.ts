@@ -556,11 +556,17 @@ export type SnapPreset = (typeof SNAP_PRESET_NAMES)[number];
  * agree on anything, so the number described a rule that refused the work
  * people were doing. Kept next to decideSnap so what a preset claims and what
  * the decision uses cannot drift apart.
+ *
+ * The widest is twice what it was, and that number is load-bearing well past
+ * this table: `snapSearchRadius` doubles the threshold, so 100 m asks the
+ * server for a 200 m lookup, which is exactly the ceiling `SnapRoadRequest`
+ * validates against. Raising `aggressive` again means raising that ceiling too,
+ * or the widest preset silently stops finding streets.
  */
 export const SNAP_PRESETS: Record<Exclude<SnapPreset, 'off'>, SnapOptions> = {
-    subtle: { threshold: 12 },
-    normal: { threshold: 25 },
-    aggressive: { threshold: 50 },
+    subtle: { threshold: 30 },
+    normal: { threshold: 50 },
+    aggressive: { threshold: 100 },
 };
 
 /**
@@ -597,6 +603,11 @@ export const SNAP_SAMPLE_LIMIT = 7;
  * than the threshold, because a candidate further out than the radius is
  * declined anyway and never becomes a candidate. `aggressive` therefore looks
  * further without needing its own constant to keep in sync.
+ *
+ * The doubling is what puts the widest preset against the server's ceiling: a
+ * 100 m threshold asks for 200 m, and `SnapRoadRequest` refuses a radius above
+ * 200. It passes by exactly nothing, so the two numbers are a pair and belong
+ * in the same thought.
  */
 export function snapSearchRadius(options: SnapOptions): number {
     return Math.max(60, options.threshold * 2);
@@ -754,8 +765,8 @@ export interface PropagationLimits {
      *
      * The same bar the dragged vertex itself was held to, which is why this is
      * derived from the active snap threshold rather than being a number of its
-     * own: a reviewer who set the threshold to 25 m has already said how far off
-     * a centreline they are willing to accept, and a second number would be a
+     * own: a reviewer who picked a preset has already said how far off a
+     * centreline they are willing to accept, and a second number would be a
      * second thing to calibrate with no visible reason to disagree with the
      * first.
      */
@@ -1937,10 +1948,10 @@ export function describeModeHelp(mode: 'move' | 'add' | 'delete'): string {
     }
 
     return (
-        'Drag a vertex to move it. Shift-click two vertices to grab everything ' +
-        'between them, or Shift-drag on the map to box a set out, then drag any of ' +
-        'them to move the whole stretch together. A drop snaps onto the nearest ' +
-        'street — hold Alt to place it off the centreline.'
+        'Drag a vertex to move it. Click a vertex, then Shift-click another to ' +
+        'grab everything between them, or Shift-drag on the map to box a set ' +
+        'out, then drag any of them to move the whole stretch together. A drop ' +
+        'snaps onto the nearest street — hold Alt to place it off the centreline.'
     );
 }
 

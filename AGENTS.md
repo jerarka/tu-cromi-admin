@@ -44,13 +44,18 @@ Two workflows, both on push/PR to `develop`/`main`/`master`/`workos`:
 
 ## Offline bundle (`lines:export-offline`)
 
-Gzipped NDJSON, one JSON object per line, consumed by the Flutter app. Record order is **fixed and part of the contract**: `meta`, then lines by `id`, then transfers by `(line_a_id, line_b_id, point_a_index, point_b_index)`.
+The command writes three files into the bundle's directory and publishes the last two:
+
+- **`data.ndjson.gz`** — the intermediate, and the **contract with the Dart CLI**: one JSON object per line, record order fixed (`meta`, then lines by `id`, then transfers by `(line_a_id, line_b_id, point_a_index, point_b_index)`). Not uploaded: the app no longer reads it.
+- **`data.db.gz`** — the gzipped SQLite database the app installs as a file copy. **Only the Flutter app's Dart CLI builds it** (`tools/build_offline_db.dart`, run from the Flutter checkout because `dart run` resolves `package:tu_cromi_app/...` from the working directory). The schema belongs to the app; a PHP-built database would make every schema change a cross-stack change. Needs Dart 3.11+ (not the Flutter SDK) and a checkout where `dart pub get` has run — `OFFLINE_FLUTTER_REPO` or `--flutter-repo=`. On Dart 3.12 the run needs `--enable-experiment=native-assets` (the app's graph reaches `objective_c` via its Apple platform plugins); the command passes it by default and `OFFLINE_DART_RUN_FLAGS` overrides it. **Older than 3.11 cannot build the bundle at all**, and the SDK's error blames the missing experiment flag even when it is present. On Windows a bare `dart` can resolve to an older SDK because PHP's executable lookup skips `.bat` wrappers; set `OFFLINE_DART_BINARY` to the real binary (e.g. Flutter's `bin/dart.bat`) and the command's version preflight will catch the rest.
+- **`meta.json`** — the published manifest, written by Laravel after the CLI. Fields: `version` (int, from `--data-version`), `updated_at`, `generated_at`, `total_lines`, `total_transfers` (counts read from the CLI's manifest), `data_bytes`, `data_sha256`. **Every size and hash is of the gzipped `data.db.gz`**, measured on the exact file about to be uploaded. The CLI's own manifest names the size `gz_bytes` and writes `version` as a string — never publish it as-is.
+
+The version has one source of truth: `--data-version` → NDJSON meta record → database `offline_metadata` (stamped by the CLI) → `meta.json`. Bump it and the app's update prompt follows.
 
 - **Ordering must be total.** Ordering transfers by the pair alone leaves ~22 tied rows per pair and the compressed output changes every run. The body is byte-reproducible; only `meta.generated_at` differs between runs, so compare content hashes, not file hashes.
-- **Every float is a JSON double, every integer a JSON integer.** `JSON_PRESERVE_ZERO_FRACTION` is what keeps a 0 m transfer emitting `0.0` instead of `0`. Encode through `LinesExportOffline::encodeRecord()` — do not call `json_encode` directly.
+- **Every float is a JSON double, every integer a JSON integer.** `JSON_PRESERVE_ZERO_FRACTION` is what keeps a 0 m transfer emitting `0.0` instead of `0`. Encode through `LinesExportOffline::writeRecord()` — do not call `json_encode` directly for bundle records.
 - **`PDO_PGSQL` returns numerics as PHP strings.** Without explicit `(float)` casts, `walk_distance` and the coordinates ship quoted and `(map['walk_distance'] as num)` throws a `TypeError` in Dart. `line_a_id` and the indices arrive as real ints and need no cast.
 - `serialize_precision` must be `-1` or ≥ 17; with the legacy default of 6, `json_encode` silently truncates doubles to ~cm. The command corrects it with `ini_set` and only fails if that is rejected.
-- `meta.json` is a sidecar at `dirname(--path)/meta.json`, derived from the meta record via `Arr::except($meta, 'type')` — one timestamp, one source. Never rebuild it; that is how it came to describe a different export.
 - Known inconsistency: `average_rating` still ships as a **string**, because Laravel's `decimal:2` cast returns a string by design. `resources/js/types/line.ts` declares it `number | null`, so the admin's type is already wrong. The column is NULL everywhere and nothing writes it.
 
 `EARTH_RADIUS_M` is **6371000.0** (mean radius), not WGS84's 6378137. The app measures with the same value; swapping it shifts every ride by ~0.1%, enough to reorder transfer rankings with no visible failure. Same for the operand order in `GreatCircle::metersBetween()`. Both ride lengths and walk distances come from that one class — see `app/Geo/`.
@@ -59,7 +64,7 @@ Gzipped NDJSON, one JSON object per line, consumed by the Flutter app. Record or
 
 | Command | Purpose |
 |---|---|
-| `lines:export-offline` | Build the NDJSON bundle. `--data-version=N` (required), `--path=` (relative to `storage/app`, **also moves the sidecar**), `--no-compress`, `--upload`. |
+| `lines:export-offline` | Build the offline bundle: NDJSON intermediate → `data.db.gz` via the Flutter app's Dart CLI → published `meta.json`. `--data-version=N` (required), `--path=` (relative to `storage/app`, default `offline/data.db.gz`; the other two files share its directory), `--flutter-repo=`, `--dart=`, `--skip-dart-cli` (NDJSON only), `--upload`. Needs Dart 3.x and a Flutter checkout with `dart pub get` run (`OFFLINE_FLUTTER_REPO`). |
 | `transfers:compute` | Precompute pedestrian transfers. PostGIS `ST_DWithin` 300 m + KNN lateral join, deduped on a 100 m spatial grid. **~17 min.** Logs to `command_executions`. |
 | `lines:import` | Import from `database/data/rutas_scz.geojson`. `sentido=1` → OUTBOUND, else RETURN with reversed coordinates. Links opposite directions by `code`. |
 | `lines:refresh-geometry` | Rebuild `geom` from `geo_json` after a manual geometry edit. |
@@ -71,7 +76,7 @@ Gzipped NDJSON, one JSON object per line, consumed by the Flutter app. Record or
 
 - `transfers:compute` **truncates `line_transfers` unconditionally, including with `--limit`**. `--limit=20` still wipes all 1.35M rows and rebuilds from 20 lines. Dump the table first, or run against a scratch database.
 - `lines:import --force` requires `--discard-everything` to confirm, because it destroys user data and manual corrections.
-- `lines:export-offline --upload` **deletes both R2 objects before uploading either**. A failed upload therefore leaves the bucket with neither, which makes clients fall back to their cached version. That ordering is deliberate: the sidecar is what advertises a new version, so it must go up after the bundle, never before.
+- `lines:export-offline --upload` **deletes both R2 objects before uploading either**. A failed upload therefore leaves the bucket with neither, which makes clients fall back to their cached version. That ordering is deliberate: `meta.json` is what advertises a new version, so it must go up after `data.db.gz`, never before.
 
 ## Architecture
 

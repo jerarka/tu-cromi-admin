@@ -1082,16 +1082,21 @@ describe('decideSnap', () => {
 
     test('a wide preset accepts a distance the normal one refuses', () => {
         // The presets only differ in this one number now, so this is the whole
-        // of what choosing one over another buys.
-        const decision = decideSnap(
-            { position: [10, 10], distance: 40 },
-            SNAP_PRESETS.normal,
-        );
+        // of what choosing one over another buys. The distance sits between the
+        // two thresholds rather than being a literal, because a literal here is
+        // a number that has to be re-chosen every time a preset is retuned —
+        // and it was already stale once, refusing nothing at 40 m.
+        const between = SNAP_PRESETS.normal.threshold + 25;
 
-        expect(decision.apply).toBe(false);
         expect(
             decideSnap(
-                { position: [10, 10], distance: 40 },
+                { position: [10, 10], distance: between },
+                SNAP_PRESETS.normal,
+            ).apply,
+        ).toBe(false);
+        expect(
+            decideSnap(
+                { position: [10, 10], distance: between },
                 SNAP_PRESETS.aggressive,
             ).apply,
         ).toBe(true);
@@ -1151,6 +1156,14 @@ describe('snapSearchRadius', () => {
         expect(snapSearchRadius(SNAP_PRESETS.aggressive)).toBeGreaterThan(
             snapSearchRadius(SNAP_PRESETS.normal),
         );
+    });
+
+    test('asks for exactly what the server will accept, on the widest preset', () => {
+        // SnapRoadRequest caps `radius` at 200. The doubling puts aggressive
+        // there, so this is the number the two files have to agree on — and it
+        // is the test that fails if a preset is widened without the cap moving
+        // with it, instead of the widest preset quietly finding no streets.
+        expect(snapSearchRadius(SNAP_PRESETS.aggressive)).toBe(200);
     });
 });
 
@@ -1348,12 +1361,16 @@ describe('propagationLimitsFor', () => {
     });
 
     test('rides the threshold when the preset changes', () => {
+        // Asserted against the table rather than as 12 and 50, which is what
+        // these used to say: the point is that the offset IS the threshold, and
+        // a literal only re-asserts the number the table already holds — while
+        // going stale the moment a preset is retuned.
         expect(
             propagationLimitsFor(SNAP_PRESETS.subtle.threshold).maxOffset,
-        ).toBe(12);
+        ).toBe(SNAP_PRESETS.subtle.threshold);
         expect(
             propagationLimitsFor(SNAP_PRESETS.aggressive.threshold).maxOffset,
-        ).toBe(50);
+        ).toBe(SNAP_PRESETS.aggressive.threshold);
     });
 });
 
@@ -1364,7 +1381,7 @@ describe('propagationLimitsFor', () => {
  * about 106 m and a ten-thousandth about 10.6 m. The route sits 11 m south of
  * the centreline, which is a real offset on a real route · the imported data
  * averages 3.6 m from a centreline with a p90 of 8.2 m · and comfortably inside
- * the 25 m the normal preset allows.
+ * the narrowest preset.
  */
 describe('propagateAlongStreet', () => {
     const CENTRELINE_LAT = -17.78;
@@ -1737,11 +1754,11 @@ describe('relayLimitsFor', () => {
 
     test('rides the threshold when the preset changes', () => {
         expect(relayLimitsFor(SNAP_PRESETS.subtle.threshold).maxOffset).toBe(
-            12,
+            SNAP_PRESETS.subtle.threshold,
         );
         expect(
             relayLimitsFor(SNAP_PRESETS.aggressive.threshold).maxOffset,
-        ).toBe(50);
+        ).toBe(SNAP_PRESETS.aggressive.threshold);
     });
 });
 
@@ -2703,9 +2720,9 @@ describe('describeSnapPreset', () => {
         // The whole reason it exists. "Normal" on its own does not say whether a
         // drop will snap, which is why fifty-eight words used to sit under this
         // control explaining it.
-        expect(describeSnapPreset('normal')).toBe('Normal · 25 m');
-        expect(describeSnapPreset('subtle')).toBe('Subtle · 12 m');
-        expect(describeSnapPreset('aggressive')).toBe('Aggressive · 50 m');
+        expect(describeSnapPreset('normal')).toBe('Normal · 50 m');
+        expect(describeSnapPreset('subtle')).toBe('Subtle · 30 m');
+        expect(describeSnapPreset('aggressive')).toBe('Aggressive · 100 m');
     });
 
     test('keeps the vocabulary beside the number', () => {
@@ -2743,7 +2760,7 @@ describe('describeSnapTooltip', () => {
     });
 
     test('restates the threshold for reference', () => {
-        expect(describeSnapTooltip('aggressive')).toContain('50 m');
+        expect(describeSnapTooltip('aggressive')).toContain('100 m');
     });
 
     /**
@@ -2793,6 +2810,25 @@ describe('describeModeHelp', () => {
     test('names the selection gesture that is shared by two modes', () => {
         expect(describeModeHelp('move')).toContain('Shift-click');
         expect(describeModeHelp('delete')).toContain('Shift-click');
+    });
+
+    test('starts a move range with a plain click, since one is free there', () => {
+        // The order is the instruction, so it is asserted. A plain click in move
+        // mode only picks a vertex — there is nothing else it could be doing —
+        // so anchoring there is free, and "Shift-click two vertices" made a
+        // single gesture look like two.
+        expect(describeModeHelp('move')).toContain(
+            'Click a vertex, then Shift-click another',
+        );
+    });
+
+    test('still tells delete to Shift-click twice, because its plain click deletes', () => {
+        // The asymmetry is real, not an oversight left behind. A plain click in
+        // delete mode removes that vertex, so there is no click available to
+        // anchor a range with and the modifier is genuinely needed on both.
+        expect(describeModeHelp('delete')).toContain(
+            'Shift-click two vertices',
+        );
     });
 
     test('tells a single add click what it will refuse', () => {

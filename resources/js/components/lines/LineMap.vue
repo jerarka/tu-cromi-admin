@@ -796,6 +796,16 @@ function addVertexMarkers(
                     } else {
                         clearSelection();
                         selection.value = [ref];
+
+                        // A plain click anchors a range as well as picking a
+                        // vertex, so the gesture a reviewer reaches for is click
+                        // the first one then Shift-click the last one. Anchoring
+                        // used to be the shift-click's alone, which meant the
+                        // range could only be started by holding the modifier —
+                        // the first Shift was pure ceremony, and the reviewer who
+                        // forgot it got a single-vertex selection with no way to
+                        // tell which of the two they had done.
+                        selectionAnchor.value = ref;
                     }
 
                     refreshMarkerStyles();
@@ -881,9 +891,16 @@ function beginVertexDrag(
         // Grabbing a vertex that is already selected moves the whole selection.
         // Grabbing an unselected one collapses the selection to it, which is
         // what makes a plain drag always do what the reviewer expects.
+        //
+        // The anchor moves with it, for the same reason the plain click sets
+        // one: where the selection ended up is where a Shift-click extends it
+        // from. Anchoring only on click would have made "drag this vertex, then
+        // Shift-click that one" reach back to whatever was clicked before the
+        // drag — an invisible earlier vertex deciding the range.
         if (!isSelected(ref)) {
             clearSelection();
             selection.value = [ref];
+            selectionAnchor.value = ref;
             refreshMarkerStyles();
         }
 

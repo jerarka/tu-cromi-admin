@@ -6,29 +6,54 @@ use App\Concerns\UploadsBundleToR2;
 use App\Geo\GreatCircle;
 use App\Models\Line;
 use Illuminate\Console\Command;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 
 /**
- * Export lines and transfers to an NDJSON file for offline use
- * in the Flutter app.
+ * Build the offline bundle for the Flutter app.
  *
- * Format:
- * - One JSON object per line (newline-delimited)
- * - First record is {"type":"meta",...} with version and summary
- * - Line records: {"type":"line",...}
- * - Transfer records: {"type":"transfer",...}
- * Also writes a meta.json sidecar in the same directory (version, generated_at,
- * total_lines, total_transfers) for quick access without decompressing.
+ * Two artifacts are published:
+ *
+ * - data.db.gz: a gzipped SQLite database the app installs as a file copy
+ *   (~3-5 s) instead of parsing 1.35 M NDJSON rows on device (~76 s).
+ * - meta.json: the manifest clients read first, with the version the app
+ *   compares against its local one, the record counts, and the size and
+ *   SHA256 of the gzipped database for integrity checks. Every size and hash
+ *   describes data.db.gz, never the decompressed database.
+ *
+ * A third artifact, data.ndjson.gz, is written beside them as an
+ * intermediate: it is the Dart CLI's input and is deliberately not uploaded.
+ * The app no longer reads it, and publishing it would cost 32 MB of bucket
+ * space and one more URL to keep honest.
+ *
+ * The SQLite file is produced by the Flutter app's own Dart CLI
+ * (tools/build_offline_db.dart), never by PHP/PDO. The schema belongs to the
+ * app: building the database here would turn every schema change into a
+ * cross-stack change and give the app's contract tests nothing to catch.
+ * The CLI is invoked from the Flutter checkout because `dart run` resolves
+ * `package:tu_cromi_app/...` imports from the working directory's package
+ * config, not from the script's path. The checkout must have had
+ * `dart pub get` run; the machine only needs Dart 3.11 or newer, not the
+ * Flutter SDK, because the CLI uses sqflite_common_ffi rather than
+ * package:sqflite. The version matters: before native assets reached stable,
+ * `dart run` refuses the app's dependency graph with a message that tells you
+ * to pass an experiment flag you may already be passing.
+ *
+ * The NDJSON format is unchanged and remains the contract between this
+ * command and the Dart CLI: one JSON object per line, record order meta,
+ * then lines by id, then transfers ordered by (line_a_id, line_b_id,
+ * point_a_index, point_b_index). The CLI rejects a bundle whose meta record
+ * declares a schema it does not know, so a change here requires updating the
+ * CLI in lockstep.
  *
  * Line records carry cumulative_distance, the distance in metres from the
  * first vertex to every other one, as an array parallel to the flattened
  * coordinates. The app ranks transfer options by ride length in SQL, where
- * SQLite has no sin or cos, so the number travels with the geometry instead of
- * being derived on the device. See App\Geo\GreatCircle for the formula and for
- * why its constants must not be "improved".
+ * SQLite has no sin or cos, so the number travels with the geometry instead
+ * of being derived on the device. See App\Geo\GreatCircle for the formula and
+ * for why its constants must not be "improved".
  *
  * Transfer records carry a walk_distance measured on the same sphere as the
  * ride lengths above, so the app can add a ride to a walk without the two
@@ -50,17 +75,22 @@ use Illuminate\Support\Facades\Storage;
  * The distances are unrounded float64, which makes the export's JSON encoding
  * part of the contract: JSON_PRESERVE_ZERO_FRACTION keeps the leading 0.0 from
  * degrading into an int, and json_encode truncates doubles to
- * serialize_precision significant digits, silently and by up to centimetres,
+ * serialize_precision significant digits, silently and up to centimetres,
  * unless that ini value is at its shortest-round-trip setting. Both are
  * enforced below rather than left to the host's php.ini.
  *
- * Output is gzip-compressed by default. Use --no-compress for raw NDJSON.
+ * The version is stamped once into the NDJSON meta record from
+ * --data-version. The Dart CLI copies it into the database's
+ * offline_metadata table and the published meta.json carries the same value
+ * as an integer. There is deliberately no second source of version truth:
+ * bump --data-version and the app's "update available" prompt follows.
  *
  * Usage:
- *   php artisan lines:export-offline --data-version=1
- *   php artisan lines:export-offline --data-version=2 --path=offline/custom.ndjson.gz
- *   php artisan lines:export-offline --data-version=1 --no-compress
- *   php artisan lines:export-offline --data-version=1 --upload
+ *   php artisan lines:export-offline --data-version=2
+ *   php artisan lines:export-offline --data-version=2 --path=offline/data.db.gz
+ *   php artisan lines:export-offline --data-version=2 --flutter-repo=/path/to/tu_cromi_app
+ *   php artisan lines:export-offline --data-version=2 --skip-dart-cli
+ *   php artisan lines:export-offline --data-version=2 --upload
  */
 class LinesExportOffline extends Command
 {
@@ -68,14 +98,16 @@ class LinesExportOffline extends Command
 
     protected $signature = 'lines:export-offline
         {--data-version= : Data version (required)}
-        {--path= : Output path relative to storage/app}
-        {--no-compress : Output uncompressed NDJSON instead of gzip}
-        {--upload : Upload exported files to Cloudflare R2}';
+        {--path= : SQLite bundle path relative to storage/app}
+        {--flutter-repo= : Flutter checkout that owns tools/build_offline_db.dart}
+        {--dart= : Dart executable used to run the CLI}
+        {--skip-dart-cli : Stop after the NDJSON intermediate, without building SQLite}
+        {--upload : Upload the SQLite bundle and manifest to Cloudflare R2}';
 
-    protected $description = 'Export lines and transfers as NDJSON for offline use';
+    protected $description = 'Build the offline SQLite bundle (NDJSON intermediate + Dart CLI)';
 
     /**
-     * Flags for every record in the bundle, and for the sidecar.
+     * Flags for every record in the bundle, and for the manifest.
      *
      * This is the bundle's contract with the app, so it is declared once here
      * rather than repeated per call site. JSON_PRESERVE_ZERO_FRACTION is what
@@ -95,64 +127,161 @@ class LinesExportOffline extends Command
             return self::FAILURE;
         }
 
+        // Cast-and-hope used to turn 'abc' into 0, and a published version 0
+        // matches a phone's starter version, so the update prompt never fires
+        // and the failure looks like the app ignoring a good bundle. A version
+        // has to be an integer or it is a typo.
+        if (filter_var($dataVersion, FILTER_VALIDATE_INT) === false) {
+            $this->error('--data-version must be an integer.');
+
+            return self::FAILURE;
+        }
+
         $dataVersion = (int) $dataVersion;
 
         if (! $this->ensureFloatPrecision()) {
             return self::FAILURE;
         }
 
-        $compress = ! $this->option('no-compress');
-        $ext = $compress ? '.ndjson.gz' : '.ndjson';
-        $path = $this->option('path') ?: 'offline/data'.$ext;
+        $skipDartCli = (bool) $this->option('skip-dart-cli');
 
-        // One path, used for both the local write and the upload. These were
-        // derived separately, and the upload side had 'offline/meta.json'
-        // hardcoded — so exporting to a custom path uploaded whatever
-        // sidecar happened to be lying in offline/, describing a different
-        // bundle than the one it published beside it.
-        $metaPath = dirname($path).'/meta.json';
-
-        $totalLines = Line::count();
-        $totalTransfers = DB::table('line_transfers')->count();
-        $linesUpdatedAt = Line::max('updated_at');
-
-        $fullPath = Storage::path($path);
-        Storage::makeDirectory(dirname($path));
-
-        $bar = $this->output->createProgressBar($totalLines + $totalTransfers + 1);
-        $bar->start();
-
-        $stream = $compress ? gzopen($fullPath, 'wb') : fopen($fullPath, 'wb');
-
-        if ($stream === false) {
-            $this->error("Could not open output path: {$fullPath}");
+        // Without the SQLite build there is nothing publishable: a meta.json
+        // with no data.db.gz beside it, or one missing data_sha256, is not a
+        // bundle the app can install. Refusing here is cheaper than letting an
+        // operator publish a half-existing pair.
+        if ($skipDartCli && $this->option('upload')) {
+            $this->error('--upload needs the SQLite bundle the Dart CLI produces. Drop --skip-dart-cli or drop --upload.');
 
             return self::FAILURE;
         }
 
-        $write = function (string $data) use ($stream, $compress): void {
-            if ($compress) {
-                gzwrite($stream, $data);
-            } else {
-                fwrite($stream, $data);
-            }
-        };
+        $path = (string) ($this->option('path') ?: 'offline/data.db.gz');
 
-        // Stamped once. The sidecar used to call now() a second time, at the
-        // end of the export, so it advertised a generation time later than the
-        // bundle it describes — by exactly as long as the export took.
+        // The bundle and its two satellites share one directory. The sidecar
+        // path used to be derived separately on the export side and hardcoded
+        // as 'offline/meta.json' on the upload side, so exporting to a custom
+        // --path published whatever sidecar happened to be lying in offline/
+        // — or none at all, silently, because Storage::get() returns null
+        // rather than throwing.
+        $artifactPaths = self::artifactPaths($path);
+        $metaPath = $artifactPaths['meta'];
+        $ndjsonPath = $artifactPaths['ndjson'];
+
+        if (dirname($path) !== '.') {
+            Storage::makeDirectory(dirname($path));
+        }
+
+        $linesUpdatedAt = Line::max('updated_at');
+
+        // Stamped once, and the published manifest reuses this exact string
+        // rather than calling now() again: the old sidecar did, and so
+        // advertised a generation time later than the bundle it describes —
+        // by exactly as long as the export took.
         $generatedAt = now()->toIso8601String();
+        $updatedAt = $linesUpdatedAt ? Carbon::parse($linesUpdatedAt)->toIso8601String() : null;
+
+        $flutterRepo = (string) ($this->option('flutter-repo') ?: config('offline.flutter_repo') ?: '');
+        $dart = (string) ($this->option('dart') ?: config('offline.dart_binary') ?: 'dart');
+
+        // Everything answerable without writing the dump is answered before
+        // the dump. A mistyped Flutter repo or an SDK too old to resolve the
+        // app's package graph used to surface only after 1.35M rows had been
+        // written — minutes spent learning a typo.
+        if (! $skipDartCli) {
+            if (! $this->assertDartCliIsRunnable($flutterRepo, $dart)) {
+                return self::FAILURE;
+            }
+
+            $this->warnIfVersionNotIncreasing($metaPath, $dataVersion);
+        }
+
+        if (! $this->dumpNdjson($ndjsonPath, $dataVersion, $updatedAt, $generatedAt)) {
+            return self::FAILURE;
+        }
+
+        $this->info(sprintf(
+            'Wrote NDJSON intermediate %s (%s)',
+            Storage::path($ndjsonPath),
+            $this->formatBytes(Storage::size($ndjsonPath)),
+        ));
+
+        if ($skipDartCli) {
+            $this->info('Skipped the Dart CLI (--skip-dart-cli): no SQLite bundle and no meta.json were produced.');
+
+            return self::SUCCESS;
+        }
+
+        // ── Dart CLI ────────────────────────────────────────────────────
+        $cliManifest = $this->buildSqliteBundle($flutterRepo, $dart, $ndjsonPath, $path, $metaPath);
+
+        if ($cliManifest === null) {
+            return self::FAILURE;
+        }
+
+        // ── Published manifest ──────────────────────────────────────────
+        if (! $this->writeManifest($path, $metaPath, $cliManifest, $dataVersion, $updatedAt, $generatedAt)) {
+            return self::FAILURE;
+        }
+
+        $this->info(sprintf(
+            'Exported %s (%s) and %s (%s)',
+            Storage::path($path), $this->formatBytes(Storage::size($path)),
+            Storage::path($metaPath), $this->formatBytes(Storage::size($metaPath)),
+        ));
+
+        // ── Upload to Cloudflare R2 ─────────────────────────────────────
+        // A failed upload has to fail the command. It used to return void, so
+        // --upload exited zero having published nothing, which is the kind of
+        // silence CI cannot see.
+        if ($this->option('upload') && ! $this->uploadToR2($path, $metaPath)) {
+            return self::FAILURE;
+        }
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Write the NDJSON intermediate that the Dart CLI consumes.
+     *
+     * This is the bundle's contract with the app's own builder: one JSON
+     * object per line, fixed record order (meta, lines by id, transfers by
+     * (line_a_id, line_b_id, point_a_index, point_b_index)), coordinates as
+     * [lng, lat], and every float emitted as a JSON double. The CLI rejects a
+     * bundle whose schema it does not know, so a change here has to land with
+     * the CLI in lockstep.
+     *
+     * @return bool False when the stream could not be opened or finished.
+     */
+    private function dumpNdjson(
+        string $ndjsonPath,
+        int $dataVersion,
+        ?string $updatedAt,
+        string $generatedAt,
+    ): bool {
+        $totalLines = Line::count();
+        $totalTransfers = DB::table('line_transfers')->count();
+
+        $bar = $this->output->createProgressBar($totalLines + $totalTransfers + 1);
+        $bar->start();
+
+        $ndjsonFullPath = Storage::path($ndjsonPath);
+        $stream = gzopen($ndjsonFullPath, 'wb');
+
+        if ($stream === false) {
+            $this->error("Could not open output path: {$ndjsonFullPath}");
+
+            return false;
+        }
 
         // ── Meta ────────────────────────────────────────────────────────
-        $meta = [
+        $this->writeRecord($stream, [
             'type' => 'meta',
             'version' => $dataVersion,
             'generated_at' => $generatedAt,
-            'updated_at' => $linesUpdatedAt ? Carbon::parse($linesUpdatedAt)->toIso8601String() : null,
+            'updated_at' => $updatedAt,
             'total_lines' => $totalLines,
             'total_transfers' => $totalTransfers,
-        ];
-        $write($this->encodeRecord($meta)."\n");
+        ]);
         $bar->advance();
 
         // ── Lines ───────────────────────────────────────────────────────
@@ -162,7 +291,7 @@ class LinesExportOffline extends Command
         // felt like, which makes the compressed bundle differ every time and
         // defeats any content hash or diff on the client side.
         foreach (Line::orderBy('id')->cursor() as $line) {
-            $record = [
+            $this->writeRecord($stream, [
                 'type' => 'line',
                 'id' => $line->id,
                 'code' => $line->code,
@@ -176,8 +305,7 @@ class LinesExportOffline extends Command
                 'objectid' => $line->objectid,
                 'average_rating' => $line->average_rating,
                 'total_reviews' => $line->total_reviews,
-            ];
-            $write($this->encodeRecord($record)."\n");
+            ]);
             $bar->advance();
         }
 
@@ -204,7 +332,7 @@ class LinesExportOffline extends Command
             ->orderBy('point_a_index')
             ->orderBy('point_b_index')
             ->cursor() as $t) {
-            $record = [
+            $this->writeRecord($stream, [
                 'type' => 'transfer',
                 'line_a_id' => $t->line_a_id,
                 'line_b_id' => $t->line_b_id,
@@ -215,62 +343,319 @@ class LinesExportOffline extends Command
                 'point_b_lat' => (float) $t->point_b_lat,
                 'point_b_index' => $t->point_b_index,
                 'walk_distance' => (float) $t->walk_distance,
-            ];
-            $write($this->encodeRecord($record)."\n");
+            ]);
             $bar->advance();
         }
 
-        if ($compress) {
-            gzclose($stream);
-        } else {
-            fclose($stream);
-        }
+        if (! gzclose($stream)) {
+            $this->error("Could not finish writing {$ndjsonFullPath}.");
 
-        // ── Meta sidecar ────────────────────────────────────────────────
-        // Derived from the record rather than rebuilt: the two used to be
-        // assembled separately, which is how they came to describe different
-        // timestamps for the same export.
-        file_put_contents(Storage::path($metaPath), $this->encodeRecord(Arr::except($meta, 'type'))."\n");
+            return false;
+        }
 
         $bar->finish();
         $this->newLine();
 
-        // Storage::size() returns int, and throws when the file is unreadable.
-        // filesize() returned int|false instead, so the report below printed
-        // "0 B" for a bundle that had failed to write.
-        $size = Storage::size($path);
-        $metaSize = Storage::size($metaPath);
-        $this->info(sprintf(
-            'Exported %s (%s) and %s (%s)',
-            $fullPath, $this->formatBytes($size),
-            $metaPath, $this->formatBytes($metaSize),
-        ));
-
-        // ── Upload to Cloudflare R2 ─────────────────────────────────────
-        // A failed upload has to fail the command. It used to return void, so
-        // --upload exited zero having published nothing, which is the kind of
-        // silence CI cannot see.
-        if ($this->option('upload') && ! $this->uploadToR2($path, $metaPath)) {
-            return self::FAILURE;
-        }
-
-        return self::SUCCESS;
+        return true;
     }
 
     /**
-     * Encode one NDJSON record with the bundle's flag set.
+     * Check that the Dart CLI could actually run, before the dump is written.
      *
-     * A failure throws rather than returning an empty string. json_encode only
-     * fails on malformed UTF-8, and the free-text `name` and `syndicate` columns
-     * are exactly where that would come from — writing `false . "\n"` would put a
-     * blank line in the bundle, which the app reads as a malformed record rather
-     * than as a failed export.
+     * Both answers are questions about the environment, and both used to
+     * arrive minutes late: a mistyped OFFLINE_FLUTTER_REPO or an SDK too old
+     * to resolve the app's package graph surfaced only after 1.35M rows had
+     * been written. The script is checked before anything is invoked so the
+     * error names the path that was wrong rather than a process failure.
+     */
+    private function assertDartCliIsRunnable(string $flutterRepo, string $dart): bool
+    {
+        if ($flutterRepo === '') {
+            $this->error('Set OFFLINE_FLUTTER_REPO (or pass --flutter-repo=) to the Flutter app checkout that owns tools/build_offline_db.dart.');
+
+            return false;
+        }
+
+        if (! is_file(rtrim($flutterRepo, '/\\').'/tools/build_offline_db.dart')) {
+            $this->error("The Dart CLI was not found at {$flutterRepo}/tools/build_offline_db.dart. Check OFFLINE_FLUTTER_REPO.");
+
+            return false;
+        }
+
+        return $this->assertDartVersion($dart);
+    }
+
+    /**
+     * Warn when the new version does not move past the last local export.
      *
+     * Nothing here is fatal — re-exporting the same version is legitimate —
+     * but a forgotten bump is the quietest failure in this pipeline: R2 gets
+     * overwritten with fresh data under a version every installed app already
+     * has, so no phone is ever prompted and the bundle change is invisible.
+     * The check reads the local manifest, so on a fresh checkout there is
+     * nothing to compare against and it stays quiet.
+     */
+    private function warnIfVersionNotIncreasing(string $metaPath, int $dataVersion): void
+    {
+        $metaFile = Storage::path($metaPath);
+
+        if (! is_file($metaFile)) {
+            return;
+        }
+
+        $previous = json_decode((string) file_get_contents($metaFile), true);
+        $previousVersion = is_array($previous) ? ($previous['version'] ?? null) : null;
+
+        if (! is_numeric($previousVersion) || (int) $previousVersion < $dataVersion) {
+            return;
+        }
+
+        $this->warn(
+            "Version {$dataVersion} is not greater than the previous local export (version {$previousVersion}). "
+            .'Clients already on that version will not be prompted to update — bump --data-version if the data changed.'
+        );
+    }
+
+    /**
+     * Resolve the three artifact paths from the bundle path.
+     *
+     * Public and static so the '.' branch — a bundle at the storage root,
+     * where dirname() is '.' — is testable without a database. There a
+     * './meta.json' still resolves on the local filesystem, but an R2 object
+     * key is literal: the app would look for meta.json at the bucket root
+     * forever while the upload sat under a key it never requests.
+     *
+     * @return array{bundle: string, meta: string, ndjson: string}
+     */
+    public static function artifactPaths(string $bundlePath): array
+    {
+        $directory = dirname($bundlePath);
+        $prefix = $directory === '.' ? '' : $directory.'/';
+
+        return [
+            'bundle' => $bundlePath,
+            'meta' => $prefix.'meta.json',
+            'ndjson' => $prefix.'data.ndjson.gz',
+        ];
+    }
+
+    /**
+     * Convert the NDJSON intermediate into the gzipped SQLite bundle.
+     *
+     * The repo and the Dart binary arrive already resolved and checked by
+     * assertDartCliIsRunnable(); this only runs the build.
+     *
+     * The build is given 10 minutes: a full 1.35 M-row bundle takes 3-5, and
+     * the default 60 s would time out every real run.
+     *
+     * Output is streamed rather than buffered: the CLI reports progress every
+     * 200k transfers, and a frozen terminal for five minutes reads like a
+     * hang. The exception covers both a missing dart binary and a timeout.
+     *
+     * @return array<string, mixed>|null The CLI's manifest, or null when the
+     *                                   build failed and nothing may be published.
+     */
+    private function buildSqliteBundle(
+        string $flutterRepo,
+        string $dart,
+        string $ndjsonPath,
+        string $bundlePath,
+        string $manifestPath,
+    ): ?array {
+        $this->info('Building the SQLite bundle with the Dart CLI. A full bundle takes 3-5 minutes...');
+
+        try {
+            $result = Process::path($flutterRepo)
+                ->timeout(600)
+                ->start([
+                    $dart, 'run', ...$this->dartRunFlags(), 'tools/build_offline_db.dart',
+                    '--input', Storage::path($ndjsonPath),
+                    '--output', Storage::path($bundlePath),
+                    '--manifest', Storage::path($manifestPath),
+                ], function (string $type, string $output): void {
+                    $this->output->write($output);
+                })
+                ->wait();
+        } catch (\Throwable $e) {
+            // A missing dart binary, a timeout, and similar process-level
+            // failures land here. The command's job is to fail the export,
+            // not to spill a stack trace over an operations terminal.
+            $this->error("The Dart CLI could not be run: {$e->getMessage()}");
+
+            return null;
+        }
+
+        if (! $result->successful()) {
+            $this->error("The Dart CLI failed with exit code {$result->exitCode()}.");
+
+            return null;
+        }
+
+        $manifestJson = is_file(Storage::path($manifestPath)) ? file_get_contents(Storage::path($manifestPath)) : false;
+
+        if ($manifestJson === false) {
+            $this->error('The Dart CLI did not write a manifest.');
+
+            return null;
+        }
+
+        $manifest = json_decode($manifestJson, true);
+
+        if (! is_array($manifest)) {
+            $this->error('The Dart CLI manifest is not valid JSON.');
+
+            return null;
+        }
+
+        /** @var array<string, mixed> $manifest */
+        return $manifest;
+    }
+
+    /**
+     * Refuse to build with a Dart too old to resolve the app's package graph.
+     *
+     * Before native assets reached stable, `dart run` answers a package that
+     * needs the feature with "enable native assets with --enable-experiment=
+     * native-assets" — even when that flag is already in the command. That
+     * message sent us chasing the invocation while the real problem was a
+     * second, older dart earlier in the resolver's order: PHP's
+     * ExecutableFinder checks .bat wrappers with is_executable(), which
+     * returns false on Windows, so Flutter's dart.bat loses to a bare
+     * dart.exe that is years behind. Checking the version first turns that
+     * scavenger hunt into one line.
+     *
+     * Unparseable output is not an error here: if dart is missing or broken,
+     * the build step reports it with the command it tried to run.
+     */
+    private function assertDartVersion(string $dart): bool
+    {
+        $result = Process::timeout(30)->run([$dart, '--version']);
+
+        $version = $result->output().$result->errorOutput();
+
+        if (! preg_match('/Dart SDK version: (\d+)\.(\d+)/', $version, $matches)) {
+            return true;
+        }
+
+        if ((int) $matches[1] > 3 || ((int) $matches[1] === 3 && (int) $matches[2] >= 11)) {
+            return true;
+        }
+
+        $this->error(
+            "The resolved Dart is {$matches[1]}.{$matches[2]}, which cannot build this bundle: "
+            .'native assets need Dart 3.11 or newer. Point OFFLINE_DART_BINARY (or --dart=) '
+            .'at a newer SDK — for example the dart bundled with Flutter.'
+        );
+
+        return false;
+    }
+
+    /**
+     * VM options Dart needs between `run` and the script path.
+     *
+     * `dart run [vm-options] <dart-file>`, so placement matters: putting them
+     * after the script would hand them to the CLI as its own arguments.
+     *
+     * The default is the native-assets experiment. The app's dependency graph
+     * reaches `objective_c` through its Apple platform plugins, and this SDK
+     * refuses to resolve it otherwise. It is env-configurable because the
+     * flag is an SDK detail: a Dart that graduates the feature can drop it by
+     * emptying OFFLINE_DART_RUN_FLAGS, and an expired flag only warns.
+     *
+     * @return list<string>
+     */
+    private function dartRunFlags(): array
+    {
+        $flags = trim((string) config('offline.dart_run_flags'));
+
+        if ($flags === '') {
+            return [];
+        }
+
+        return preg_split('/\s+/', $flags, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    }
+
+    /**
+     * Write the published meta.json from Laravel's own export state.
+     *
+     * The CLI's manifest is not copied: it names the size `gz_bytes`, writes
+     * `version` as a string (a client comparing `remote > local` on a String
+     * would silently never update), and knows nothing about data_sha256 or
+     * generated_at. What it does own is the counts, and those are read from
+     * it — they describe what actually landed in the database.
+     *
+     * data_bytes and data_sha256 are measured here, on the file that is about
+     * to be uploaded, so the manifest can never certify bytes that are not the
+     * bytes in the bucket.
+     *
+     * @param  array<string, mixed>  $cliManifest
+     */
+    private function writeManifest(
+        string $bundlePath,
+        string $metaPath,
+        array $cliManifest,
+        int $dataVersion,
+        ?string $updatedAt,
+        string $generatedAt,
+    ): bool {
+        if (! isset($cliManifest['total_lines'], $cliManifest['total_transfers'])) {
+            $this->error('The Dart CLI manifest is missing total_lines or total_transfers.');
+
+            return false;
+        }
+
+        $bundleFullPath = Storage::path($bundlePath);
+        $dataBytes = filesize($bundleFullPath);
+        $dataSha256 = hash_file('sha256', $bundleFullPath);
+
+        if ($dataBytes === false || $dataSha256 === false) {
+            $this->error("Could not measure the SQLite bundle at {$bundleFullPath}.");
+
+            return false;
+        }
+
+        $manifest = [
+            'version' => $dataVersion,
+            'updated_at' => $updatedAt,
+            'generated_at' => $generatedAt,
+            'total_lines' => (int) $cliManifest['total_lines'],
+            'total_transfers' => (int) $cliManifest['total_transfers'],
+            'data_bytes' => $dataBytes,
+            'data_sha256' => $dataSha256,
+        ];
+
+        $json = json_encode($manifest, self::JSON_FLAGS | JSON_PRETTY_PRINT);
+
+        if ($json === false) {
+            $this->error('Could not encode the manifest: '.json_last_error_msg());
+
+            return false;
+        }
+
+        if (file_put_contents(Storage::path($metaPath), $json."\n") === false) {
+            $this->error('Could not write '.Storage::path($metaPath));
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Append one encoded NDJSON record to the open gzip stream.
+     *
+     * A failure throws rather than writing nothing. json_encode only fails on
+     * malformed UTF-8, and the free-text `name` and `syndicate` columns are
+     * exactly where that would come from — writing `false . "\n"` would put a
+     * blank line in the bundle, which the app reads as a malformed record
+     * rather than as a failed export.
+     *
+     * @param  resource  $stream
      * @param  array<string, mixed>  $record
      *
      * @throws \RuntimeException
      */
-    private function encodeRecord(array $record): string
+    private function writeRecord($stream, array $record): void
     {
         $json = json_encode($record, self::JSON_FLAGS);
 
@@ -278,12 +663,13 @@ class LinesExportOffline extends Command
             throw new \RuntimeException('Could not encode a bundle record: '.json_last_error_msg());
         }
 
-        return $json;
+        if ((int) gzwrite($stream, $json."\n") === 0) {
+            throw new \RuntimeException('Could not write a bundle record to the NDJSON stream.');
+        }
     }
 
     /**
      * Make sure json_encode can express a float64 without losing digits.
-     *
      *
      * json_encode formats doubles with `serialize_precision` significant
      * digits, and PHP defaults it to -1, which means the shortest
