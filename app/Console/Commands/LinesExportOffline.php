@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Geo\GreatCircle;
 use App\Models\Line;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
@@ -19,6 +20,37 @@ use Illuminate\Support\Facades\Storage;
  * - Transfer records: {"type":"transfer",...}
  * Also writes a meta.json sidecar in the same directory (version, generated_at,
  * total_lines, total_transfers) for quick access without decompressing.
+ *
+ * Line records carry cumulative_distance, the distance in metres from the
+ * first vertex to every other one, as an array parallel to the flattened
+ * coordinates. The app ranks transfer options by ride length in SQL, where
+ * SQLite has no sin or cos, so the number travels with the geometry instead of
+ * being derived on the device. See App\Geo\GreatCircle for the formula and for
+ * why its constants must not be "improved".
+ *
+ * Transfer records carry a walk_distance measured on the same sphere as the
+ * ride lengths above, so the app can add a ride to a walk without the two
+ * terms sitting on different distance models. It is rounded to one decimal;
+ * see App\Geo\GreatCircle::walkMeters() for why.
+ *
+ * Every float in a transfer record is emitted as a JSON double and every
+ * integer as a JSON integer. That is not automatic: PDO_PGSQL returns
+ * numerics as PHP strings, so without the explicit casts in the transfer loop
+ * below walk_distance and the four coordinates would ship quoted, and
+ * `(map['walk_distance'] as num)` on the Dart side throws a TypeError. The
+ * ids and indices need no cast because they already arrive as PHP ints.
+ *
+ * average_rating is the one field still emitted as a string, and for a
+ * different reason: Laravel's decimal:2 cast returns a string by design, to
+ * keep the trailing zeros of "3.98". It is called out here so nobody reads
+ * the paragraph above as a blanket guarantee.
+ *
+ * The distances are unrounded float64, which makes the export's JSON encoding
+ * part of the contract: JSON_PRESERVE_ZERO_FRACTION keeps the leading 0.0 from
+ * degrading into an int, and json_encode truncates doubles to
+ * serialize_precision significant digits, silently and by up to centimetres,
+ * unless that ini value is at its shortest-round-trip setting. Both are
+ * enforced below rather than left to the host's php.ini.
  *
  * Output is gzip-compressed by default. Use --no-compress for raw NDJSON.
  *
@@ -49,6 +81,10 @@ class LinesExportOffline extends Command
         }
 
         $dataVersion = (int) $dataVersion;
+
+        if (! $this->ensureFloatPrecision()) {
+            return self::FAILURE;
+        }
 
         $compress = ! $this->option('no-compress');
         $ext = $compress ? '.ndjson.gz' : '.ndjson';
@@ -101,6 +137,7 @@ class LinesExportOffline extends Command
                 'name' => $line->name,
                 'sense' => $line->sense->value,
                 'color' => $line->color,
+                'cumulative_distance' => GreatCircle::forGeometry($line->geo_json),
                 'geo_json' => $line->geo_json,
                 'parent_line_id' => $line->parent_line_id,
                 'syndicate' => $line->syndicate,
@@ -108,25 +145,35 @@ class LinesExportOffline extends Command
                 'average_rating' => $line->average_rating,
                 'total_reviews' => $line->total_reviews,
             ];
-            $write(json_encode($record, JSON_UNESCAPED_UNICODE)."\n");
+            $write(json_encode($record, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION)."\n");
             $bar->advance();
         }
 
         // ── Transfers ───────────────────────────────────────────────────
+        // The four coordinates and walk_distance are cast explicitly because
+        // PDO_PGSQL hands numerics back as PHP strings: without the cast they
+        // are json_encode'd as "8.5" rather than 8.5, and the app's
+        // `as num` on walk_distance throws a TypeError on a String. The ids
+        // and indices need no cast — those come back as PHP ints.
+        //
+        // JSON_PRESERVE_ZERO_FRACTION keeps a 0 m transfer emitting 0.0 rather
+        // than 0, so every float in the bundle is a JSON double and the
+        // consumer can read them all as numbers without a per-field exception
+        // for the zero case.
         foreach (DB::table('line_transfers')->orderBy('line_a_id')->orderBy('line_b_id')->cursor() as $t) {
             $record = [
                 'type' => 'transfer',
                 'line_a_id' => $t->line_a_id,
                 'line_b_id' => $t->line_b_id,
-                'point_a_lng' => $t->point_a_lng,
-                'point_a_lat' => $t->point_a_lat,
+                'point_a_lng' => (float) $t->point_a_lng,
+                'point_a_lat' => (float) $t->point_a_lat,
                 'point_a_index' => $t->point_a_index,
-                'point_b_lng' => $t->point_b_lng,
-                'point_b_lat' => $t->point_b_lat,
+                'point_b_lng' => (float) $t->point_b_lng,
+                'point_b_lat' => (float) $t->point_b_lat,
                 'point_b_index' => $t->point_b_index,
-                'walk_distance' => $t->walk_distance,
+                'walk_distance' => (float) $t->walk_distance,
             ];
-            $write(json_encode($record, JSON_UNESCAPED_UNICODE)."\n");
+            $write(json_encode($record, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION)."\n");
             $bar->advance();
         }
 
@@ -166,6 +213,44 @@ class LinesExportOffline extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /**
+     * Make sure json_encode can express a float64 without losing digits.
+     *
+     * json_encode formats doubles with `serialize_precision` significant
+     * digits, and PHP defaults it to -1, which means the shortest
+     * representation that round-trips. A host configured with the older
+     * default of 6 would quietly rewrite 611.9834402331257 as 611.983: no
+     * warning, no error, just a bundle whose ride lengths disagree with the
+     * ones the app measures by up to centimetres per vertex.
+     *
+     * The value is PHP_INI_ALL, so it is corrected here instead of refused:
+     * stopping a build step over a setting the run can fix itself would be
+     * friction, and the alternative — silently shipping lossy distances — is
+     * not acceptable. A host that refuses the assignment does get stopped,
+     * because then the only options are shipping bad data or not shipping.
+     *
+     * @return bool False only when the setting is wrong and cannot be fixed.
+     */
+    private function ensureFloatPrecision(): bool
+    {
+        $precision = ini_get('serialize_precision');
+
+        if ($precision === '-1' || $precision === false || (int) $precision >= 17) {
+            return true;
+        }
+
+        if (@ini_set('serialize_precision', '-1') !== false) {
+            return true;
+        }
+
+        $this->error(
+            "serialize_precision is {$precision}, which truncates the exported "
+            .'distances. Set it to -1 (shortest round-trip) in php.ini.'
+        );
+
+        return false;
     }
 
     private function formatBytes(int $bytes): string

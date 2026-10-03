@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Geo\GreatCircle;
 use App\Models\CommandExecution;
 use App\Models\Line;
 use Illuminate\Console\Command;
@@ -25,6 +26,23 @@ use Illuminate\Support\Facades\DB;
  * - TRANSFER_RADIUS: 300 m — maximum walk distance between lines.
  * - MIN_SEPARATION: 100 m — minimum distance between distinct transfer points
  *   on the same line pair (spatial grid cell size for dedup).
+ *
+ * Two different distance models, on purpose
+ * -----------------------------------------
+ * walk_distance is computed in PHP with App\Geo\GreatCircle, on the same sphere
+ * of radius 6371000 that produces the bundle's cumulative_distance. It is not
+ * taken from PostGIS. That is deliberate: the app adds a ride length to a walk
+ * length to rank a transfer, and a spherical mean radius disagrees with the
+ * spheroid geodesic by +0,38% on north-south legs and -0,05% on east-west ones
+ * — about 33 m of phantom distance on a 25 km ride, against a median walk of
+ * 46 m. A single scale on both terms is what keeps that from reordering close
+ * options.
+ *
+ * The search, by contrast, stays geodesic: ST_DWithin at TRANSFER_RADIUS and
+ * the <-> KNN ordering are PostGIS-only heuristics for finding candidate
+ * vertex pairs, never published values. Changing them would silently change
+ * which transfers exist at all, and at 300 m the two models differ by at most
+ * 1,15 m. Leave them alone.
  */
 class TransfersCompute extends Command
 {
@@ -332,7 +350,7 @@ class TransfersCompute extends Command
 
     /**
      * @param  list<array{line_a_id: int, line_b_id: int}>  $pairs
-     * @return list<array{line_a_id: int, line_b_id: int, point_a_lng: float, point_a_lat: float, point_a_index: int, point_b_lng: float, point_b_lat: float, point_b_index: int, walk_distance: int}>
+     * @return list<array{line_a_id: int, line_b_id: int, point_a_lng: float, point_a_lat: float, point_a_index: int, point_b_lng: float, point_b_lat: float, point_b_index: int, walk_distance: float}>
      */
     private function processPairBatch(array $pairs): array
     {
@@ -353,6 +371,9 @@ class TransfersCompute extends Command
 
         $params['radius'] = self::TRANSFER_RADIUS;
 
+        // walk_distance is absent on purpose: it is derived in PHP from the two
+        // coordinates below, so that the bundle's ride lengths and walk lengths
+        // come from the same sphere. See the class docblock.
         $sql = '
             WITH pairs (a_id, b_id) AS (
                 VALUES '.implode(', ', $valueRows).'
@@ -365,8 +386,7 @@ class TransfersCompute extends Command
                 ST_Y(pa.geom) AS point_a_lat,
                 nb.point_index AS point_b_index,
                 ST_X(nb.geom) AS point_b_lng,
-                ST_Y(nb.geom) AS point_b_lat,
-                ROUND(ST_Distance(pa.geog, nb.geog))::int AS walk_distance
+                ST_Y(nb.geom) AS point_b_lat
             FROM pairs
             JOIN line_points pa ON pa.line_id = pairs.a_id
             CROSS JOIN LATERAL (
@@ -390,7 +410,10 @@ class TransfersCompute extends Command
             'point_b_lng' => (float) $r->point_b_lng,
             'point_b_lat' => (float) $r->point_b_lat,
             'point_b_index' => (int) $r->point_b_index,
-            'walk_distance' => (int) $r->walk_distance,
+            'walk_distance' => GreatCircle::walkMeters(
+                [(float) $r->point_a_lng, (float) $r->point_a_lat],
+                [(float) $r->point_b_lng, (float) $r->point_b_lat],
+            ),
         ], $rows));
     }
 
