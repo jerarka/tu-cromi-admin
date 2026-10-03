@@ -17,11 +17,13 @@ class Review extends Model
         'comment',
     ];
 
+    /** @return BelongsTo<User, $this> */
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
+    /** @return BelongsTo<Line, $this> */
     public function line(): BelongsTo
     {
         return $this->belongsTo(Line::class);

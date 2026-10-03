@@ -2,9 +2,11 @@
 
 namespace App\Console\Commands;
 
+use App\Concerns\UploadsBundleToR2;
 use App\Geo\GreatCircle;
 use App\Models\Line;
 use Illuminate\Console\Command;
+use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
@@ -62,6 +64,8 @@ use Illuminate\Support\Facades\Storage;
  */
 class LinesExportOffline extends Command
 {
+    use UploadsBundleToR2;
+
     protected $signature = 'lines:export-offline
         {--data-version= : Data version (required)}
         {--path= : Output path relative to storage/app}
@@ -69,6 +73,17 @@ class LinesExportOffline extends Command
         {--upload : Upload exported files to Cloudflare R2}';
 
     protected $description = 'Export lines and transfers as NDJSON for offline use';
+
+    /**
+     * Flags for every record in the bundle, and for the sidecar.
+     *
+     * This is the bundle's contract with the app, so it is declared once here
+     * rather than repeated per call site. JSON_PRESERVE_ZERO_FRACTION is what
+     * keeps a 0 m transfer emitting 0.0 instead of 0, and what keeps
+     * cumulative_distance[0] a double rather than an int — the app reads both
+     * as numbers, and an int is a type change the consumer never asked for.
+     */
+    private const JSON_FLAGS = JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION;
 
     public function handle(): int
     {
@@ -89,6 +104,13 @@ class LinesExportOffline extends Command
         $compress = ! $this->option('no-compress');
         $ext = $compress ? '.ndjson.gz' : '.ndjson';
         $path = $this->option('path') ?: 'offline/data'.$ext;
+
+        // One path, used for both the local write and the upload. These were
+        // derived separately, and the upload side had 'offline/meta.json'
+        // hardcoded — so exporting to a custom path uploaded whatever
+        // sidecar happened to be lying in offline/, describing a different
+        // bundle than the one it published beside it.
+        $metaPath = dirname($path).'/meta.json';
 
         $totalLines = Line::count();
         $totalTransfers = DB::table('line_transfers')->count();
@@ -116,16 +138,21 @@ class LinesExportOffline extends Command
             }
         };
 
+        // Stamped once. The sidecar used to call now() a second time, at the
+        // end of the export, so it advertised a generation time later than the
+        // bundle it describes — by exactly as long as the export took.
+        $generatedAt = now()->toIso8601String();
+
         // ── Meta ────────────────────────────────────────────────────────
         $meta = [
             'type' => 'meta',
             'version' => $dataVersion,
-            'generated_at' => now()->toIso8601String(),
+            'generated_at' => $generatedAt,
             'updated_at' => $linesUpdatedAt ? Carbon::parse($linesUpdatedAt)->toIso8601String() : null,
             'total_lines' => $totalLines,
             'total_transfers' => $totalTransfers,
         ];
-        $write(json_encode($meta)."\n");
+        $write($this->encodeRecord($meta)."\n");
         $bar->advance();
 
         // ── Lines ───────────────────────────────────────────────────────
@@ -150,7 +177,7 @@ class LinesExportOffline extends Command
                 'average_rating' => $line->average_rating,
                 'total_reviews' => $line->total_reviews,
             ];
-            $write(json_encode($record, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION)."\n");
+            $write($this->encodeRecord($record)."\n");
             $bar->advance();
         }
 
@@ -189,7 +216,7 @@ class LinesExportOffline extends Command
                 'point_b_index' => $t->point_b_index,
                 'walk_distance' => (float) $t->walk_distance,
             ];
-            $write(json_encode($record, JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION)."\n");
+            $write($this->encodeRecord($record)."\n");
             $bar->advance();
         }
 
@@ -200,23 +227,19 @@ class LinesExportOffline extends Command
         }
 
         // ── Meta sidecar ────────────────────────────────────────────────
-        $metaPath = dirname($fullPath).'/meta.json';
-        file_put_contents(
-            $metaPath,
-            json_encode([
-                'version' => $dataVersion,
-                'generated_at' => now()->toIso8601String(),
-                'updated_at' => $linesUpdatedAt ? Carbon::parse($linesUpdatedAt)->toIso8601String() : null,
-                'total_lines' => $totalLines,
-                'total_transfers' => $totalTransfers,
-            ], JSON_UNESCAPED_UNICODE)."\n",
-        );
+        // Derived from the record rather than rebuilt: the two used to be
+        // assembled separately, which is how they came to describe different
+        // timestamps for the same export.
+        file_put_contents(Storage::path($metaPath), $this->encodeRecord(Arr::except($meta, 'type'))."\n");
 
         $bar->finish();
         $this->newLine();
 
-        $size = filesize($fullPath);
-        $metaSize = filesize($metaPath);
+        // Storage::size() returns int, and throws when the file is unreadable.
+        // filesize() returned int|false instead, so the report below printed
+        // "0 B" for a bundle that had failed to write.
+        $size = Storage::size($path);
+        $metaSize = Storage::size($metaPath);
         $this->info(sprintf(
             'Exported %s (%s) and %s (%s)',
             $fullPath, $this->formatBytes($size),
@@ -224,15 +247,43 @@ class LinesExportOffline extends Command
         ));
 
         // ── Upload to Cloudflare R2 ─────────────────────────────────────
-        if ($this->option('upload')) {
-            $this->uploadToR2($path, $metaPath);
+        // A failed upload has to fail the command. It used to return void, so
+        // --upload exited zero having published nothing, which is the kind of
+        // silence CI cannot see.
+        if ($this->option('upload') && ! $this->uploadToR2($path, $metaPath)) {
+            return self::FAILURE;
         }
 
         return self::SUCCESS;
     }
 
     /**
+     * Encode one NDJSON record with the bundle's flag set.
+     *
+     * A failure throws rather than returning an empty string. json_encode only
+     * fails on malformed UTF-8, and the free-text `name` and `syndicate` columns
+     * are exactly where that would come from — writing `false . "\n"` would put a
+     * blank line in the bundle, which the app reads as a malformed record rather
+     * than as a failed export.
+     *
+     * @param  array<string, mixed>  $record
+     *
+     * @throws \RuntimeException
+     */
+    private function encodeRecord(array $record): string
+    {
+        $json = json_encode($record, self::JSON_FLAGS);
+
+        if ($json === false) {
+            throw new \RuntimeException('Could not encode a bundle record: '.json_last_error_msg());
+        }
+
+        return $json;
+    }
+
+    /**
      * Make sure json_encode can express a float64 without losing digits.
+     *
      *
      * json_encode formats doubles with `serialize_precision` significant
      * digits, and PHP defaults it to -1, which means the shortest
@@ -284,70 +335,5 @@ class LinesExportOffline extends Command
         }
 
         return number_format($bytes, 1).' '.$units[$i];
-    }
-
-    private function uploadToR2(string $path, string $metaPath): void
-    {
-        $this->newLine();
-        $this->info('Uploading to Cloudflare R2...');
-
-        $r2 = Storage::disk('r2');
-        $baseUrl = rtrim((string) config('filesystems.disks.r2.url'), '/');
-
-        $files = [$path, 'offline/meta.json'];
-        $mimeTypes = [
-            $path => str_ends_with($path, '.gz') ? 'application/gzip' : 'application/x-ndjson',
-            'offline/meta.json' => 'application/json',
-        ];
-
-        $spinner = $this->output->createProgressBar(0);
-        $spinner->setFormat(' %message% %cycle%');
-
-        foreach ($files as $file) {
-            try {
-                $r2->delete($file);
-            } catch (\Throwable) {
-                // File may not exist yet — safe to ignore.
-            }
-        }
-
-        foreach ($files as $file) {
-            $contents = Storage::get($file);
-
-            if ($contents === null) {
-                $spinner->finish();
-                $this->newLine();
-                $this->error("Failed to read local file: {$file}");
-
-                return;
-            }
-
-            $spinner->setMessage("Uploading {$file}...");
-            $spinner->advance();
-
-            try {
-                $result = $r2->put($file, $contents, ['Content-Type' => $mimeTypes[$file]]);
-
-                if ($result === false) {
-                    $spinner->finish();
-                    $this->newLine();
-                    $this->error("Failed to upload {$file} to R2 (put returned false). Check R2 credentials and bucket.");
-
-                    return;
-                }
-            } catch (\Throwable $e) {
-                $spinner->finish();
-                $this->newLine();
-                $this->error("Failed to upload {$file} to R2: {$e->getMessage()}");
-
-                return;
-            }
-
-            $spinner->finish();
-            $this->newLine();
-            $this->info("  Uploaded {$baseUrl}/{$file}");
-        }
-
-        $this->info('Upload complete.');
     }
 }

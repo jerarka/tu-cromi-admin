@@ -15,11 +15,13 @@ class Favorite extends Model
         'name',
     ];
 
+    /** @return BelongsTo<User, $this> */
     public function user(): BelongsTo
     {
         return $this->belongsTo(User::class);
     }
 
+    /** @return BelongsTo<Line, $this> */
     public function line(): BelongsTo
     {
         return $this->belongsTo(Line::class);

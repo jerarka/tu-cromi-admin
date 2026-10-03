@@ -2,6 +2,7 @@
 
 namespace App\Models;
 
+use Database\Factories\LineTransferFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -51,11 +52,13 @@ class LineTransfer extends Model
         ];
     }
 
+    /** @return BelongsTo<Line, $this> */
     public function lineA(): BelongsTo
     {
         return $this->belongsTo(Line::class, 'line_a_id');
     }
 
+    /** @return BelongsTo<Line, $this> */
     public function lineB(): BelongsTo
     {
         return $this->belongsTo(Line::class, 'line_b_id');

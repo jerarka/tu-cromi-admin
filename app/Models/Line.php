@@ -54,7 +54,7 @@ use Illuminate\Support\Facades\Schema;
  * @property int|null $objectid External system identifier
  * @property float|null $average_rating Average user rating (1.00–5.00)
  * @property int $total_reviews Number of user reviews
- * @property \Geometry|null $geom PostGIS geometry(MultiLineString, 4326) with GIST index for spatial queries (ST_DWithin, etc.)
+ * @property string|null $geom PostGIS geometry(MultiLineString, 4326) with GIST index for spatial queries (ST_DWithin, etc.). A hex EWKB string as the driver returns it — there is no Geometry PHP class, and the column is only ever written by syncGeometry() through a raw statement
  * @property Carbon|null $created_at
  * @property Carbon|null $updated_at
  *
@@ -142,23 +142,33 @@ class Line extends Model
      * through the query builder (LinesImport) must set both columns
      * explicitly.
      *
-     * No @return annotation is given for Attribute: larastan's stub declares
-     * TGet/TSet without @template-covariant, so PHPStan treats them as
-     * invariant and rejects any explicit annotation, including one identical
-     * to the inferred type.
+     * The get callback is an identity function and changes nothing at runtime: with
+     * no get callback Laravel returns the raw attribute value, which is what
+     * this returns. It is here because PHPStan infers TGet as `never` without
+     * one, and larastan declares TGet/TSet as plain @template — invariant — so
+     * a `never` TGet cannot be annotated even to match the inferred type. Naming
+     * the get side makes TGet `string|null` and the attribute becomes
+     * annotatable. Dropping the return type or adding a baseline entry would
+     * both trade a real check away; this trades nothing.
+     *
+     * @return Attribute<string|null, string|null>
      */
     protected function code(): Attribute
     {
-        return Attribute::set(function (?string $value): array {
-            $code = (string) $value;
+        return Attribute::make(
+            get: fn (?string $value): ?string => $value,
+            set: function (?string $value): array {
+                $code = (string) $value;
 
-            return [
-                'code' => $code,
-                'code_number' => self::numberFromCode($code),
-            ];
-        });
+                return [
+                    'code' => $code,
+                    'code_number' => self::numberFromCode($code),
+                ];
+            },
+        );
     }
 
+    /** @return BelongsTo<self, $this> */
     public function parentLine(): BelongsTo
     {
         return $this->belongsTo(self::class, 'parent_line_id');
@@ -428,16 +438,19 @@ class Line extends Model
         $this->parent_line_id = $counterpart->getKey();
     }
 
+    /** @return HasMany<self, $this> */
     public function childLines(): HasMany
     {
         return $this->hasMany(self::class, 'parent_line_id');
     }
 
+    /** @return HasMany<Favorite, $this> */
     public function favorites(): HasMany
     {
         return $this->hasMany(Favorite::class);
     }
 
+    /** @return HasMany<Review, $this> */
     public function reviews(): HasMany
     {
         return $this->hasMany(Review::class);

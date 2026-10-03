@@ -3,8 +3,12 @@
 namespace Tests\Feature\Lines;
 
 use App\Models\Line;
+use App\Models\LineTransfer;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
 
@@ -218,9 +222,7 @@ class LineExportOfflineTest extends TestCase
             'geo_json' => self::geometry(self::points()),
         ]);
 
-        DB::table('line_transfers')->insert([
-            'line_a_id' => $outbound->id,
-            'line_b_id' => $return->id,
+        LineTransfer::factory()->between($outbound->id, $return->id)->create([
             'point_a_lng' => -63.0552587326916,
             'point_a_lat' => -17.8429626188005,
             'point_a_index' => 0,
@@ -254,9 +256,7 @@ class LineExportOfflineTest extends TestCase
         $outbound = Line::factory()->outbound()->create(['geo_json' => self::geometry(self::points())]);
         $return = Line::factory()->return()->create(['geo_json' => self::geometry(self::points())]);
 
-        DB::table('line_transfers')->insert([
-            'line_a_id' => $outbound->id,
-            'line_b_id' => $return->id,
+        LineTransfer::factory()->between($outbound->id, $return->id)->create([
             'point_a_lng' => -63.05,
             'point_a_lat' => -17.84,
             'point_a_index' => 0,
@@ -336,6 +336,99 @@ class LineExportOfflineTest extends TestCase
         $this->assertSame(
             [0, 1, 2, 3],
             array_column($transfers, 'point_a_index'),
+        );
+    }
+
+    public function test_the_sidecar_describes_the_same_export_as_the_bundle()
+    {
+        Storage::fake('local');
+
+        Line::factory()->create(['geo_json' => self::geometry(self::points())]);
+
+        // The clock is advanced the moment the line records start coming out,
+        // which is after the bundle's own meta record has been written and
+        // before the sidecar is. Without that the two stamps land in the same
+        // second and a re-introduced second now() call would go unnoticed — a
+        // test that cannot fail is not a test. The gap in production was 36 s,
+        // which is how long the export took.
+        Carbon::setTestNow('2026-01-01 00:00:00');
+
+        Event::listen('eloquent.retrieved: '.Line::class, function (): void {
+            Carbon::setTestNow('2026-01-01 00:00:45');
+        });
+
+        try {
+            $records = $this->export(1);
+            $meta = $records[0];
+
+            $sidecar = json_decode(
+                Storage::disk('local')->get('offline/meta.json'),
+                true,
+                flags: JSON_THROW_ON_ERROR,
+            );
+        } finally {
+            Carbon::setTestNow();
+        }
+
+        $this->assertSame('2026-01-01T00:00:00+00:00', $meta['generated_at']);
+        $this->assertArrayNotHasKey('type', $sidecar);
+        $this->assertSame(Arr::except($meta, 'type'), $sidecar);
+
+        // Called out separately because this is the regression: the sidecar
+        // used to call now() again at the end of the run, so it advertised a
+        // generation time later than the bundle it describes.
+        $this->assertSame($meta['generated_at'], $sidecar['generated_at']);
+    }
+
+    public function test_upload_publishes_the_bundle_and_the_sidecar_it_just_wrote()
+    {
+        Storage::fake('local');
+        Storage::fake('r2');
+
+        Line::factory()->create(['geo_json' => self::geometry(self::points())]);
+
+        $this->artisan('lines:export-offline', [
+            '--data-version' => 1,
+            '--path' => 'verify/data.ndjson.gz',
+            '--upload' => true,
+        ])->assertSuccessful()->run();
+
+        $r2 = Storage::disk('r2');
+
+        $r2->assertExists('verify/data.ndjson.gz');
+        $r2->assertExists('verify/meta.json');
+
+        // The point of the assertion: the uploaded sidecar has to be the one
+        // written beside this bundle. The upload used to name 'offline/meta.json'
+        // outright, so a custom --path published a sidecar belonging to some
+        // earlier default export — or none at all, silently, because
+        // Storage::get() returns null rather than throwing.
+        $this->assertSame(
+            Storage::disk('local')->get('verify/meta.json'),
+            $r2->get('verify/meta.json'),
+        );
+        $r2->assertMissing('offline/meta.json');
+    }
+
+    public function test_upload_with_the_default_path_publishes_to_offline()
+    {
+        Storage::fake('local');
+        Storage::fake('r2');
+
+        Line::factory()->create(['geo_json' => self::geometry(self::points())]);
+
+        $this->artisan('lines:export-offline', [
+            '--data-version' => 1,
+            '--upload' => true,
+        ])->assertSuccessful()->run();
+
+        $r2 = Storage::disk('r2');
+
+        $r2->assertExists('offline/data.ndjson.gz');
+        $r2->assertExists('offline/meta.json');
+        $this->assertSame(
+            Storage::disk('local')->get('offline/meta.json'),
+            $r2->get('offline/meta.json'),
         );
     }
 }

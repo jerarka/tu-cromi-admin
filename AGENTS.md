@@ -6,77 +6,112 @@ Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue 
 
 | What | Command | Notes |
 |---|---|---|
-| Dev server | `composer dev` | Laravel Chisel (PHP + Vite concurrently) |
+| Dev server | `composer dev` | Laravel Chisel (PHP + Vite + SSR concurrently) |
 | Vite only | `npm run dev` | |
-| PHP tests | `php artisan test` | Use `--compact --filter=testName` for single test |
-| All checks | `composer test` | lint:check → types:check → test |
-| PHP lint | `composer lint` | Pint (laravel preset) |
+| **All PHP checks** | `composer test` | `config:clear` → `lint:check` → `types:check` → `artisan test`. Currently green end to end. |
+| PHP tests | `php artisan test --compact` | One test: `--filter=ClassNameOrTestName` |
+| PHP lint | `composer lint` | Pint (`laravel` preset) |
 | PHP lint check | `composer lint:check` | `pint --parallel --test` |
-| PHPStan | `composer types:check` | Level 7, covers `app/`, `config/`, `database/`, `routes/` |
-| Frontend lint | `npm run lint` | ESLint + fix |
-| Frontend format | `npm run format` | Prettier on `resources/` |
+| PHPStan | `composer types:check` | Level 7 over `app/`, `config/`, `database/`, `routes/` |
+| Frontend tests | `npm run test` | `vitest run`. One file: `npm run test -- resources/js/lib/undoStack` |
+| Frontend lint | `npm run lint` | ESLint + fix (`lint:check` without fix) |
+| Frontend format | `npm run format` | Prettier over `resources/` |
 | TypeScript check | `npm run types:check` | `vue-tsc --noEmit` |
-| Full CI | `composer ci:check` | Frontend lint → format → types → test |
+| Everything | `composer ci:check` | Runs **both** stacks: frontend lint → format → vue-tsc → vitest → `composer test` |
 | Build | `npm run build` | |
-| Codegen | `php artisan wayfinder:generate` | Regenerates `resources/js/{actions,routes,wayfinder}/` |
+| Codegen | `php artisan wayfinder:generate` | Regenerates the gitignored `resources/js/{actions,routes,wayfinder}/` |
+
+Use **npm**, not pnpm. `pnpm-workspace.yaml` exists but the lockfile and CI are npm. `.npmrc` sets `ignore-scripts=true`, so no postinstall hooks run.
+
+## CI
+
+Two workflows, both on push/PR to `develop`/`main`/`master`/`workos`:
+
+- **`.github/workflows/tests.yml`** — PHP **8.3, 8.4 and 8.5** matrix, Node 22, copies `.env.example`. Runs `composer types:check` then `php artisan test`. **PHPStan errors fail CI**, so keep it at zero.
+- **`.github/workflows/lint.yml`** — `composer lint`, `npm run format`, `npm run lint` (writes, does not check).
+
+**`.env.example` ships `DB_CONNECTION=sqlite`** but dev and prod are PostgreSQL + PostGIS. Copying it verbatim gives you SQLite, and every spatial query then fails confusingly.
 
 ## Domain model — Lines
 
-- **Each `lines` row = one direction** (OUTBOUND or RETURN), not a full line. Real-world lines (e.g. "Línea 1") generate two records sharing the same `code`.
-- `code` has an index but **no unique constraint** — two rows share it.
-- Opposite directions link bidirectionally via `parent_line_id` (self-referential FK). Lines with only one sense (circular) have no counterpart.
-- Coordinates: `geo_json` (JSONB) stores raw MultiLineString `[lng, lat]`. `geom` (PostGIS `geometry(MultiLineString,4326)`) is populated from geo_json via `ST_GeomFromGeoJSON`. GIST index on geography.
+- **Each `lines` row = one direction** (OUTBOUND or RETURN), not a full line. Real lines ("Línea 1") are two rows sharing a `code`.
+- **UNIQUE index on `(code, sense)`** — two rows may share a `code`, never with the same `sense`. Two factory-created lines with a fixed `code` and a random `sense` collide ~50% of the time; pin `->outbound()` / `->return()`.
+- `code_number` (NOT NULL) is derived from the numeric prefix of `code`; `lines_sort_index (code_number, code, sense)` makes `"2"` sort before `"22 rojo"`. `code_suffix` was dropped — don't reintroduce it.
+- Opposite directions link bidirectionally via `parent_line_id`. Circular lines (72, 73) have no counterpart; that is expected, not a bug.
+- `geo_json` (JSONB) is the source of truth: MultiLineString `[lng, lat]`. `geom` is derived from it via `ST_GeomFromGeoJSON` and is written **only** by `Line::syncGeometry()` through a raw statement — it does not exist on SQLite.
+- **`geometry_adjusted` is a dirty flag, not state**: it marks a line whose geometry a human corrected after import (`applyDirectionOperation()`). When set, previously computed transfer point indices point at different coordinates, so `transfers:compute` must be re-run.
 - `LineSense` enum: `Outbound = 'OUTBOUND'` (ida), `Return = 'RETURN'` (vuelta).
+
+## Offline bundle (`lines:export-offline`)
+
+Gzipped NDJSON, one JSON object per line, consumed by the Flutter app. Record order is **fixed and part of the contract**: `meta`, then lines by `id`, then transfers by `(line_a_id, line_b_id, point_a_index, point_b_index)`.
+
+- **Ordering must be total.** Ordering transfers by the pair alone leaves ~22 tied rows per pair and the compressed output changes every run. The body is byte-reproducible; only `meta.generated_at` differs between runs, so compare content hashes, not file hashes.
+- **Every float is a JSON double, every integer a JSON integer.** `JSON_PRESERVE_ZERO_FRACTION` is what keeps a 0 m transfer emitting `0.0` instead of `0`. Encode through `LinesExportOffline::encodeRecord()` — do not call `json_encode` directly.
+- **`PDO_PGSQL` returns numerics as PHP strings.** Without explicit `(float)` casts, `walk_distance` and the coordinates ship quoted and `(map['walk_distance'] as num)` throws a `TypeError` in Dart. `line_a_id` and the indices arrive as real ints and need no cast.
+- `serialize_precision` must be `-1` or ≥ 17; with the legacy default of 6, `json_encode` silently truncates doubles to ~cm. The command corrects it with `ini_set` and only fails if that is rejected.
+- `meta.json` is a sidecar at `dirname(--path)/meta.json`, derived from the meta record via `Arr::except($meta, 'type')` — one timestamp, one source. Never rebuild it; that is how it came to describe a different export.
+- Known inconsistency: `average_rating` still ships as a **string**, because Laravel's `decimal:2` cast returns a string by design. `resources/js/types/line.ts` declares it `number | null`, so the admin's type is already wrong. The column is NULL everywhere and nothing writes it.
+
+`EARTH_RADIUS_M` is **6371000.0** (mean radius), not WGS84's 6378137. The app measures with the same value; swapping it shifts every ride by ~0.1%, enough to reorder transfer rankings with no visible failure. Same for the operand order in `GreatCircle::metersBetween()`. Both ride lengths and walk distances come from that one class — see `app/Geo/`.
 
 ## Artisan commands
 
 | Command | Purpose |
 |---|---|
-| `lines:import` | Import from GeoJSON (Santa Cruz data). `sentido=1` → OUTBOUND, other → RETURN. RETURN coordinates reversed. Links opposite lines by `code`. `--force` to truncate first, `--path=` for custom file. |
-| `lines:export-offline` | Export lines + transfers as gzip-compressed NDJSON for Flutter offline mode. `--data-version=N` (required), `--no-compress` for raw output, `--path=` for custom location. `--upload` pushes files to Cloudflare R2 (deletes old first, publishes public URLs). Requires `R2_*` env vars. |
-| `transfers:compute` | Precompute pedestrian transfers. Uses PostGIS (ST_DWithin 300m, KNN lateral join). Deduplicates via 100m spatial grid. **Can be slow (17min).** Use `--limit=N` to test with N lines first. |
+| `lines:export-offline` | Build the NDJSON bundle. `--data-version=N` (required), `--path=` (relative to `storage/app`, **also moves the sidecar**), `--no-compress`, `--upload`. |
+| `transfers:compute` | Precompute pedestrian transfers. PostGIS `ST_DWithin` 300 m + KNN lateral join, deduped on a 100 m spatial grid. **~17 min.** Logs to `command_executions`. |
+| `lines:import` | Import from `database/data/rutas_scz.geojson`. `sentido=1` → OUTBOUND, else RETURN with reversed coordinates. Links opposite directions by `code`. |
+| `lines:refresh-geometry` | Rebuild `geom` from `geo_json` after a manual geometry edit. |
+| `lines:backfill-sort-keys` | Recompute `code_number`. `--dry-run` reports first. |
+| `roads:import-overpass` | Import streets from Overpass for snapping. `--bbox=`, `--tile=`, `--truncate`, `--dry-run`. |
+| `roads:self-test` | Exercises the PostGIS snap path against a real instance and rolls back. |
 
-Both commands have class-level docblocks with algorithm details.
+**Destructive by default — read before running:**
+
+- `transfers:compute` **truncates `line_transfers` unconditionally, including with `--limit`**. `--limit=20` still wipes all 1.35M rows and rebuilds from 20 lines. Dump the table first, or run against a scratch database.
+- `lines:import --force` requires `--discard-everything` to confirm, because it destroys user data and manual corrections.
+- `lines:export-offline --upload` **deletes both R2 objects before uploading either**. A failed upload therefore leaves the bucket with neither, which makes clients fall back to their cached version. That ordering is deliberate: the sidecar is what advertises a new version, so it must go up after the bundle, never before.
 
 ## Architecture
 
-- **Frontend entry**: `resources/js/app.ts` — layout dispatching, theme init, flash toasts.
-- **Pages**: `resources/js/pages/` auto-discovered by Inertia. Auth pages under `auth/`, settings under `settings/`.
-- **Layouts**: Assigned by page name in `app.ts`: `auth/*` → AuthLayout, `settings/*` → AppLayout+SettingsLayout, `Welcome` → none, else → AppLayout.
-- **Routes**: `routes/web.php`, `routes/settings.php`, `routes/console.php`. Use named routes.
-- **`@` alias**: `resources/js/` (tsconfig + Inertia config). `vitest.config.ts` declares it too, since a test runner does not read tsconfig.
-- **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `snapWire` and `snapTransport` (the lat/lng boundary and the street lookup), `mapView`, `undoStack`.
-- **`resources/js/composables/`**: Vue-aware shared state — `useRouteGeometry` (route editing state, shared by the create and edit pages), `useSnapPreset`, `useAppearance`. No DOM, so testable under `environment: 'node'`.
+- **Frontend entry**: `resources/js/app.ts` — layout dispatch, theme init, flash toasts. Boots `initializeTheme()` + `initializeFlashToast()` on every page.
+- **Pages**: `resources/js/pages/` auto-discovered by Inertia. Auth under `auth/`, settings under `settings/`.
+- **Layouts**: chosen by page name in `app.ts` — `auth/*` → AuthLayout, `settings/*` → AppLayout + SettingsLayout, `Welcome` → none, else AppLayout.
+- **`@` alias** → `resources/js/`, declared in `vitest.config.ts` as well as tsconfig, because a test runner does not read tsconfig.
+- **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `snapWire`/`snapTransport` (the lat/lng boundary and the street lookup), `mapView`, `undoStack`, `flashToast`, `utils` (`cn()`).
+- **`resources/js/composables/`**: Vue-aware shared state — `useRouteGeometry` (shared by the create and edit pages), `useSnapPreset`, `usePropagation`, `useResampleSpacing`, `useAppearance`. Several have colocated `.test.ts` siblings and are testable because they touch no DOM.
 - If logic is worth testing, it belongs in one of those two rather than in a component.
-- **`app/Geo/`**: pure, framework-free PHP. `GreatCircle` owns the distance model for the offline bundle — both `cumulative_distance` (ride lengths) and `walk_distance` (transfer legs) come from it, so a ride and a walk are on one scale by construction instead of by two copies of a formula agreeing.
-- **`EARTH_RADIUS_M` is load-bearing**: 6371000.0 (the mean radius), **not** WGS84's 6378137. The app measures with the same value; changing it shifts every ride length by ~0.1%, which is enough to reorder transfer rankings without failing anything visibly. Same for the operand order inside `metersBetween()` — reassociating a float sum moves the last bit.
-- Testable geometry belongs in `app/Geo/`, not inside a Command. A Command's data path is usually PostGIS and therefore unreachable from the SQLite suite; that is why the rounding policy in `walkMeters()` lives on the class.
-- **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests).
-- **SSR**: Enabled. Dev URL at `127.0.0.1:13714` (config/inertia.php).
-- **Auth**: Laravel Fortify — features: registration, password reset, email verification, 2FA, passkeys.
-- **Gated pages**: `dashboard` requires `auth` + `verified` middleware.
-- **No service layer**: Domain logic lives in Models, Commands, and `app/Geo/` for pure geometry.
-- **Incomplete**: `IssueReport` migration exists but no Model or UI yet.
+- **`app/Geo/`**: pure, framework-free PHP. `GreatCircle` owns the bundle's distance model.
+- **`app/Concerns/`**: traits, not services — `ProfileValidationRules`, `PasswordValidationRules`, `UploadsBundleToR2`.
+- **Testable geometry belongs in `app/Geo/`, not inside a Command.** A Command's data path is usually PostGIS and therefore unreachable from the SQLite suite; that is why the rounding policy in `walkMeters()` lives on the class.
+- **No service layer**: domain logic lives in Models, Commands, and `app/Geo/`.
+- **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests). Two GIST indexes on `lines`: `geom` and `geography(geom)`.
+- **SSR**: enabled, dev server at `127.0.0.1:13714` (`config/inertia.php`).
+- **Auth**: Laravel Fortify — registration, password reset, email verification, 2FA, passkeys.
+- **Gated pages**: `dashboard` requires `auth` + `verified`.
+- **Incomplete**: the `issue_reports` migration exists with no Model or UI.
 
 ## Testing quirks
 
-- **PHPUnit classes** (not Pest). `RefreshDatabase` trait. `skipUnlessFortifyHas()` for conditional Fortify feature tests.
-- **Vitest** for `resources/js/**/*.test.ts`, configured in its own `vitest.config.ts` (not a `test` block in `vite.config.ts`, which would start `php artisan pail`). `environment: 'node'`, so there is no jsdom and **component tests are not possible** — anything worth asserting has to live in `resources/js/lib/`.
-- **PostGIS queries are untestable on SQLite**: the `roads` table and the snap lookup are PostgreSQL-only. `php artisan roads:self-test` exercises them against a real instance and rolls back.
-- Tests use **SQLite `:memory:`** — PostGIS spatial queries (`ST_DWithin`, `ST_Distance`) will **fail** in tests. Commands using PostGIS cannot be tested via the standard test suite.
+- **PHPUnit classes, not Pest.** `RefreshDatabase`; `skipUnlessFortifyHas()` for conditional Fortify tests.
+- **Vitest** for `resources/js/**/*.test.ts`, configured in its own `vitest.config.ts` — a `test` block in `vite.config.ts` would start `php artisan pail`. `environment: 'node'`, so there is no jsdom and **component tests are not possible**; anything worth asserting has to live in `lib/` or `composables/`.
+- **PostGIS is untestable on SQLite**: the `roads` table and the snap lookup are PostgreSQL-only, and `ST_DWithin`/`ST_Distance` will fail. `transfers:compute` cannot be tested by the suite at all — it is verified by hand against a real instance (it is deterministic: two runs hash identically).
+- **Pin the vectors you assert against.** The line-230 coordinate array in the bundle tests is a hardcoded copy on purpose. Deriving it from the database would make the test unable to detect the drift it exists to catch.
+- **Assert against a clock you control** when the code stamps two artifacts at different points; two `now()` calls in a sub-second test land in the same second and the test cannot fail. Freeze with `Carbon::setTestNow()` and advance it from an `eloquent.retrieved` listener.
+- **Mutation-check new tests.** Reintroduce the bug and confirm they go red — twice this session, a test passed with the bug present and another shipped a wrong type that only the failing branch reached.
 
 ## Conventions
 
-- **Pint** after every PHP change: `vendor/bin/pint --dirty --format agent` (not `--test`).
-- **Prettier**: 4-space indent, single quotes, semicolons. YAML files use 2-space indent. Ignores `resources/js/components/ui/*`, `resources/views/mail/*`.
-- **ESLint**: block brace `1tbs` (no single line), padding around control statements, sorted imports (builtin→external→internal→parent→sibling→index). Ignores codegen outputs.
+- **Pint after every PHP change**: `vendor/bin/pint --dirty --format agent` (not `--test`).
+- **Prettier**: 4-space indent, single quotes, semicolons; YAML 2-space. Ignores `resources/js/components/ui/*`, `resources/views/mail/*`.
+- **ESLint**: `1tbs` braces, padding around control statements, sorted imports (builtin → external → internal → parent → sibling → index). Ignores codegen output.
 - **shadcn-vue**: `cn()` from `@/lib/utils` (clsx + tailwind-merge), lucide icons.
-- **Wayfinder**: Import controllers from `@/actions/`, named routes from `@/routes/`. Generated files are gitignored.
-- **Cookies excluded from encryption**: `appearance`, `sidebar_state` (see `bootstrap/app.php`).
-- **Passkeys**: `PASSKEYS_USER_HANDLE_SECRET` env var (falls back to `APP_KEY`).
-- **App boots** `initializeTheme()` + `initializeFlashToast()` on every page load (see `app.ts`).
-- **Migrations**: `$table->timestamps()` for `created_at`/`updated_at` pairs; `$table->softDeletes()` for soft deletes; `string()` defaults to 255; `foreignId('foo_id')->constrained()` resolves table by convention.
+- **Wayfinder**: controllers from `@/actions/`, named routes from `@/routes/`. Generated dirs are gitignored — regenerate, never edit.
+- **Cookies excluded from encryption**: `appearance`, `sidebar_state` (`bootstrap/app.php`).
+- **Passkeys**: `PASSKEYS_USER_HANDLE_SECRET`, falling back to `APP_KEY`.
+- **Migrations**: `$table->timestamps()`; `$table->softDeletes()`; `string()` defaults to 255; `foreignId('foo_id')->constrained()` resolves by convention. `numeric` columns come back from PDO as strings — cast at the boundary.
 
 ## MCP
 
-`opencode.json` enables `laravel-boost` (Laravel Boost MCP server). Use it for DB schema, error logs, and docs searches.
+`opencode.json` runs the **laravel-boost** MCP server (`php artisan boost:mcp`). Use it for DB schema, application and browser error logs, and version-specific docs. `boost.json` scopes it to opencode.
