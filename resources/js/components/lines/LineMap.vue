@@ -1712,7 +1712,7 @@ onUnmounted(() => {
                                             @click="relaySelection"
                                         >
                                             <Waves class="size-4" />
-                                            Re-lay on the street network
+                                            Re-lay
                                         </Button>
                                     </span>
                                 </TooltipTrigger>

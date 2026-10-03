@@ -4,9 +4,11 @@ import {
     ArrowLeft,
     ArrowLeftRight,
     ArrowRightLeft,
+    Check,
     ChevronDown,
     ChevronLeft,
     ChevronRight,
+    PencilLine,
     Redo2,
     RotateCcw,
     Shuffle,
@@ -419,9 +421,32 @@ function onMapUpdate(
     setGeometry(geoJson);
 }
 
+/**
+ * "Ida" or "Vuelta" for a sense value.
+ *
+ * The ternary was written out four times in this file, and the two versions
+ * that matter to a reviewer — this line's and its counterpart's — sit nine
+ * lines apart in the header. One function is the only place where the word
+ * for a sense is decided.
+ */
+function senseName(sense: Line['sense']): string {
+    return sense === 'OUTBOUND' ? 'Ida' : 'Vuelta';
+}
+
+const senseLabel = computed(() => senseName(props.line.sense));
+
 const pageTitle = computed(
-    () =>
-        `Edit: ${props.line.code} — ${props.line.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'}`,
+    () => `Edit: ${props.line.code} — ${senseLabel.value}`,
+);
+
+/**
+ * The icon that goes with the editor toggle, flipped by the same state.
+ *
+ * Data rather than two branches of markup so the glyph can never describe the
+ * opposite of the label next to it.
+ */
+const editToggleIcon = computed(() =>
+    isEditingMap.value ? Check : PencilLine,
 );
 </script>
 
@@ -440,54 +465,100 @@ const pageTitle = computed(
         </Button>
 
         <div class="flex items-center gap-2">
-            <Button
-                v-if="props.counterpart"
-                type="button"
-                variant="secondary"
-                size="sm"
-                :title="`Switch to ${props.counterpart.code} (${props.counterpart.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta'})`"
-                @click="
-                    confirmDiscard(
-                        lines.edit.url({ line: props.counterpart!.id }),
-                    )
-                "
-            >
-                <ArrowLeftRight class="size-4" />
-                {{ props.counterpart.sense === 'OUTBOUND' ? 'Ida' : 'Vuelta' }}
-            </Button>
+            <!--
+                Every navigation control here moved to a shadcn Tooltip instead
+                of a native title. Two reasons, and the second is the real one: a
+                Button is `disabled:pointer-events-none`, so a title on a
+                disabled button never fires — and the pager is disabled at the
+                ends of the list, which is exactly when the reviewer is checking
+                whether there is a line that way. A Tooltip triggered from a
+                wrapper span has neither problem.
+            -->
+            <TooltipProvider :delay-duration="0">
+                <Tooltip v-if="props.counterpart">
+                    <TooltipTrigger as-child>
+                        <Button
+                            type="button"
+                            variant="secondary"
+                            size="sm"
+                            @click="
+                                confirmDiscard(
+                                    lines.edit.url({
+                                        line: props.counterpart!.id,
+                                    }),
+                                )
+                            "
+                        >
+                            <ArrowLeftRight class="size-4" />
+                            {{ senseName(props.counterpart.sense) }}
+                        </Button>
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs">
+                        <p>
+                            {{
+                                `Switch to ${props.counterpart.code} (${senseName(
+                                    props.counterpart.sense,
+                                )})`
+                            }}
+                        </p>
+                    </TooltipContent>
+                </Tooltip>
 
-            <Button
-                v-if="props.nav.prev"
-                type="button"
-                variant="outline"
-                size="sm"
-                :title="`Previous: ${props.nav.prev.code}`"
-                @click="
-                    confirmDiscard(lines.edit.url({ line: props.nav.prev!.id }))
-                "
-            >
-                <ChevronLeft class="size-4" />
-                Previous
-            </Button>
+                <!--
+                    A pager, so it reads as a pair and stays a pair. Icon-only
+                    because "Previous" and "Next" cost two words each to say
+                    something the chevrons already say, and the code they jump
+                    to — the part that is not obvious — is in the tooltip.
+                -->
+                <Tooltip v-if="props.nav.prev">
+                    <TooltipTrigger as-child>
+                        <Button
+                            type="button"
+                            variant="outline"
+                            size="icon-sm"
+                            @click="
+                                confirmDiscard(
+                                    lines.edit.url({
+                                        line: props.nav.prev!.id,
+                                    }),
+                                )
+                            "
+                        >
+                            <ChevronLeft class="size-4" />
+                            <span class="sr-only">Previous line</span>
+                        </Button>
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs">
+                        <p>Previous: {{ props.nav.prev.code }}</p>
+                    </TooltipContent>
+                </Tooltip>
 
-            <Button
-                v-if="props.nav.next"
-                type="button"
-                variant="outline"
-                size="sm"
-                :title="`Next: ${props.nav.next.code}`"
-                @click="
-                    confirmDiscard(lines.edit.url({ line: props.nav.next!.id }))
-                "
-            >
-                Next
-                <ChevronRight class="size-4" />
-            </Button>
+                <Tooltip v-if="props.nav.next">
+                    <TooltipTrigger as-child>
+                        <Button
+                            type="button"
+                            variant="outline"
+                            size="icon-sm"
+                            @click="
+                                confirmDiscard(
+                                    lines.edit.url({
+                                        line: props.nav.next!.id,
+                                    }),
+                                )
+                            "
+                        >
+                            <span class="sr-only">Next line</span>
+                            <ChevronRight class="size-4" />
+                        </Button>
+                    </TooltipTrigger>
+                    <TooltipContent class="max-w-xs">
+                        <p>Next: {{ props.nav.next.code }}</p>
+                    </TooltipContent>
+                </Tooltip>
+            </TooltipProvider>
         </div>
     </div>
-    <Heading
-        :title="pageTitle"
-    />
+    <Heading :title="pageTitle" />
 
     <div class="grid gap-8 lg:grid-cols-5">
         <!-- Form -->
@@ -497,29 +568,45 @@ const pageTitle = computed(
                 class="grid grid-cols-2 gap-4"
                 v-slot="{ errors, processing }"
             >
-                <!-- Read-only fields -->
-                <div class="grid gap-1">
-                    <Label for="code">Code</Label>
-                    <Input
-                        id="code"
-                        :model-value="line.code"
-                        disabled
-                        class="opacity-60"
-                    />
-                </div>
+                <!--
+                    Read-only, and printed rather than shown as disabled
+                    inputs.
 
-                <div class="grid gap-1">
-                    <Label for="sense">Direction</Label>
-                    <Input
-                        id="sense"
-                        :model-value="line.sense"
-                        disabled
-                        class="opacity-60"
-                    />
-                </div>
+                    A disabled control is a poor way to say "not editable": it
+                    occupies the space a real field would, it takes focus in
+                    the tab order, it cannot be selected with the mouse without
+                    a keyboard dance to get the value out, and it invites the
+                    reviewer to type into it and watch nothing happen. Two of
+                    the four are bugs and one is a lie.
+
+                    A plain definition row says the same thing and also frames
+                    what follows: this is the record being changed, and
+                    everything under it is what can be changed about it.
+                -->
+                <dl
+                    class="col-span-2 grid grid-cols-2 gap-4 rounded-md border bg-muted/40 px-3 py-2"
+                >
+                    <div class="grid gap-0.5">
+                        <dt class="text-xs font-medium text-muted-foreground">
+                            Code
+                        </dt>
+                        <dd class="font-mono text-sm">{{ line.code }}</dd>
+                    </div>
+                    <div class="grid gap-0.5">
+                        <dt class="text-xs font-medium text-muted-foreground">
+                            Direction
+                        </dt>
+                        <dd class="text-sm">
+                            {{ senseLabel }}
+                            <span class="text-muted-foreground">
+                                ({{ line.sense }})
+                            </span>
+                        </dd>
+                    </div>
+                </dl>
 
                 <!-- Editable fields -->
-                <div class="grid gap-1">
+                <div class="col-span-2 grid gap-1">
                     <Label for="name">Name</Label>
                     <Input
                         id="name"
@@ -531,7 +618,13 @@ const pageTitle = computed(
                     <InputError :message="errors.name" />
                 </div>
 
-                <div class="grid grid-cols-2">
+                <!--
+                    Full width now that the identity row above takes its own
+                    line: these two were sharing half the form with the name
+                    field, which left three inputs on one row and made the
+                    name the odd one out.
+                -->
+                <div class="col-span-2 grid grid-cols-2 gap-4">
                     <div class="grid gap-2">
                         <Label for="color">Color</Label>
                         <div class="flex items-center gap-3">
@@ -584,16 +677,28 @@ const pageTitle = computed(
                     </p>
                 </div>
 
-                <div class="flex items-center gap-4">
+                <!--
+                    Cancel is gone, and "Back to lines" at the top of the page
+                    was already it: same href, same confirmDiscard, same guard
+                    against throwing away unsaved geometry. Two buttons for one
+                    action meant one of them was the one the reviewer reached
+                    for and the other was the one they second-guessed.
+
+                    What replaced it is the reason they used to need Cancel to
+                    discover. isDirty was set on every keystroke and every
+                    vertex drag but stayed invisible until someone tried to
+                    leave and got a confirm() — so the state existed only at
+                    the moment it stopped being recoverable. Printed next to
+                    Save, it is visible while it is still cheap to act on.
+                -->
+                <div class="col-span-2 flex items-center gap-4">
                     <Button :disabled="processing">Save</Button>
-                    <Button
-                        type="button"
-                        variant="outline"
-                        :disabled="processing"
-                        @click="confirmDiscard(lines.index.url())"
+                    <span
+                        v-if="isDirty"
+                        class="text-sm font-medium text-amber-700 dark:text-amber-400"
                     >
-                        Cancel
-                    </Button>
+                        Unsaved changes
+                    </span>
                 </div>
             </Form>
         </div>
@@ -641,42 +746,102 @@ const pageTitle = computed(
                     />
                 </CollapsibleTrigger>
                 <CollapsibleContent class="px-4 pb-4">
-                    <p class="text-sm text-muted-foreground">
+                    <!--
+                        The paragraph explains what the two buttons are for, so
+                        it is only rendered when there are two buttons that can
+                        do it. It used to print above a row of dead controls,
+                        which is how a line with no counterpart ended up
+                        reading forty words about re-orienting and then saying
+                        it could not be re-oriented.
+                    -->
+                    <p
+                        v-if="canChangeDirection"
+                        class="text-sm text-muted-foreground"
+                    >
                         The source data does not record which end a bus departs
                         from, so this is a manual correction. Both actions cover
                         this line and its counterpart, and both are undone by
                         repeating them.
                     </p>
-                    <div class="mt-3 flex flex-wrap gap-2">
-                        <Button
-                            v-for="action in directionActions"
-                            :key="action.operation"
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            :disabled="!canChangeDirection"
-                            :title="
-                                canChangeDirection
-                                    ? undefined
-                                    : 'This line has no counterpart to re-orient.'
-                            "
-                            @click="
-                                applyDirection(action.operation, action.confirm)
-                            "
-                        >
-                            <component :is="action.icon" class="size-4" />
-                            {{ action.label }}
-                        </Button>
-                        <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            title="Restore this line's geometry from the source GeoJSON"
-                            @click="refreshGeometry"
-                        >
-                            <RotateCcw class="size-4" />
-                            Reset to source
-                        </Button>
+                    <div
+                        class="flex flex-wrap gap-2"
+                        :class="canChangeDirection ? 'mt-3' : ''"
+                    >
+                        <!--
+                            The trigger is a span around the button, because the
+                            reason a button is disabled is exactly when the
+                            explanation is wanted and a disabled button fires
+                            no pointer events for a title to hang off.
+                        -->
+                        <TooltipProvider :delay-duration="0">
+                            <Tooltip
+                                v-for="action in directionActions"
+                                :key="action.operation"
+                            >
+                                <TooltipTrigger as-child>
+                                    <span class="inline-flex">
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            :disabled="!canChangeDirection"
+                                            @click="
+                                                applyDirection(
+                                                    action.operation,
+                                                    action.confirm,
+                                                )
+                                            "
+                                        >
+                                            <component
+                                                :is="action.icon"
+                                                class="size-4"
+                                            />
+                                            {{ action.label }}
+                                        </Button>
+                                    </span>
+                                </TooltipTrigger>
+                                <!--
+                                    Rendered only while the button is disabled.
+                                    What the button does is a confirm() the
+                                    reviewer has to answer anyway, so the
+                                    tooltip has one job — say why it cannot be
+                                    pressed — and showing it unconditionally
+                                    would have it deny the existence of a
+                                    counterpart on the lines that have one.
+                                -->
+                                <TooltipContent
+                                    v-if="!canChangeDirection"
+                                    class="max-w-xs"
+                                >
+                                    <p>
+                                        This line has no counterpart to
+                                        re-orient.
+                                    </p>
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
+
+                        <TooltipProvider :delay-duration="0">
+                            <Tooltip>
+                                <TooltipTrigger as-child>
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        @click="refreshGeometry"
+                                    >
+                                        <RotateCcw class="size-4" />
+                                        Reset to source
+                                    </Button>
+                                </TooltipTrigger>
+                                <TooltipContent class="max-w-xs">
+                                    <p>
+                                        Restore this line's geometry from the
+                                        source GeoJSON.
+                                    </p>
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
                     </div>
                     <p
                         v-if="!canChangeDirection"
@@ -684,7 +849,7 @@ const pageTitle = computed(
                     >
                         A line with no counterpart cannot be re-oriented.
                         Circular routes such as 72 and 73 are legitimately alone
-                        in their direction.
+                        in their direction. Reset to source still applies.
                     </p>
                 </CollapsibleContent>
             </Collapsible>
@@ -695,30 +860,67 @@ const pageTitle = computed(
                     <RouteStats :geo-json="parsedGeoJson" />
                 </div>
                 <div class="flex items-center gap-2">
-                    <Button
-                        v-if="isEditingMap"
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        :disabled="!canUndoGeometry"
-                        title="Undo the last geometry edit (Ctrl+Z). The map keeps its framing, so you stay where you were looking."
-                        @click="undo"
-                    >
-                        <Undo2 class="size-4" />
-                        Undo
-                    </Button>
-                    <Button
-                        v-if="isEditingMap"
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        :disabled="!canRedoGeometry"
-                        title="Redo (Ctrl+Shift+Z)"
-                        @click="redo"
-                    >
-                        <Redo2 class="size-4" />
-                        Redo
-                    </Button>
+                    <!--
+                        Icon-only with a Tooltip, and the tooltip is doing
+                        real work rather than repeating a visible word: the
+                        reason the map keeps its framing after an undo is the
+                        thing a reviewer needs to know before pressing it, and
+                        a native title would have hidden it behind a hover
+                        delay on a control that is disabled precisely when
+                        there is nothing to undo.
+                    -->
+                    <TooltipProvider :delay-duration="0">
+                        <Tooltip v-if="isEditingMap">
+                            <TooltipTrigger as-child>
+                                <span class="inline-flex">
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon-sm"
+                                        :disabled="!canUndoGeometry"
+                                        @click="undo"
+                                    >
+                                        <Undo2 class="size-4" />
+                                        <span class="sr-only">Undo</span>
+                                    </Button>
+                                </span>
+                            </TooltipTrigger>
+                            <TooltipContent class="max-w-xs">
+                                <p>
+                                    Undo the last geometry edit (Ctrl+Z). The
+                                    map keeps its framing, so you stay where you
+                                    were looking.
+                                </p>
+                            </TooltipContent>
+                        </Tooltip>
+
+                        <Tooltip v-if="isEditingMap">
+                            <TooltipTrigger as-child>
+                                <span class="inline-flex">
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon-sm"
+                                        :disabled="!canRedoGeometry"
+                                        @click="redo"
+                                    >
+                                        <Redo2 class="size-4" />
+                                        <span class="sr-only">Redo</span>
+                                    </Button>
+                                </span>
+                            </TooltipTrigger>
+                            <TooltipContent class="max-w-xs">
+                                <p>Redo (Ctrl+Shift+Z)</p>
+                            </TooltipContent>
+                        </Tooltip>
+                    </TooltipProvider>
+
+                    <!--
+                        The one control here that keeps its label. It is the
+                        only way into the editor and it renames itself three
+                        ways depending on state, so the glyph is a second signal
+                        rather than a replacement for it.
+                    -->
                     <Button
                         v-if="parsedGeoJson"
                         type="button"
@@ -726,6 +928,7 @@ const pageTitle = computed(
                         size="sm"
                         @click="toggleEditing"
                     >
+                        <component :is="editToggleIcon" class="size-4" />
                         {{ editToggleLabel }}
                     </Button>
                 </div>
