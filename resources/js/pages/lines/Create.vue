@@ -61,6 +61,11 @@ const {
                         @input="markDirty"
                     />
                     <InputError :message="errors.code" />
+                    <p class="text-sm text-muted-foreground">
+                        Identity, shared by both directions. A number, or a
+                        lowercase slug for a service with no number (e.g.
+                        la-guardia-nueva-terminal).
+                    </p>
                 </div>
 
                 <div class="grid gap-1">
@@ -87,6 +92,10 @@ const {
                         @input="markDirty"
                     />
                     <InputError :message="errors.name" />
+                    <p class="text-sm text-muted-foreground">
+                        What riders read on the bus. For a slug code, this is
+                        the only wording the app shows.
+                    </p>
                 </div>
 
                 <div class="grid grid-cols-2">

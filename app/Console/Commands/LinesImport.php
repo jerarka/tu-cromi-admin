@@ -25,7 +25,9 @@ use Illuminate\Support\Str;
  *     direction corrections and route edits made since.
  *   - objectid, syndicate    owned by the source. Refreshed on every run.
  *   - code, code_number,
- *     sense                  identity. Set on insert only.
+ *     sense                  identity. Set on insert only. A slug-coded line
+ *     exists only in the database, so the import never sees one and never has
+ *     anything to say about it.
  *   - parent_line_id         derived. Relinked after every run.
  *   - geom                   derived from geo_json. Only filled for new rows,
  *     because a refreshed geometry on an existing row is the one thing this
@@ -114,7 +116,7 @@ class LinesImport extends Command
             $lines[] = [
                 'objectid' => data_get($feature, 'properties.objectid'),
                 'code' => $this->code($feature),
-                'code_number' => Line::numberFromCode($this->code($feature)),
+                'code_number' => Line::sortNumber($this->code($feature)),
                 'sense' => $sense->value,
                 'syndicate' => $this->syndicate($feature),
                 'geo_json' => json_encode(Line::geometryFromSourceFeature($feature)),

@@ -616,6 +616,10 @@ const editToggleIcon = computed(() =>
                         @input="markDirty"
                     />
                     <InputError :message="errors.name" />
+                    <p class="text-sm text-muted-foreground">
+                        What riders read on the bus. For a slug code, this is
+                        the only wording the app shows.
+                    </p>
                 </div>
 
                 <!--

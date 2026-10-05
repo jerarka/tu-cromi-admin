@@ -290,6 +290,35 @@ class LineStoreTest extends TestCase
         $this->assertSame($geometry, $line->fresh()->geo_json);
     }
 
+    public function test_creating_a_numberless_line_links_both_directions_under_one_slug()
+    {
+        $this->actingAsUser();
+
+        $slug = 'la-guardia-nueva-terminal';
+
+        $this->post(route('lines.store'), [
+            'code' => $slug,
+            'sense' => LineSense::Outbound->value,
+            'name' => 'La Guardia - Nueva Terminal',
+        ])->assertRedirect(route('lines.index'));
+
+        $this->post(route('lines.store'), [
+            'code' => $slug,
+            'sense' => LineSense::Return->value,
+            'name' => 'La Guardia - Nueva Terminal',
+        ])->assertRedirect(route('lines.index'));
+
+        $outbound = Line::query()->where('code', $slug)->where('sense', LineSense::Outbound->value)->sole();
+        $return = Line::query()->where('code', $slug)->where('sense', LineSense::Return->value)->sole();
+
+        // A slug is an identity like any other code: one value per direction,
+        // paired across both of them.
+        $this->assertSame($return->id, $outbound->parent_line_id);
+        $this->assertSame($outbound->id, $return->parent_line_id);
+        $this->assertSame(Line::SORT_LAST, (int) $outbound->code_number);
+        $this->assertSame(Line::SORT_LAST, (int) $return->code_number);
+    }
+
     public function test_guests_cannot_create_a_line()
     {
         $this->post(route('lines.store'), $this->payload())

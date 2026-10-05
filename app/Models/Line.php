@@ -32,18 +32,26 @@ use Illuminate\Support\Facades\Schema;
  * lines:import respects:
  *
  *   objectid, syndicate  the source. Safe to refresh.
- *   code, code_number,
  *   sense                the source, as identity. Set on insert only.
+ *   code, code_number    the source, as identity, except for a slug code: a
+ *                        service with no number exists only in this database,
+ *                        so its code and its name both come from a human
+ *                        through the admin form. Nothing derives them, and
+ *                        lines:refresh-geometry has no source feature to match
+ *                        a slug against — which is the correct outcome, since
+ *                        there is nothing upstream to restore from.
  *   geo_json             a human, since the bootstrap. Never overwritten.
  *   name, color          a human, through the admin form. Never touched.
+ *                        For a slug-coded line, name is the rider-facing route
+ *                        name and the only wording the app should display.
  *   parent_line_id       derived. Recomputed after every import.
  *   geom                 derived from geo_json. Resynced when geo_json changes.
  *   average_rating,
  *   total_reviews        the users. Never touched.
  *
  * @property int $id Auto-increment primary key
- * @property string $code Public identifier grouping OUTBOUND and RETURN (e.g. "1", "16 azul", "104 C"). Not unique — two rows share the same code
- * @property int $code_number Derived numeric prefix of $code, used for natural ordering
+ * @property string $code Public identifier grouping OUTBOUND and RETURN (e.g. "1", "16 azul", "104 C", or a slug like "la-guardia-nueva-terminal" for a service with no number). Not unique — two rows share the same code
+ * @property int $code_number Derived sort key: the numeric prefix of $code, or Line::SORT_LAST when the code carries no number, which is what places such a route after every numbered one
  * @property string|null $name Display name (e.g. "Línea 1")
  * @property string|null $color Hex color for UI
  * @property GeoJson|null $geo_json Raw GeoJSON MultiLineString coordinates [lng, lat]. The only source of truth for which way a line travels
@@ -107,24 +115,60 @@ class Line extends Model
     /**
      * Extract the numeric prefix of a public code.
      *
-     * Codes take the form "<number>[ <suffix>]" — "1", "104 C", "22 rojo" —
-     * and ordering by that prefix as an integer is what makes "2" precede
-     * "10". The suffix needs no counterpart column: within a number a bare
-     * code is a strict prefix of the suffixed ones, so sorting by `code` after
-     * this value already places "22" before "22 rojo".
+     * A numbered code takes the form "<number>[ <suffix>]", e.g. "1", "104 C",
+     * "22 rojo". A service with no number has none, and this returns null for it
+     * rather than 0: 0 is a legal line number, and a method named after the
+     * number has no business reporting one it did not find.
      *
-     * A code with no leading digits is not expected (StoreLineRequest rejects
-     * them) but can exist in legacy data. Returning 0 keeps ordering
-     * deterministic instead of producing a NULL, which PostgreSQL and SQLite
-     * would sort in opposite directions.
+     * What to *store* for that case is sortNumber()'s problem, not this one's.
      */
-    public static function numberFromCode(string $code): int
+    public static function numberFromCode(string $code): ?int
     {
         if (preg_match('/^\d+/', trim($code), $matches) === 1) {
             return (int) $matches[0];
         }
 
-        return 0;
+        return null;
+    }
+
+    /**
+     * Sort key for a code with no number: the largest integer the column holds.
+     *
+     * A real line number cannot reach it, so nothing collides, and it is what
+     * makes the index order plain ascending `code_number`: every numbered line
+     * sorts before every numberless one, which is what a reviewer wants to see
+     * without an extra bucket in the query.
+     */
+    public const SORT_LAST = 2147483647;
+
+    /**
+     * The value stored in code_number for a code: its number, or SORT_LAST.
+     *
+     * Separated from numberFromCode() because the two answer different
+     * questions. One reports what the code says; the other reports where the
+     * line belongs in the index. Conflating them would either make the index
+     * depend on a NULL — which PostgreSQL sorts last and SQLite sorts first,
+     * so the same data would produce two different orders — or make
+     * numberFromCode() answer 2147483647 for a slug and be believed.
+     */
+    public static function sortNumber(string $code): int
+    {
+        return self::numberFromCode($code) ?? self::SORT_LAST;
+    }
+
+    /**
+     * This row's position in index order, for comparison against the columns
+     * index() sorts by.
+     *
+     * @return array<int, mixed>
+     */
+    public static function indexOrderValues(self $line): array
+    {
+        return [
+            $line->code_number,
+            $line->code,
+            $line->sense->value,
+        ];
     }
 
     /**
@@ -162,7 +206,7 @@ class Line extends Model
 
                 return [
                     'code' => $code,
-                    'code_number' => self::numberFromCode($code),
+                    'code_number' => self::sortNumber($code),
                 ];
             },
         );

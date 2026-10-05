@@ -10,8 +10,9 @@ use Illuminate\Support\Facades\DB;
  * Populate the derived code_number sort key.
  *
  * Run once after the add_sort_columns_to_lines_table migration on any database
- * that already holds line rows. Until it runs, every row has code_number = 0,
- * which makes the natural ordering collapse.
+ * that already holds line rows. Until it runs, every row carries the column
+ * default instead of a number derived from its code, which makes the natural
+ * ordering collapse into one bucket.
  *
  * New rows do not need this command: Line::create() derives the column through
  * the model mutator, and LinesImport sets it explicitly because its bulk
@@ -34,7 +35,7 @@ class LinesBackfillSortKeys extends Command
         $updates = [];
 
         foreach ($rows as $row) {
-            $number = Line::numberFromCode((string) $row->code);
+            $number = Line::sortNumber((string) $row->code);
 
             if ((int) $row->code_number === $number) {
                 continue;

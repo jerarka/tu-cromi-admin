@@ -27,12 +27,37 @@ class LineCodeSortTest extends TestCase
         $this->assertSame(5, Line::numberFromCode("5\t"));
     }
 
-    public function test_number_from_code_falls_back_for_a_code_with_no_leading_number()
+    public function test_number_from_code_reports_no_number_for_a_slug()
     {
-        // Legacy rows may predate the format check. Returning 0 keeps ordering
-        // deterministic instead of yielding a NULL, which PostgreSQL and
-        // SQLite would sort differently.
-        $this->assertSame(0, Line::numberFromCode('abc'));
+        // Null, not 0: a service with no number is a real category, and this
+        // method's job is to report what the code says, not where to sort it.
+        $this->assertNull(Line::numberFromCode('la-guardia-nueva-terminal'));
+        $this->assertNull(Line::numberFromCode('abc'));
+    }
+
+    public function test_number_from_code_still_reads_zero_as_a_real_number()
+    {
+        // The case that makes null necessary rather than merely tidy.
+        $this->assertSame(0, Line::numberFromCode('0'));
+    }
+
+    public function test_sort_number_sends_a_numberless_line_to_the_end_of_the_column()
+    {
+        // The stored key, as opposed to the reported number. It has to be the
+        // largest value the column holds so plain ascending code_number puts
+        // numberless routes last without a NULL, which PostgreSQL and SQLite
+        // would sort in opposite directions.
+        $this->assertSame(Line::SORT_LAST, Line::sortNumber('la-guardia-nueva-terminal'));
+        $this->assertSame(1, Line::sortNumber('1'));
+        $this->assertSame(22, Line::sortNumber('22 roja'));
+    }
+
+    public function test_sort_number_does_not_confuse_a_route_called_zero_with_no_number()
+    {
+        // Both are "no prefix after sorting" candidates if 0 were used as the
+        // stand-in. Here they cannot collide.
+        $this->assertSame(0, Line::sortNumber('0'));
+        $this->assertNotSame(Line::sortNumber('0'), Line::sortNumber('la-guardia-nueva-terminal'));
     }
 
     public function test_creating_a_line_derives_the_sort_key()
@@ -144,17 +169,135 @@ class LineCodeSortTest extends TestCase
         $this->assertSame(1, Line::query()->where('code', '22 rojo')->count());
     }
 
-    public function test_storing_a_code_without_a_leading_number_is_rejected()
+    public function test_a_slug_code_is_accepted_for_a_service_with_no_number()
     {
         $user = User::factory()->create();
 
         $this->actingAs($user)->post(route('lines.store'), [
-            // Letter O instead of zero — the typo this rule exists to catch.
+            'code' => 'la-guardia-nueva-terminal',
+            'sense' => LineSense::Outbound->value,
+            'name' => 'La Guardia - Nueva Terminal',
+        ])->assertRedirect(route('lines.index'));
+
+        $line = Line::query()->where('code', 'la-guardia-nueva-terminal')->sole();
+
+        $this->assertSame(Line::SORT_LAST, (int) $line->code_number);
+        $this->assertSame('La Guardia - Nueva Terminal', $line->name);
+    }
+
+    public function test_a_slug_code_is_still_unique_per_direction()
+    {
+        $user = User::factory()->create();
+
+        $payload = [
+            'code' => 'la-guardia-nueva-terminal',
+            'sense' => LineSense::Outbound->value,
+        ];
+
+        $this->actingAs($user)->post(route('lines.store'), $payload);
+        $this->actingAs($user)->post(route('lines.store'), $payload)
+            ->assertSessionHasErrors('code');
+
+        // Both senses of one slug pair are legitimate; the same sense twice is not.
+        $this->actingAs($user)->post(route('lines.store'), [
+            ...$payload,
+            'sense' => LineSense::Return->value,
+        ])->assertRedirect(route('lines.index'));
+
+        $this->assertSame(2, Line::query()->where('code', 'la-guardia-nueva-terminal')->count());
+    }
+
+    public function test_a_slug_cannot_spoof_a_numbered_code()
+    {
+        $user = User::factory()->create();
+
+        foreach (['2O rojo', 'La Guardia', 'la guardia', 'la--guardia', '-guardia', 'la-guardia-'] as $invalid) {
+            $this->actingAs($user)->post(route('lines.store'), [
+                'code' => $invalid,
+                'sense' => LineSense::Outbound->value,
+            ])->assertSessionHasErrors('code');
+        }
+
+        $this->assertSame(0, Line::query()->count());
+    }
+
+    public function test_a_slug_code_is_not_silently_normalised()
+    {
+        $user = User::factory()->create();
+
+        // The display wording goes in `name`. Slugifying what was typed into
+        // `code` would let a stray capital or trailing space create an identity
+        // nobody can predict, and two spellings of one route would then be two
+        // different lines.
+        $this->actingAs($user)->post(route('lines.store'), [
+            'code' => 'La Guardia - Nueva Terminal',
+            'sense' => LineSense::Outbound->value,
+        ])->assertSessionHasErrors('code');
+
+        $this->assertSame(0, Line::query()->count());
+    }
+
+    public function test_a_code_with_a_letter_where_a_zero_belongs_is_still_rejected()
+    {
+        $user = User::factory()->create();
+
+        $this->actingAs($user)->post(route('lines.store'), [
+            // Letter O instead of zero. It reads as a slug until you notice the
+            // space and the capital, which is exactly why the rule does not
+            // simply accept anything.
             'code' => '2O rojo',
             'sense' => LineSense::Outbound->value,
         ])->assertSessionHasErrors('code');
 
         $this->assertSame(0, Line::query()->count());
+    }
+
+    public function test_index_places_lines_with_no_number_after_the_numbered_ones()
+    {
+        $user = User::factory()->create();
+
+        foreach (['2', '1', 'la-guardia-nueva-terminal', 'el-torno-nueva-terminal'] as $code) {
+            Line::factory()->create(['code' => $code, 'sense' => LineSense::Outbound]);
+        }
+
+        $response = $this->actingAs($user)->get(route('lines.index'));
+
+        $response->assertOk();
+
+        $codes = array_map(
+            fn (array $line): string => $line['code'],
+            $response->viewData('page')['props']['lines']['data'],
+        );
+
+        // Numbered first in numeric order, then the numberless ones by code.
+        $this->assertSame([
+            '1',
+            '2',
+            'el-torno-nueva-terminal',
+            'la-guardia-nueva-terminal',
+        ], $codes);
+    }
+
+    public function test_a_line_numbered_zero_sorts_among_the_numbered_lines()
+    {
+        $user = User::factory()->create();
+
+        foreach (['2', '0', 'la-guardia-nueva-terminal'] as $code) {
+            Line::factory()->create(['code' => $code, 'sense' => LineSense::Outbound]);
+        }
+
+        $response = $this->actingAs($user)->get(route('lines.index'));
+
+        $response->assertOk();
+
+        $codes = array_map(
+            fn (array $line): string => $line['code'],
+            $response->viewData('page')['props']['lines']['data'],
+        );
+
+        // With 0 as the "no number" stand-in, "0" would have been pushed behind
+        // the slug. Null is what keeps them apart.
+        $this->assertSame(['0', '2', 'la-guardia-nueva-terminal'], $codes);
     }
 
     public function test_a_unique_index_backs_up_the_validation_rule()

@@ -68,6 +68,27 @@ class EditNavigationTest extends TestCase
         return $outbound;
     }
 
+    /**
+     * Seed a service that has no number, alongside one numbered pair.
+     *
+     * Navigation has to cross from the numbered group into the numberless one
+     * without losing its way, and that boundary is where the ordering key stops
+     * being a plain integer: a numberless row carries no code_number at all, so
+     * the row comparison in adjacent() would compare against a NULL and return
+     * nothing if the key did not substitute one.
+     */
+    private function seedNumberedPairPlusSlug(string $slug): Line
+    {
+        foreach ([LineSense::Outbound, LineSense::Return] as $sense) {
+            Line::factory()->create(['code' => '2', 'sense' => $sense]);
+        }
+
+        return Line::factory()->create([
+            'code' => $slug,
+            'sense' => LineSense::Outbound,
+        ]);
+    }
+
     private function find(string $code, LineSense $sense): Line
     {
         return Line::query()
@@ -234,6 +255,41 @@ class EditNavigationTest extends TestCase
             ->assertInertia(fn (Assert $page) => $page
                 ->component('lines/Edit')
                 ->where('counterpart', null)
+            );
+    }
+
+    public function test_next_steps_from_the_last_numbered_line_into_a_numberless_one()
+    {
+        $user = User::factory()->create();
+        $this->seedNumberedPairPlusSlug('la-guardia-nueva-terminal');
+
+        $lastNumbered = $this->find('2', LineSense::Return);
+
+        $this->actingAs($user)
+            ->get(route('lines.edit', $lastNumbered))
+            ->assertOk()
+            ->assertInertia(fn (Assert $page) => $page
+                ->component('lines/Edit')
+                ->where('nav.prev.code', '2')
+                ->where('nav.prev.sense', LineSense::Outbound->value)
+                ->where('nav.next.code', 'la-guardia-nueva-terminal')
+                ->where('nav.next.sense', LineSense::Outbound->value)
+            );
+    }
+
+    public function test_the_only_numberless_line_follows_the_last_numbered_one()
+    {
+        $user = User::factory()->create();
+        $slug = $this->seedNumberedPairPlusSlug('la-guardia-nueva-terminal');
+
+        $this->actingAs($user)
+            ->get(route('lines.edit', $slug))
+            ->assertOk()
+            ->assertInertia(fn (Assert $page) => $page
+                ->component('lines/Edit')
+                ->where('nav.prev.code', '2')
+                ->where('nav.prev.sense', LineSense::Return->value)
+                ->where('nav.next', null)
             );
     }
 

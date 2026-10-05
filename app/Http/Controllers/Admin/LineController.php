@@ -9,6 +9,7 @@ use App\Http\Requests\Line\StoreLineRequest;
 use App\Http\Requests\Line\UpdateLineRequest;
 use App\Models\Line;
 use Illuminate\Console\Command;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\DB;
@@ -22,15 +23,14 @@ class LineController extends Controller
         $search = request('search');
         $sense = request('sense');
 
-        $lines = Line::query()
+        $query = Line::query()
             ->when($search, fn ($q) => $q->where(function ($q) use ($search) {
                 $q->where('code', 'like', "%{$search}%")
                     ->orWhere('name', 'like', "%{$search}%");
             }))
-            ->when($sense, fn ($q) => $q->where('sense', $sense))
-            ->orderBy('code_number')
-            ->orderBy('code')
-            ->orderBy('sense')
+            ->when($sense, fn ($q) => $q->where('sense', $sense));
+
+        $lines = $this->applyIndexOrder($query)
             ->paginate(15)
             ->withQueryString();
 
@@ -195,15 +195,33 @@ class LineController extends Controller
     }
 
     /**
+     * Order a query the way the index lists lines.
+     *
+     * Numbered lines come first in natural numeric order — "2" precedes "10" —
+     * and a service with no number follows them, ordered by code. That needs no
+     * special handling here: Line::sortNumber() stores the largest possible integer
+     * for a code with no number, so plain ascending code_number already places
+     * those rows last. A NULL would not, because PostgreSQL sorts it last and
+     * SQLite first.
+     *
+     * @param  Builder<Line>  $query
+     * @param  'asc'|'desc'  $direction
+     * @return Builder<Line>
+     */
+    private function applyIndexOrder(Builder $query, string $direction = 'asc'): Builder
+    {
+        $query->orderBy('code_number', $direction);
+        $query->orderBy('code', $direction);
+        $query->orderBy('sense', $direction);
+
+        return $query;
+    }
+
+    /**
      * Find the line immediately before or after the given line in index order.
      *
      * The ordering must mirror index() exactly so that prev/next walk the same
-     * sequence the user sees in the table. It is natural, not lexicographic:
-     * code_number is an integer column so "2" precedes "10". The suffix needs
-     * no column — within a number a bare code is a strict prefix of the
-     * suffixed ones, so ordering by `code` next already yields "22",
-     * "22 amarillo", "22 rojo". `code` is NOT NULL, so PostgreSQL and SQLite
-     * cannot disagree on where a missing value lands.
+     * sequence the user sees in the table.
      *
      * sense is stored as a string in the database but cast to the LineSense
      * enum on the model, hence the ->value access here.
@@ -217,15 +235,13 @@ class LineController extends Controller
     {
         $ascending = $direction === 'next';
 
-        return Line::query()
-            ->whereRowValues(
+        return $this->applyIndexOrder(
+            Line::query()->whereRowValues(
                 ['code_number', 'code', 'sense'],
                 $ascending ? '>' : '<',
-                [$line->code_number, $line->code, $line->sense->value]
-            )
-            ->orderBy('code_number', $ascending ? 'asc' : 'desc')
-            ->orderBy('code', $ascending ? 'asc' : 'desc')
-            ->orderBy('sense', $ascending ? 'asc' : 'desc')
-            ->first(['id', 'code', 'sense']);
+                Line::indexOrderValues($line)
+            ),
+            $ascending ? 'asc' : 'desc'
+        )->first(['id', 'code', 'sense']);
     }
 }
