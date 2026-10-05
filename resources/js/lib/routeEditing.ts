@@ -758,6 +758,28 @@ export const PROPAGATION_MAX_ARC_METERS = 250;
  */
 export const PROPAGATION_MAX_VERTICES = 4;
 
+/**
+ * How far along the street a placement has to move the walk's cursor, in metres,
+ * before it is taken.
+ *
+ * The rule that keeps a propagation from piling points on top of each other, and
+ * the counterpart of `RELAY_MIN_SPACING_METERS` on the re-lay side. The re-lay
+ * enforces its spacing with a cursor per street; a propagation had a cursor and
+ * nothing to stop a placement landing exactly on it — which is what a clamped
+ * search does to a vertex the cursor has already passed. The gap between the two
+ * features was the whole defect: one had the protection and the other did not.
+ *
+ * A metre, where the re-lay uses ten. The two answer different questions. The
+ * re-lay's is a spacing to *reach*, because it is reshaping a stretch onto a
+ * street that may be shorter than the stretch; refusing there costs the reviewer
+ * a correction they asked for. This one is a floor below which two placements are
+ * the same point, and the cost of being generous is nil: a route with vertices a
+ * metre apart is a route that was already a metre apart, and straightening it is
+ * what the walk was asked to do. Ten would instead cut a walk short the moment the
+ * imported route got dense, leaving the very kink the feature exists to remove.
+ */
+export const PROPAGATION_MIN_ADVANCE_METERS = 1;
+
 export interface PropagationLimits {
     /**
      * Furthest a following vertex may sit from the centreline and still be
@@ -775,6 +797,15 @@ export interface PropagationLimits {
     maxArc: number;
     /** Most following vertices to consider, whatever the distances say. */
     maxVertices: number;
+    /**
+     * Least a placement has to move the cursor along the street to count.
+     *
+     * What separates a vertex from the one already placed. Without it a vertex
+     * whose projection falls outside the search window is clamped to the window's
+     * edge — which, for a vertex the cursor has already passed, is the cursor
+     * itself — and it lands on the vertex the reviewer just dragged.
+     */
+    minAdvance: number;
 }
 
 /**
@@ -790,6 +821,7 @@ export function propagationLimitsFor(threshold: number): PropagationLimits {
         maxOffset: threshold,
         maxArc: PROPAGATION_MAX_ARC_METERS,
         maxVertices: PROPAGATION_MAX_VERTICES,
+        minAdvance: PROPAGATION_MIN_ADVANCE_METERS,
     };
 }
 
@@ -917,6 +949,15 @@ function closestOnPart(
         // the wrong distance. The distance was never wrong, because it was
         // measured to the already-clamped foot — which is exactly why every test
         // that only checked a refusal passed while the cursor quietly did not.
+        //
+        // The clamp keeps the cursor inside the window and hides one thing from
+        // whoever calls this: a vertex the cursor has already passed comes back
+        // *at* the cursor rather than near it. Neither caller can see it here,
+        // because the distance is measured to the clamped foot and so reads as a
+        // comfortable distance to the centreline. Both have to notice it
+        // themselves — the re-lay through its own spacing rule, a propagation
+        // through `minAdvance` — and until the propagation grew one, it placed
+        // vertices straight on top of the dragged one.
         const t = Math.max(0, Math.min(1, projection.t));
         const chainage = from2 + t * (to2 - from2);
         const point: Position = [
@@ -1008,10 +1049,18 @@ function locateOnStreet(
  *
  * The walk is monotone. Each vertex is searched for only in the stretch ahead of
  * where the last one landed, so the route cannot be folded back along the street
- * it is already following. There is deliberately no tolerance for a vertex a
- * little behind the cursor — a route that wiggles a couple of metres has its
- * wiggling straightened, and one that genuinely doubles back is further than the
- * offset limit from anything in the window and ends the walk.
+ * it is already following.
+ *
+ * It stops at a vertex the cursor has already passed. The search clamps a
+ * projection that falls outside its window to the nearest edge, and for a vertex
+ * behind the cursor that edge is the cursor itself — so without a separate rule
+ * the vertex is laid exactly on top of the one the reviewer dragged, and the
+ * vertex after it lands there too. This used to be documented as "a route that
+ * wiggles a couple of metres has its wiggling straightened, and one that
+ * genuinely doubles back is further than the offset limit from anything in the
+ * window"; that was a claim about a guard that did not exist. What actually
+ * happened was the collapse described above, which is why the rule is a number in
+ * `PropagationLimits` rather than a sentence in a comment.
  *
  * It stops at the first vertex too far from the centreline. That vertex is the
  * route announcing it has left this street — a turn, or the end of the block —
@@ -1099,6 +1148,24 @@ export function propagateAlongStreet(
         );
 
         if (found === null || found.distance > limits.maxOffset) {
+            break;
+        }
+
+        // A placement that does not move the cursor along the street is a vertex
+        // the cursor has already passed, and it is the case the search window
+        // produces on its own: a vertex whose projection falls outside the window
+        // is clamped to the nearest edge, and for a vertex behind the cursor that
+        // edge *is* the cursor — the exact position of the vertex the reviewer
+        // dragged. The distance guard cannot see it, because distance is measured
+        // to that already-clamped foot, so a neighbour a block behind the cursor
+        // reads as being within a block of the centreline.
+        //
+        // Left alone rather than pushed forward, which is the re-lay's answer for
+        // the same pile-up. Here the vertex is announcing that the route left this
+        // street behind it, and moving it would edit a stretch nobody dragged to
+        // fix a defect the reviewer can now see. So it stops the walk, and
+        // everything past it with it.
+        if (Math.abs(found.chainage - cursor) < limits.minAdvance) {
             break;
         }
 
@@ -1905,13 +1972,18 @@ export function describeSnapTooltip(preset: SnapPreset): string {
  * Its own function because the threshold is the snap's, not propagation's: both
  * are printed from one number so the two controls cannot appear to disagree
  * about how far a vertex has to be to count as "on the street".
+ *
+ * The stopping clause is in there because "up to 4 vertices" is otherwise a
+ * promise with three ways to fall short and no way for the reviewer to tell which
+ * one happened — a walk that ended after one looks identical to a bug.
  */
 export function describePropagationTooltip(threshold: number): string {
     return (
         `A drop also pulls up to ${PROPAGATION_MAX_VERTICES} vertices either ` +
         `side of it onto that street, as long as each is within ${threshold} m ` +
-        `of it and no more than ${PROPAGATION_MAX_ARC_METERS} m along it. Hold ` +
-        'Alt on a drop to skip this along with the snap.'
+        `of it and no more than ${PROPAGATION_MAX_ARC_METERS} m along it, and ` +
+        'it stops at the first one it cannot place. Hold Alt on a drop to skip ' +
+        'this along with the snap.'
     );
 }
 

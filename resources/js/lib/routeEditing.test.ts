@@ -23,6 +23,7 @@ import {
     propagateAlongStreet,
     PROPAGATION_MAX_ARC_METERS,
     PROPAGATION_MAX_VERTICES,
+    PROPAGATION_MIN_ADVANCE_METERS,
     rangeBetween,
     RELAY_MIN_SPACING_METERS,
     relayLimitsFor,
@@ -1352,12 +1353,32 @@ describe('propagationLimitsFor', () => {
     test('takes the offset from the preset and nothing else', () => {
         // One number the reviewer calibrates, deliberately. A second setting
         // here would be a second thing to tune with no visible reason to
-        // disagree with the threshold they just chose.
+        // disagree with the threshold they just chose. The separation floor is
+        // not a setting either, and is asserted as the constant rather than a
+        // literal for the same reason the arc cap is.
         expect(propagationLimitsFor(25)).toEqual({
             maxOffset: 25,
             maxArc: PROPAGATION_MAX_ARC_METERS,
             maxVertices: PROPAGATION_MAX_VERTICES,
+            minAdvance: PROPAGATION_MIN_ADVANCE_METERS,
         });
+    });
+
+    test('does not scale the separation floor with the preset', () => {
+        // A metre is "two placements are the same point", which is a statement
+        // about geometry and not about how hard the reviewer is snapping. Had it
+        // ridden the threshold, Aggressive would have demanded ten metres and cut
+        // a walk short the moment the imported route got dense — refusing the very
+        // kinks the feature exists to remove, and harder the more the reviewer had
+        // asked for.
+        expect(
+            propagationLimitsFor(SNAP_PRESETS.subtle.threshold).minAdvance,
+        ).toBe(
+            propagationLimitsFor(SNAP_PRESETS.aggressive.threshold).minAdvance,
+        );
+        expect(
+            propagationLimitsFor(SNAP_PRESETS.subtle.threshold).minAdvance,
+        ).toBeLessThan(RELAY_MIN_SPACING_METERS);
     });
 
     test('rides the threshold when the preset changes', () => {
@@ -1502,6 +1523,148 @@ describe('propagateAlongStreet', () => {
 
         expect(result.moved).toEqual([]);
         expect(result.coordinates).toEqual(folded);
+    });
+
+    test('leaves a vertex the cursor has already passed where it is', () => {
+        // The case this feature's spacing floor exists for, and the one a reviewer
+        // reported as "it puts the vertex on the right street but drops several
+        // others on top of the one I moved".
+        //
+        // The reference sits at a street vertex, so the next route vertex shares
+        // its chainage exactly and is 11 m south of it. The search clamps the
+        // neighbour's projection — which falls on the window's trailing edge, the
+        // cursor — and hands back that point, 11 m away, which reads as a
+        // comfortable distance to the centreline. Before the floor it was taken,
+        // and the route gained a vertex at the exact position of the dragged one.
+        // The vertex after it was then taken too, on a cursor that had not moved.
+        const doubled: Coordinates = [
+            [
+                [-63.1795, CENTRELINE_LAT - 0.0001],
+                [-63.179, CENTRELINE_LAT - 0.0001],
+                // The dropped vertex, already snapped onto the centreline, at a
+                // chainage the street also has a vertex on.
+                [-63.178, CENTRELINE_LAT],
+                [-63.178, CENTRELINE_LAT - 0.0001],
+                [-63.177, CENTRELINE_LAT - 0.0001],
+            ],
+        ];
+
+        const result = walk(
+            doubled,
+            street(4),
+            1,
+            {},
+            {
+                segment: 0,
+                index: 2,
+            },
+        );
+
+        // Nothing, not the neighbour and not the one behind it: a vertex the
+        // cursor has passed is the route announcing it left this street, so the
+        // walk ends rather than editing a stretch nobody dragged.
+        expect(result.moved).toEqual([]);
+        expect(result.coordinates).toBe(doubled);
+        expect(result.coordinates[0][3]).toEqual([
+            -63.178,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+        expect(result.coordinates[0][4]).toEqual([
+            -63.177,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+    });
+
+    test('the same refusal on the way back', () => {
+        // The mirror, and it is a separate test because the window is built
+        // differently: backwards it is [cursor - maxArc, cursor], so the clamp
+        // that folds the vertex in is the *high* edge rather than the low one. A
+        // rule written only for one direction would pass the case above and leave
+        // this one collapsing.
+        const doubledBack: Coordinates = [
+            [
+                [-63.177, CENTRELINE_LAT - 0.0001],
+                [-63.178, CENTRELINE_LAT - 0.0001],
+                [-63.178, CENTRELINE_LAT],
+                [-63.1795, CENTRELINE_LAT - 0.0001],
+            ],
+        ];
+
+        const result = walk(
+            doubledBack,
+            street(4),
+            -1,
+            {},
+            {
+                segment: 0,
+                index: 2,
+            },
+        );
+
+        expect(result.moved).toEqual([]);
+        expect(result.coordinates).toBe(doubledBack);
+        expect(result.coordinates[0][1]).toEqual([
+            -63.178,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+        expect(result.coordinates[0][0]).toEqual([
+            -63.177,
+            CENTRELINE_LAT - 0.0001,
+        ]);
+    });
+
+    test('the floor is what refuses it, not the offset', () => {
+        // A vertex 21 m along the street and 11 m off it, so the two rules have
+        // different answers: the offset takes it comfortably — either foot is
+        // inside 25 m — and the floor is the only thing that can hold it back.
+        // Raising the floor therefore refuses it, and lowering it would let a
+        // placement that barely moves through, which is what the collapse above is.
+        const ahead: Coordinates = [
+            [
+                [-63.178, CENTRELINE_LAT],
+                [-63.1778, CENTRELINE_LAT - 0.0001],
+            ],
+        ];
+
+        expect(
+            walk(ahead, street(4), 1, {}, { segment: 0, index: 0 }).moved,
+        ).toEqual([{ segment: 0, index: 1 }]);
+        expect(
+            walk(
+                ahead,
+                street(4),
+                1,
+                { minAdvance: 60 },
+                { segment: 0, index: 0 },
+            ).moved,
+        ).toEqual([]);
+    });
+
+    test('a floor of zero takes the collapse back, so the number is load-bearing', () => {
+        // Not a settings test. A floor of zero restores the exact behaviour this
+        // was fixed for, which is the point: the rule is a comparison against a
+        // number, so anything that lets the number be zero lets the bug back in,
+        // and only an assertion that says so will notice if it ever is.
+        const doubled: Coordinates = [
+            [
+                [-63.178, CENTRELINE_LAT],
+                [-63.178, CENTRELINE_LAT - 0.0001],
+            ],
+        ];
+
+        const result = walk(
+            doubled,
+            street(4),
+            1,
+            { minAdvance: 0 },
+            {
+                segment: 0,
+                index: 0,
+            },
+        );
+
+        expect(result.moved).toEqual([{ segment: 0, index: 1 }]);
+        expect(result.coordinates[0][1]).toEqual([-63.178, CENTRELINE_LAT]);
     });
 
     test('stops at the first vertex too far off the centreline', () => {
