@@ -1199,6 +1199,667 @@ export function propagateAlongStreet(
 }
 
 /**
+ * A street a lay can be laid onto, as far as laying is concerned.
+ *
+ * Narrower than `StreetLookup` on purpose: a re-lay answers per point and needs
+ * the distance and the votes to decide, while a lay is handed the street the
+ * reference already snapped to and only needs to know which street it is and
+ * where it runs. Both `StreetLookup` and a drop's lookup satisfy this
+ * structurally, which is what lets the editor pass either without a conversion.
+ */
+export interface LayStreet {
+    /** The road's identity, or null when the answer did not carry one. */
+    roadId: number | null;
+    name: string | null;
+    /** The centreline, or null when the answer carried nothing usable. */
+    line: Coordinates | null;
+}
+
+/**
+ * A street the walk crossed onto, and the point on it the walk carries on from.
+ *
+ * The entry point is asked for as a position rather than as a chainage, and that
+ * is the whole reason this shape works. Two streets share exactly one node, so the
+ * walk enters the new one at one of its two ends — but a chainage is only
+ * meaningful against a named part, and a street's geometry can hold several parts
+ * with real gaps between them. Naming the point lets the client find the part with
+ * the same lookup it uses everywhere else, instead of being handed a number that
+ * silently refers to the wrong piece of road.
+ */
+export interface StreetContinuation extends LayStreet {
+    /** Where on the new street the walk continues, in this module's order. */
+    entry: Position;
+}
+
+/** Where a walk ran out of street, and which way it was going. */
+export interface StreetContinuationRequest {
+    street: LayStreet;
+    /**
+     * The point where the walk left this street, in this module's order.
+     *
+     * Where the geometry runs out, not where the reviewer pointed: a continuation
+     * is a question about the network from that node outward, and a query from
+     * anywhere else answers a different one.
+     */
+    from: Position;
+    /**
+     * Which way along the route the walk is travelling.
+     *
+     * A drop at the far end of a street is a different question from one at the
+     * near end — same position, same radius, opposite answer — and it is the
+     * sign of this that tells the server which end it is being asked about.
+     */
+    direction: PropagationDirection;
+    /**
+     * The compass bearing the walk was travelling at that point, degrees
+     * clockwise from north.
+     *
+     * Asked for rather than left to the server, because the server has no way to
+     * work it out: it holds one row per OSM way and nothing records which way a
+     * route runs along one. A route runs against a way's own node order about
+     * half the time, and the two senses of a line are separate rows, so "which
+     * way is this street going" has no answer in the data. The walk knows because
+     * it knows which direction it is walking.
+     */
+    bearing: number;
+}
+
+/**
+ * Asks what continues past the end of a street.
+ *
+ * Injected rather than imported for two reasons, and both of them about the
+ * tests. It is the only network call this feature makes, so a test can lay a
+ * stretch across two streets with a fake and assert the re-anchoring without a
+ * server; and it keeps the seam where the revision guard already is, so a stale
+ * answer is dropped by the same comparison that drops a stale snap.
+ */
+export type ContinueStreet = (
+    request: StreetContinuationRequest,
+) => Promise<StreetContinuation | null>;
+
+/**
+ * How many corners one drop may cross while laying a selection.
+ *
+ * One, and it is a cap rather than a limit because past the first corner the
+ * answer is a heuristic whose confidence falls off with every branch it might
+ * have taken: a four-way junction with the geometry the network actually has is
+ * not decidable from geometry alone. A drop that crosses one corner is a
+ * correction a reviewer can check by looking; a drop that crosses three is a
+ * 400-metre stretch they now have to inspect, which is more attention than the
+ * edit was worth and more than the save is reversible about.
+ *
+ * The alternative was to refuse any selection that turns a corner at all, which
+ * is honest and useless: a corner in the middle of a stretch is the single most
+ * common thing a route does.
+ */
+export const LAY_MAX_CROSSINGS = 1;
+
+/**
+ * How far outside a street's end a vertex may ask to be and still be placed, in
+ * metres.
+ *
+ * A millimetre, and the asymmetry is the whole reason it exists. The chainage a
+ * vertex asks for is a sum of floating-point distances, so "exactly at the end of
+ * the street" is not a representable value: a selection whose spacing works out to
+ * precisely the remaining street lands a few billionths of a metre past it and
+ * gets dropped. Dropping costs a vertex, and a vertex shifts every transfer index
+ * above it. The same comparison going the other way costs a placement a
+ * millimetre off the end of the road, which nobody can see on a map — the
+ * imported network's own vertices are three metres from the centreline on a median
+ * route.
+ *
+ * The alternative — no tolerance — is a refusal decided by the last bit of a
+ * floating-point sum, which is the one input in this feature nobody controls.
+ */
+export const LAY_EDGE_TOLERANCE_METERS = 0.001;
+
+/**
+ * How far the continuation's entry point may be from the street it claims to enter,
+ * in metres.
+ *
+ * `locateOnStreet` answers "where on this street is that point" and it answers
+ * with the nearest point on the geometry whether or not the point is anywhere near
+ * it — a projection with no distance test. That is the right behaviour for the
+ * reference, which is known to be on the centreline, and the wrong one for a
+ * continuation's entry, which is a claim that has not been checked yet.
+ *
+ * Without this bound a response naming a street twelve degrees away is accepted,
+ * the walk steps onto it, and the rest of the selection is laid out on a road in
+ * another city: no error, a plausible-looking route, and a reviewer who has to
+ * spot it by comparing against the map.
+ *
+ * Five metres is a kerb, which is what "the node these two ways share" can be
+ * worth when the two geometries come from different OSM ways and their endpoints
+ * are close rather than identical. A correct answer projects to zero.
+ */
+export const LAY_ENTRY_TOLERANCE_METERS = 5;
+
+export interface LayLimits {
+    /**
+     * Most corners the walk may cross, counted across the whole drop rather than
+     * per direction.
+     *
+     * Total, because the cost being capped is the reviewer's attention and a drop
+     * crossing a corner at each end costs twice as much to check as one crossing
+     * one. It also keeps the number of round trips after the mouseup predictable:
+     * one.
+     */
+    maxCrossings: number;
+}
+
+/**
+ * What one street did in a lay, for the message the reviewer reads.
+ *
+ * Same shape and same reason as `RelayStreetReport`: the number on screen has to
+ * be the number in the geometry. A street 480 m long that received eleven of the
+ * selection's twenty vertices has not failed, and a report that said "9 vertices
+ * dropped" without saying why would read as a bug.
+ */
+export interface LayStreetReport {
+    roadId: number | null;
+    name: string | null;
+    /** How many of the selection's vertices were placed on it. */
+    placed: number;
+    /** How far the street runs from where the walk entered it, in metres. */
+    streetMeters: number;
+}
+
+export interface LayResult {
+    coordinates: Coordinates;
+    /** Every vertex that moved, in the order the selection was laid. */
+    placed: VertexRef[];
+    /**
+     * Every vertex removed, because it asked for a chainage past the end of the
+     * way.
+     *
+     * Reported as vertices rather than silently applied, and it is the one result
+     * here that touches `line_transfers`: those rows address vertices by index, so
+     * removing one re-points every transfer above it at a different vertex. The
+     * editor marks the line as adjusted on save and `transfers:compute` has to run
+     * before a bundle ships, which is the same cost any geometry change already
+     * carries — but a reviewer who is not told which vertices went cannot undo it
+     * selectively either.
+     */
+    dropped: VertexRef[];
+    /** One entry per street used, in the order the walk reached them. */
+    streets: LayStreetReport[];
+    /** What stood between the two lookups, or why a lay cannot be applied. */
+    blocked: SelectionBlock | null;
+}
+
+/**
+ * A lay that did not happen, with the route handed back by identity.
+ *
+ * The blocked case carries a reason rather than a boolean, for the reason
+ * `describeRelayHint` does: "not enough selected" is fixed by selecting more and
+ * "crosses a segment" cannot be, and a hint that named only the first would send
+ * a reviewer off to select more vertices they already have.
+ */
+function layNothing(
+    coordinates: Coordinates,
+    blocked: SelectionBlock | null = null,
+): LayResult {
+    return {
+        coordinates,
+        placed: [],
+        dropped: [],
+        streets: [],
+        blocked,
+    };
+}
+
+/** How far a street's part runs from its own start, in metres. */
+function partLengthMeters(part: StreetPart): number {
+    return part.chainage[part.chainage.length - 1] - part.chainage[0];
+}
+
+/**
+ * Where a street's part runs out in the direction the walk is going, in this
+ * module's order and out of the metric frame.
+ *
+ * The end rather than the start, chosen by the direction of travel: a walk heading
+ * away from the reference runs off one end and a walk heading towards it runs off
+ * the other, and the continuation is a question about the node at that end. Asking
+ * from the wrong one returns a street that begins behind the route — which is a
+ * plausible-looking answer and the wrong direction entirely.
+ */
+function endOfPart(
+    part: StreetPart,
+    direction: PropagationDirection,
+    scale: number,
+): Position {
+    const edge = direction === 1 ? part.points.length - 1 : 0;
+
+    return [part.points[edge][0] / scale, part.points[edge][1]];
+}
+
+/**
+ * The compass bearing a walk leaves a street's part at, in degrees clockwise from
+ * north.
+ *
+ * The direction of the *way*, so the difference between the last two points of the
+ * part when the walk is heading away from the reference and the first two when it
+ * is heading towards it. Not the bearing of the reference to the end: that is the
+ * straight line across the street, which on a bend of more than a few degrees is
+ * not the direction the route is travelling, and the difference is what tells a
+ * continuation from the street just travelled.
+ *
+ * Null when the part cannot say — fewer than two points, which `measureStreet`
+ * already filters out, or a degenerate leg at the end, which a street's geometry
+ * does contain where a way doubles back on itself. A null costs the crossing and
+ * nothing else, which is the same outcome as a lookup that finds nothing.
+ */
+function bearingAtEnd(
+    part: StreetPart,
+    direction: PropagationDirection,
+): number | null {
+    const last = part.points.length - 1;
+    const to = direction === 1 ? last : 0;
+    const from = direction === 1 ? last - 1 : 1;
+
+    const a = part.points[from];
+    const b = part.points[to];
+
+    if (!a || !b) {
+        return null;
+    }
+
+    const east = b[0] - a[0];
+    const north = b[1] - a[1];
+
+    // atan2 rather than a quadrant table, because the frame is already metric and
+    // a bearing out of it is one call. The result is folded into [0, 360) because
+    // that is what the request documents and because a negative compass direction
+    // is a way of writing the same angle that a reader would have to translate.
+    const degrees = (Math.atan2(east, north) * 180) / Math.PI;
+
+    return ((degrees % 360) + 360) % 360;
+}
+
+/** One vertex of the selection, with where it sits along the selection. */
+interface LayStep {
+    ref: VertexRef;
+    /**
+     * Metres from the reference, signed by route direction: negative before it,
+     * positive after.
+     *
+     * The one number this feature preserves. It is measured along the selection's
+     * own path rather than as a straight line between vertices, because the point
+     * is that the spacing survives — and a stretch that turns a corner has vertices
+     * 40 m apart along the route that are 10 m apart through the air.
+     */
+    offset: number;
+}
+
+/**
+ * The selection in route order, each vertex carrying its distance from the
+ * reference along the selection's own path.
+ *
+ * A prefix sum over the span, so the total is one pass and the answer for every
+ * vertex is a subtraction rather than another walk. `distanceMeters` is used
+ * directly rather than the metric frame by hand, because it is the one function
+ * here that takes raw positions and applies the frame itself — which is exactly
+ * what this is.
+ *
+ * Null when the reference is not among the selection, which is a stale ref rather
+ * than an error: the same thing a propagation does with it, for the same reason.
+ */
+function laySteps(
+    coordinates: Coordinates,
+    selection: VertexRef[],
+    reference: VertexRef,
+): LayStep[] | null {
+    const segment = coordinates[reference.segment];
+
+    if (segment === undefined) {
+        return null;
+    }
+
+    const ordered = [...selection]
+        .filter((ref) => ref.segment === reference.segment)
+        .sort((a, b) => a.index - b.index);
+
+    // The prefix is keyed by index into `segment` and starts at the reference, so
+    // only the span between the selection's ends is ever measured.
+    const anchor = segment[reference.index];
+
+    if (!anchor) {
+        return null;
+    }
+
+    const steps: LayStep[] = [];
+
+    for (const ref of ordered) {
+        const from = Math.min(ref.index, reference.index);
+        const to = Math.max(ref.index, reference.index);
+        let walked = 0;
+
+        for (let i = from; i < to; i += 1) {
+            const a = segment[i];
+            const b = segment[i + 1];
+
+            if (!a || !b) {
+                return null;
+            }
+
+            walked += distanceMeters([a[0], a[1]], [b[0], b[1]]);
+        }
+
+        steps.push({
+            ref,
+            offset: ref.index >= reference.index ? walked : -walked,
+        });
+    }
+
+    return steps;
+}
+
+/**
+ * Lay a selected stretch of route along the street its reference vertex snapped
+ * to, keeping the spacing the selection already had.
+ *
+ * The gap this closes. A multi-vertex drag applies one rigid offset, so the
+ * reference lands on the street and the rest of the selection lands wherever the
+ * translation puts it — which for anything wider than a couple of blocks is
+ * nowhere near the network. The propagation that follows cannot repair it: it
+ * places each neighbour by its own perpendicular projection, which preserves
+ * neither spacing nor shape, and it stops at the first vertex too far off. So a
+ * reviewer dragging thirty vertices onto a street gets one vertex on it and a
+ * kink where the rest gave up.
+ *
+ * This replaces the shape of the selection with the shape of the street and keeps
+ * only the spacing. That is a deliberate trade and not a refinement of the drag:
+ * after a drop the stretch is no longer what was dragged, it is the road. The
+ * offset is what the previous step did with the drag; this is the step after it,
+ * and the reviewer asked for the road.
+ *
+ * Three rules keep it from doing damage:
+ *
+ * A vertex past the end of the way is **dropped, never clamped**. Clamping would
+ * put it at the far end of the street — the vertex teleports the length of a
+ * block, which is the worst thing this function could do and the one the previous
+ * generation of it did. Dropping is why this one can remove vertices at all, and
+ * the count is reported rather than applied quietly.
+ *
+ * Once the walk runs out of street it either crosses one corner or stops. Which
+ * one it did is in the result, because a stretch that quietly stops halfway is
+ * indistinguishable from one that quietly dropped four vertices.
+ *
+ * And the endpoints of the selection are moved like everything else. A lay has no
+ * privileged ends: the reference is where the walk starts, not a vertex held
+ * still, and holding it still would leave a gap at the exact point the reviewer
+ * aimed at.
+ *
+ * The walk never crosses a segment boundary, for the reason it never does
+ * anywhere else here: a MultiLineString's parts are not a continuation of each
+ * other, so there is no leg to measure a spacing along across one.
+ *
+ * No offset limit, and that is worth stating because every other place in this
+ * module has one. The vertices are placed at the spacing the selection already
+ * had, so the distance from each one to the street is a consequence of the shape
+ * the reviewer dragged rather than a correction being made — and a limit would
+ * reject exactly the case the feature exists for, where a whole selection is
+ * being put onto a street it was never near. What decides whether the lay happens
+ * at all is `decideSnap`, on the reference, before this runs.
+ */
+export async function laySelectionAlongStreet(
+    coordinates: Coordinates,
+    selection: VertexRef[],
+    reference: VertexRef,
+    street: LayStreet | null,
+    limits: LayLimits,
+    continueStreet?: ContinueStreet,
+): Promise<LayResult> {
+    const blocked = resampleBlock(selection);
+
+    if (blocked !== null || !street?.line) {
+        return layNothing(coordinates, blocked);
+    }
+
+    const steps = laySteps(coordinates, selection, reference);
+
+    if (steps === null || steps.length === 0) {
+        return layNothing(coordinates);
+    }
+
+    const raw = coordinates[reference.segment]?.[reference.index];
+
+    if (!raw) {
+        return layNothing(coordinates);
+    }
+
+    // Rebuilt rather than narrowed: the stored positions are plain arrays, and
+    // handing one of those to a function typed on a two-tuple is a cast that reads
+    // as if the length had been checked. It has not.
+    const referencePosition: Position = [raw[0], raw[1]];
+
+    const scale = longitudeScale(referencePosition[1]);
+    const opened = measureStreet(street.line, referencePosition[1]);
+    const start = locateOnStreet(opened, referencePosition, scale);
+
+    if (start === null) {
+        return layNothing(coordinates);
+    }
+
+    /** One street the walk is standing on, and where on it the walk stands. */
+    interface Walk {
+        street: LayStreet;
+        part: StreetPart;
+        /** Chainage on `part` the walk stands at. */
+        anchor: number;
+        /** The step offset that chainage corresponds to, so the two can be added. */
+        reached: number;
+    }
+
+    const walk: Walk = {
+        street,
+        part: start.part,
+        anchor: start.chainage,
+        reached: 0,
+    };
+
+    const streets: LayStreetReport[] = [];
+    const reportByKey = new Map<string, LayStreetReport>();
+
+    const reportFor = (on: LayStreet, part: StreetPart): LayStreetReport => {
+        // Keyed by identity where there is one and by name where there is not,
+        // because two anonymous lanes either side of a crossing are the same
+        // street only by accident, and counting one of them twice would print it
+        // twice.
+        const key = on.roadId === null ? `n:${on.name}` : `r:${on.roadId}`;
+        const existing = reportByKey.get(key);
+
+        if (existing) {
+            return existing;
+        }
+
+        const fresh: LayStreetReport = {
+            roadId: on.roadId,
+            name: on.name,
+            placed: 0,
+            streetMeters: partLengthMeters(part),
+        };
+
+        reportByKey.set(key, fresh);
+        streets.push(fresh);
+
+        return fresh;
+    };
+
+    const placements = new Map<string, Position>();
+    const placed: VertexRef[] = [];
+    const dropped: VertexRef[] = [];
+
+    const crossings = { spent: 0 };
+
+    /**
+     * Step onto the continuation of the current street, or answer false.
+     *
+     * Every way this can fail answers false and lets the caller drop the rest of
+     * that side: no callback at all, a response with no geometry, a geometry with
+     * no usable part, an entry point the new street does not contain. None of them
+     * is worth a different behaviour at the call site — the reviewer is told the
+     * vertices were dropped either way, and a corner they have to look at is
+     * better than one we guessed.
+     *
+     * The accounting that matters is `reached`. It is the step offset the walk stood
+     * at when it left this street, and it has to be that offset rather than the one
+     * that triggered the crossing: the vertex that ran out of road is asking for
+     * more than the street had, so using its offset as the walk's position would
+     * place it at the new street's entry point instead of the metres beyond it.
+     * It is derived from the chainage the walk left at, measured against the
+     * reference's own chainage on the first street, because that is the only place
+     * the two numbers are on the same scale.
+     */
+    const cross = async (direction: PropagationDirection): Promise<boolean> => {
+        if (
+            continueStreet === undefined ||
+            crossings.spent >= limits.maxCrossings
+        ) {
+            return false;
+        }
+
+        const leftAt =
+            direction === 1
+                ? partLengthMeters(walk.part)
+                : walk.part.chainage[0];
+
+        const bearing = bearingAtEnd(walk.part, direction);
+
+        if (bearing === null) {
+            return false;
+        }
+
+        const cont = await continueStreet({
+            street: walk.street,
+            from: endOfPart(walk.part, direction, scale),
+            direction,
+            bearing,
+        });
+
+        crossings.spent += 1;
+
+        if (!cont?.line) {
+            return false;
+        }
+
+        const parts = measureStreet(cont.line, referencePosition[1]);
+        const enter = locateOnStreet(parts, cont.entry, scale);
+
+        if (parts.length === 0 || enter === null) {
+            return false;
+        }
+
+        // Located rather than trusted. `locateOnStreet` projects whatever it is
+        // given onto the geometry and answers with the nearest point on it, with no
+        // distance test of its own, so an entry point from a response naming some
+        // other street entirely would be accepted and the walk would carry on
+        // there. See LAY_ENTRY_TOLERANCE_METERS for what the five metres are.
+        if (
+            metricDistance(
+                [cont.entry[0] * scale, cont.entry[1]],
+                positionAtChainage(enter.part, enter.chainage),
+            ) > LAY_ENTRY_TOLERANCE_METERS
+        ) {
+            return false;
+        }
+
+        walk.street = cont;
+        walk.part = enter.part;
+        walk.anchor = enter.chainage;
+        walk.reached = leftAt - start.chainage;
+
+        return true;
+    };
+
+    // Backwards first, for the reason the propagation does it that way: the
+    // message reads the route in the order the reviewer reads it, and the crossing
+    // budget goes to the earlier half of the selection if it goes anywhere.
+    //
+    // The reference is not in either list. It was placed by the snap, which is the
+    // step before this one and the only one the reviewer watched happen — the walk
+    // starts from it rather than moving it, and holding it still is what leaves a
+    // gap at the exact point they aimed at.
+    for (const direction of [-1, 1] as const) {
+        const ordered = steps
+            .filter((step) =>
+                direction === 1 ? step.offset > 0 : step.offset < 0,
+            )
+            .sort((a, b) =>
+                direction === 1 ? a.offset - b.offset : b.offset - a.offset,
+            );
+
+        for (const [i, step] of ordered.entries()) {
+            // Whether this vertex is still on the street the walk is on, and it is
+            // the tolerance rather than a bare comparison because the chainage
+            // asked for is a sum of float distances — see the constant for why
+            // refusing on the last bit is the expensive answer.
+            const onStreet = () => {
+                const target = walk.anchor + (step.offset - walk.reached);
+
+                return (
+                    target >= -LAY_EDGE_TOLERANCE_METERS &&
+                    target <=
+                        partLengthMeters(walk.part) + LAY_EDGE_TOLERANCE_METERS
+                );
+            };
+
+            if (!onStreet() && !(await cross(direction))) {
+                // Everything further in this direction asks for even more and the
+                // offsets only grow, so the rest of this side goes with it — each
+                // one would pay for its own refusal of the same missing street.
+                for (const rest of ordered.slice(i)) {
+                    dropped.push(rest.ref);
+                }
+
+                break;
+            }
+
+            const position = positionAtChainage(
+                walk.part,
+                walk.anchor + (step.offset - walk.reached),
+            );
+
+            placements.set(`${step.ref.segment}:${step.ref.index}`, [
+                position[0] / scale,
+                position[1],
+            ]);
+            placed.push(step.ref);
+            reportFor(walk.street, walk.part).placed += 1;
+        }
+    }
+
+    if (placed.length === 0) {
+        return { ...layNothing(coordinates), streets };
+    }
+
+    // Placements first, removals second, and the order is not interchangeable: a
+    // removal renumbers everything after it, so the placements still written in the
+    // first pass would be addressing the wrong vertices by the time they landed.
+    //
+    // One call, never a loop. `removeVertexAt` drops a whole segment when it is
+    // left with two positions, which moves the segment field of every later
+    // reference — so the second removal in such a loop would already be aimed at
+    // the wrong vertex.
+    const written = coordinates.map((part) => [...part]);
+
+    for (const [key, position] of placements) {
+        const [segIdx, pointIdx] = key.split(':').map(Number);
+        written[segIdx][pointIdx] = position;
+    }
+
+    const removal = removeVertices(written, dropped);
+
+    return {
+        coordinates: removal.coordinates,
+        placed,
+        dropped: removal.removed > 0 ? dropped : [],
+        streets,
+        blocked: null,
+    };
+}
+
+/**
  * A validated answer about one street, from either of the two lookups.
  *
  * Lives here rather than in the wire module because it is a domain shape � a
@@ -1299,13 +1960,24 @@ export interface RelayResult {
 function positionAtChainage(part: StreetPart, chainage: number): Position {
     const last = part.points.length - 2;
 
-    for (let i = 0; i < last; i++) {
+    for (let i = 0; i < last; i += 1) {
         if (chainage <= part.chainage[i + 1]) {
             return pointAtChainage(part, i, chainage);
         }
     }
 
-    return pointAtChainage(part, Math.max(0, last), part.chainage[last + 1]);
+    // The last segment, reached with the chainage as asked for rather than the
+    // segment's own end.
+    //
+    // It used to pass `part.chainage[last + 1]` here, on the reasoning that a
+    // chainage past the loop has to be past the end and clamping is the answer.
+    // The loop is `i < last`, so it never covers the last segment: a chainage
+    // anywhere inside it fell through and was answered with the end of the way.
+    // Every vertex the walk put in a street's final segment was therefore placed
+    // on its last vertex instead — three vertices on one point at the end of a
+    // block, which is the exact pile-up the spacing rules exist to prevent, and
+    // `pointAtChainage` clamps on its own so nothing is lost by asking properly.
+    return pointAtChainage(part, Math.max(0, last), chainage);
 }
 
 /**
@@ -1906,6 +2578,75 @@ export function describeResampleHint(block: SelectionBlock | null): string {
 }
 
 /**
+ * What a lay did, in the reviewer's terms.
+ *
+ * The one message in this editor that has to carry a consequence rather than a
+ * count, because a lay is the only action here that can remove a vertex. It says
+ * how many went, and it says that the line's transfers will have to be recomputed
+ * before a bundle ships — the second clause is the whole reason the first one is
+ * allowed to exist at all, and it is the sentence `lines:export-offline` does not
+ * say on its own.
+ *
+ * A lay that dropped nothing is reported as what it is, with the streets named:
+ * a reviewer who dragged thirty vertices and sees "21 placed" needs to know they
+ * are on a road and how far it runs, or the number tells them nothing about
+ * whether the result is the one they wanted.
+ */
+export function describeLay(result: LayResult): string {
+    if (result.blocked === 'too-few') {
+        return 'Nothing to lay: a single vertex stays where it is dropped.';
+    }
+
+    if (result.blocked === 'spans-segments') {
+        return 'Nothing to lay: the selection crosses a segment boundary.';
+    }
+
+    const streets = result.streets
+        .map((street) => {
+            const what = street.name ?? 'an unnamed street';
+
+            return `${street.placed} on ${what} (${formatDistance(
+                street.streetMeters,
+            )} long)`;
+        })
+        .join(', ');
+
+    const laid = `Laid ${result.placed.length} vertices along ${streets}.`;
+
+    if (result.dropped.length === 0) {
+        return `${laid} Spacing kept.`;
+    }
+
+    const dropped = ` ${result.dropped.length} past the end of the street were dropped, and this line's transfers now need transfers:compute before a bundle ships.`;
+
+    return `${laid}${dropped}`;
+}
+
+/**
+ * What a lay will do, or why it cannot be applied.
+ *
+ * The blocked case leads for the same reason it leads in the re-lay's hint: a
+ * tooltip the reviewer only reaches for because the action is unavailable has
+ * already failed if it opens by explaining what the action would do.
+ */
+export function describeLayHint(block: SelectionBlock | null): string {
+    if (block === 'too-few') {
+        return 'Select at least two vertices to lay them along a street.';
+    }
+
+    if (block === 'spans-segments') {
+        return 'A lay walks one segment, so the selection cannot cross a segment boundary.';
+    }
+
+    return (
+        'Lay the selected stretch along the street the dragged vertex lands on, ' +
+        'keeping the spacing between them and taking the shape of the street. ' +
+        'It crosses one corner if the street runs out. Hold Alt to drop it off ' +
+        'the centreline entirely.'
+    );
+}
+
+/**
  * How each preset reads to a reviewer, beside the distance it actually means.
  *
  * Kept apart from `SNAP_PRESETS` rather than folded into it: the numbers are
@@ -1967,23 +2708,33 @@ export function describeSnapTooltip(preset: SnapPreset): string {
 }
 
 /**
- * What propagation does to the vertices around a drop.
+ * What propagation does to the vertices around a drop, and what a lay does to a
+ * dragged stretch.
  *
  * Its own function because the threshold is the snap's, not propagation's: both
  * are printed from one number so the two controls cannot appear to disagree
  * about how far a vertex has to be to count as "on the street".
  *
- * The stopping clause is in there because "up to 4 vertices" is otherwise a
- * promise with three ways to fall short and no way for the reviewer to tell which
- * one happened — a walk that ended after one looks identical to a bug.
+ * Both behaviours are in here because they answer the same question — what happens
+ * to the vertices you did not grab — and they are the same question at two scales.
+ * A single dragged vertex pulls up to four neighbours each side; a dragged stretch
+ * is laid along the street at the spacing it already had. One checkbox, one
+ * tooltip, two scales: the reviewer who turns it off gets a rigid offset and
+ * nothing else at either size.
+ *
+ * The stopping clause is there because "up to 4 vertices" is otherwise a promise
+ * with three ways to fall short and no way for the reviewer to tell which one
+ * happened — a walk that ended after one looks identical to a bug.
  */
 export function describePropagationTooltip(threshold: number): string {
     return (
         `A drop also pulls up to ${PROPAGATION_MAX_VERTICES} vertices either ` +
         `side of it onto that street, as long as each is within ${threshold} m ` +
         `of it and no more than ${PROPAGATION_MAX_ARC_METERS} m along it, and ` +
-        'it stops at the first one it cannot place. Hold Alt on a drop to skip ' +
-        'this along with the snap.'
+        'it stops at the first one it cannot place. Dragging a whole stretch ' +
+        'instead lays it along the street at the spacing it already had, ' +
+        'dropping any vertex that runs past the end and crossing one corner if ' +
+        'the street stops. Hold Alt on a drop to skip this along with the snap.'
     );
 }
 

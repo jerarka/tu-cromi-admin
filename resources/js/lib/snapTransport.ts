@@ -1,11 +1,14 @@
 import { RELAY_MIN_SPACING_METERS, snapSearchRadius } from '@/lib/routeEditing';
 import type {
+    LayStreet,
     Position,
     RelayStreetReport,
     SnapOptions,
+    StreetContinuation,
     StreetLookup,
 } from '@/lib/routeEditing';
 import {
+    continuationFromResponse,
     relayLookupsFromResponse,
     snapLookupFromResponse,
     toWirePoints,
@@ -118,6 +121,18 @@ export async function lookupSnapStreets(
     points: Position[],
     options: SnapOptions,
     cookie: string,
+    /**
+     * A deadline shared with the rest of the drop's lookups, when there is more
+     * than one.
+     *
+     * Optional and defaulted so that a drop's first lookup reads as it always did,
+     * and passed only by the caller that will go on to ask for a continuation. The
+     * reason it exists at all: the timeout is per request, so two chained lookups
+     * after a mouseup would leave the reviewer looking at a committed drop for up to
+     * twice as long, and the second one is the one that has not started yet when
+     * the first has already used the budget.
+     */
+    signal: AbortSignal = AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS),
 ): Promise<SnapLookup | null> {
     // No sample means no question worth asking the server. Answering this
     // before the request is what keeps a stale vertex reference from costing a
@@ -136,7 +151,7 @@ export async function lookupSnapStreets(
                 'X-XSRF-TOKEN': csrfToken(cookie),
             },
             credentials: 'same-origin',
-            signal: AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS),
+            signal,
             body: JSON.stringify({
                 points: toWirePoints(points),
                 radius: snapSearchRadius(options),
@@ -269,5 +284,69 @@ export async function lookupRelayStreets(
         return relayLookupsFromResponse(await response.json());
     } catch {
         return [];
+    }
+}
+
+/**
+ * Ask which street continues past the end of another one.
+ *
+ * The third road lookup, and the only one whose answer is a judgement rather than a
+ * measurement: there is no graph in the table, so "what continues" is decided by
+ * where the caller says it was heading. That is why the bearing is sent rather than
+ * derived here — only the walk knows which way along the route it was going.
+ *
+ * Every failure is a null for the same reason the other two have one: the drop has
+ * already been committed, so a street that could not be asked about costs the
+ * crossing and nothing else. A street with no identity is refused rather than
+ * passed on, because without one the server cannot exclude the road the walk is
+ * leaving and would hand back the street the route is already on — a loop that
+ * never leaves the block, which looks like a working answer.
+ */
+export async function continueRoad(
+    street: LayStreet,
+    from: Position,
+    bearing: number,
+    cookie: string,
+    signal: AbortSignal = AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS),
+): Promise<StreetContinuation | null> {
+    // Asking about a street with no identity would ask the server to exclude
+    // nothing, and the answer it gives then is the street the walk is on.
+    if (street.roadId === null) {
+        return null;
+    }
+
+    try {
+        const response = await fetch(roads.continue.url(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-XSRF-TOKEN': csrfToken(cookie),
+            },
+            credentials: 'same-origin',
+            signal,
+            body: JSON.stringify({
+                road_id: street.roadId,
+                lat: from[1],
+                lng: from[0],
+                bearing,
+            }),
+        });
+
+        // 204 is the documented "nothing continues here" answer, not a failure.
+        if (response.status === 204) {
+            return null;
+        }
+
+        if (!response.ok) {
+            console.warn('Road continuation lookup failed', response.status);
+
+            return null;
+        }
+
+        return continuationFromResponse(await response.json());
+    } catch {
+        return null;
     }
 }

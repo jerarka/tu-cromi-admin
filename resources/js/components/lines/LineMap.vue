@@ -21,6 +21,7 @@ import {
     applyDeltaToSelection,
     clampRange,
     decideSnap,
+    describeLay,
     describeModeHelp,
     describeRelayHint,
     describeRemoval,
@@ -29,6 +30,8 @@ import {
     describeSelectionState,
     findClosestSegment,
     insertVertexAt,
+    LAY_MAX_CROSSINGS,
+    laySelectionAlongStreet,
     projectOnSegment,
     propagationLimitsFor,
     propagateAlongStreet,
@@ -53,11 +56,14 @@ import type {
     VertexRef,
 } from '@/lib/routeEditing';
 import {
+    continueRoad,
     describeRelay,
     describeSnap,
     lookupRelayStreets,
     lookupSnapStreets,
+    SNAP_LOOKUP_TIMEOUT_MS,
 } from '@/lib/snapTransport';
+import type { SnapLookup } from '@/lib/snapWire';
 
 const props = defineProps<{
     geoJson: {
@@ -124,10 +130,21 @@ const props = defineProps<{
 let geometryRevision = 0;
 
 const emit = defineEmits<{
+    /**
+     * The geometry changed, and `meta` says which kind of change it was.
+     *
+     * Three flags rather than one, because the parent has to treat them
+     * differently and a single field could not say what it needed to. `snap` marks
+     * a refinement of a drop the reviewer already made, so it is not a history
+     * step on its own. `propagated` counts vertices that moved and the reviewer did
+     * not drag, which makes it one. `laid` says a whole dragged stretch was laid
+     * along a street, which is one even though every vertex it moved was the
+     * reviewer's own — and which may have removed some of them.
+     */
     (
         e: 'update:geoJson',
         value: NonNullable<typeof props.geoJson>,
-        meta?: { snap?: boolean; propagated?: number },
+        meta?: { snap?: boolean; propagated?: number; laid?: boolean },
     ): void;
     /**
      * The re-space interval changed from the toolbar.
@@ -1052,16 +1069,33 @@ async function refineDropAfterSnap(
         return;
     }
 
+    // One deadline for every lookup this drop makes, not one per request. A group
+    // move can ask for the street, run out of it and ask what continues, and the
+    // timeout is per fetch — so two chained lookups would leave the reviewer
+    // looking at a committed drop for twice the budget, the second of which has
+    // not even started when the first has used it up.
+    const deadline = AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS);
+
     const found = await lookupSnapStreets(
-        snapSample(coordinates, active, reference),
+        // The reference alone once the drop is a whole stretch. The other sampled
+        // points exist to break a tie between streets at a crossing, and for a
+        // group move that tie is between streets the reviewer has just displaced by
+        // hand — voting with them is asking the drop to agree with itself. It also
+        // cannot change the answer: the reference's own distance is what decides
+        // whether any street counts.
+        active.length > 1
+            ? snapSample(coordinates, [], reference, 1)
+            : snapSample(coordinates, active, reference),
         options,
         document.cookie,
+        deadline,
     );
 
     // A newer edit landed while this was in flight. Applying the offset now
     // would drag geometry the reviewer has since moved again, by an amount
     // derived from where it used to be — so the refinement is dropped and the
-    // route stays exactly where they last put it.
+    // route stays exactly where they last put it. Checked again after the lay,
+    // which awaits its own lookups and can be outlasted the same way.
     if (geometryRevision !== revision || !found) {
         return;
     }
@@ -1077,12 +1111,47 @@ async function refineDropAfterSnap(
         decision.position[1] - dropped[1],
     ];
 
-    // The snap is applied first and the walk starts from the result, so the
+    // The snap is applied first and every walk starts from the result, so the
     // reference is already on the centreline when the cursor is placed. Doing it
-    // the other way round would start the walk from a point that is off the
-    // street and put every propagated vertex that same distance off it, which is
-    // the rigid offset this is here to replace.
+    // the other way round would start from a point that is off the street and put
+    // every vertex it places that same distance off it, which is the rigid offset
+    // this is here to replace.
     const snapped = applyDeltaToSelection(coordinates, active, offset);
+
+    // Two tools, chosen by how much was dragged, and the split is a rule rather
+    // than a preference.
+    //
+    // One vertex: the drag moved a point, and what the reviewer wants is for the
+    // route to stop kinking around it. That is the propagation's job — the
+    // neighbours get pulled onto the street and the dragged vertex keeps the
+    // position it was dropped at.
+    //
+    // Two or more: the drag moved a *shape*, and no offset can make that shape
+    // lie along a road. The lay replaces the shape with the street's and keeps the
+    // spacing, and the propagation would then be reaching for vertices the lay has
+    // already placed. Running both is not a stronger version of the same thing; it
+    // is two tools writing the same vertices.
+    //
+    // Both are gated on the same checkbox, because that checkbox already says
+    // "snap the nearby points to this street" and a lay is that decision taken for
+    // a whole selection instead of for four neighbours. A reviewer who turned it
+    // off and then drags a stretch gets a rigid offset and nothing else, which is
+    // exactly what they asked for — and without the gate they would get thirty
+    // vertices moved onto a street they had opted out of.
+    if (active.length > 1 && propagationEnabled.value) {
+        await laySelection(
+            snapped,
+            active,
+            reference,
+            found,
+            offset,
+            revision,
+            deadline,
+        );
+
+        return;
+    }
+
     const propagation = spreadAlongStreet(snapped, reference, found.line);
 
     // The markers follow the snap rather than the raw drop, so the vertex the
@@ -1107,6 +1176,85 @@ async function refineDropAfterSnap(
             coordinates: propagation.coordinates,
         },
         { snap: true, propagated: propagation.moved.length },
+    );
+    geometryRevision += 1;
+}
+
+/**
+ * Lay a dragged stretch along the street its reference vertex snapped to.
+ *
+ * The continuation lookup is wired in here rather than inside the walk because it
+ * is the walk's only network call, and the walk is a pure function: it is handed a
+ * callback and a test hands it a fake. This is the only place in the editor where
+ * two road lookups are chained, and the revision guard around it is the same one a
+ * single drop has — a second drag while the lay is in flight makes the answer
+ * describe geometry the reviewer has since moved, and applying it would move the
+ * stretch to a place nobody dropped it.
+ *
+ * A lay with nothing placed is not emitted at all. The drag's own result is
+ * already on screen and already correct as a drag; a street that turned out to
+ * have no usable geometry for it is not a reason to replace that with the drag
+ * repeated.
+ */
+async function laySelection(
+    snapped: Coordinates,
+    active: VertexRef[],
+    reference: VertexRef,
+    street: SnapLookup,
+    offset: Position,
+    revision: number,
+    deadline: AbortSignal,
+): Promise<void> {
+    const lay = await laySelectionAlongStreet(
+        snapped,
+        active,
+        reference,
+        street,
+        { maxCrossings: LAY_MAX_CROSSINGS },
+        (request) =>
+            continueRoad(
+                request.street,
+                request.from,
+                request.bearing,
+                document.cookie,
+                deadline,
+            ),
+    );
+
+    if (geometryRevision !== revision || lay.placed.length === 0) {
+        return;
+    }
+
+    // Markers by offset first, then absolutely: the drag left the whole selection
+    // where the snap put it and the lay then placed each placed vertex at its own
+    // point along the street, so the second set has to win. The vertices the lay
+    // dropped keep the marker they have for the frame before the emit lands, which
+    // the re-render then clears along with everything else.
+    moveMarkers(active, offset);
+    setMarkers(
+        new Map(
+            lay.placed.map((ref) => [
+                vertexKey(ref),
+                lay.coordinates[ref.segment][ref.index] as Position,
+            ]),
+        ),
+    );
+
+    announceSnap(describeLay(lay));
+    skipNextFitBounds = true;
+
+    // `laid` rather than a count, because what the parent needs to know is which
+    // kind of move this was and not how big it was. Every vertex a lay places was
+    // one the reviewer dragged, so counting them as "propagated" would describe a
+    // set of vertices the reviewer never touched — and it is dropping one that
+    // makes this a second move at all, which is what the history rule turns on.
+    emit(
+        'update:geoJson',
+        {
+            type: 'MultiLineString' as const,
+            coordinates: lay.coordinates,
+        },
+        { snap: true, laid: true },
     );
     geometryRevision += 1;
 }

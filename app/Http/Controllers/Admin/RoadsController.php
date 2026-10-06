@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Road\ContinueRoadRequest;
 use App\Http\Requests\Road\RelayRoadRequest;
 use App\Http\Requests\Road\SnapRoadRequest;
 use Illuminate\Http\JsonResponse;
@@ -153,7 +154,8 @@ class RoadsController extends Controller
                 ORDER BY COALESCE(v.votes, 0) DESC, b.ref_d ASC
                 LIMIT 1
             )
-            SELECT w.name,
+            SELECT w.road_id,
+                   w.name,
                    w.highway,
                    w.oneway,
                    w.votes,
@@ -172,6 +174,20 @@ class RoadsController extends Controller
         }
 
         return response()->json([
+            /**
+             * The road's own identity, and the one field this answer was missing
+             * for the longest.
+             *
+             * A drop did not need it: the position and the distance decide
+             * everything it did, and the centreline arrived with the answer so no
+             * second request was needed. Laying a *selection* along the street
+             * does need it, because when that street runs out at a corner the
+             * editor has to ask what continues — and a lookup that cannot name
+             * the street it just answered with cannot exclude it from the
+             * candidates, so the continuation returns the street the route is
+             * already on and the walk never leaves the block.
+             */
+            'road_id' => (int) $street->road_id,
             'lat' => (float) $street->lat,
             'lng' => (float) $street->lng,
             'name' => $street->name,
@@ -364,5 +380,125 @@ class RoadsController extends Controller
             ],
             $streets,
         ));
+    }
+
+    /**
+     * The street that continues past the end of another one.
+     *
+     * The third question the road lookups answer, and the only one that cannot be
+     * answered exactly, which is worth saying before the SQL: there is no graph in
+     * this table. A row is one OSM way with its geometry, a name and a highway
+     * tag, and nothing anywhere records which node a way starts or ends at. So
+     * "what continues from here" is not a lookup, it is a guess, and the honest
+     * thing is to make the guess as narrow as it can be and to say what it assumes.
+     *
+     * The guess: where would you be if you kept going? The caller sends the compass
+     * direction it was travelling — because it is the only party that knows, a
+     * route runs against a way's own node order about half the time, and the two
+     * senses of a line are separate rows — and the query projects that direction a
+     * short distance past the junction and asks which road is nearest to the
+     * result.
+     *
+     * The short distance is the parameter that decides how good the answer is, and
+     * `ContinueRoadRequest::PROBE_METERS` says why it is ten: at a corner the
+     * street being turned onto passes within a metre of the junction, so a probe
+     * ten metres ahead is about ten metres from it while the street just travelled
+     * is ten metres behind. Ordering by distance to the probe therefore prefers
+     * going straight and falls back to turning.
+     *
+     * Which is right for a route and wrong for a navigator, and that is the limit
+     * worth stating plainly: a route that doubles back on itself, or a junction
+     * where three streets leave at similar angles, can produce a street that is
+     * not the one a person would have taken. There is nothing in this table that
+     * would let the answer be better, so the reviewer looking at the map after the
+     * drop is the check — which is also why the walk is allowed to cross only one
+     * corner per drop.
+     *
+     * The road being left is excluded by id, and that exclusion is what makes this
+     * endpoint necessary rather than an extra call to `snap()`: a snap answer
+     * carries no identity, so a client that asked "what is near here" at a junction
+     * would be handed the street it is already on and would walk in a circle.
+     *
+     * `oneway` is returned but never consulted. A line's two senses are separate
+     * rows and neither is a routing constraint here — this lays geometry along a
+     * road, it does not plan a journey — so filtering on direction would refuse
+     * perfectly good continuations on any one-way street, which is a large part of
+     * the network in a city centre.
+     */
+    public function continue(ContinueRoadRequest $request): JsonResponse
+    {
+        // The roads table only exists on PostgreSQL, as in snap() and relay().
+        if (Schema::getConnection()->getDriverName() !== 'pgsql') {
+            return response()->json(null, 404);
+        }
+
+        // Bound in the order the placeholders appear in the statement, which is
+        // the order the driver matches them: the junction as lng then lat, the probe
+        // distance, the bearing it is projected along, then the road to exclude and
+        // the radius each side of the junction looks within.
+        $bindings = [
+            $request->input('lng'),
+            $request->input('lat'),
+            ContinueRoadRequest::PROBE_METERS,
+            $request->bearing(),
+            $request->roadId(),
+            $request->radius(),
+        ];
+
+        $street = DB::selectOne(
+            'WITH origin AS (
+                SELECT ST_SetSRID(ST_Point(CAST(? AS double precision), CAST(? AS double precision)), 4326) AS p
+            ),
+            probe AS (
+                SELECT ST_Project(o.p::geography, CAST(? AS double precision), radians(CAST(? AS double precision)))::geometry AS p
+                FROM origin o
+            ),
+            candidates AS (
+                SELECT r.id AS road_id, r.name, r.highway, r.oneway, r.geom,
+                       ST_Distance(r.geom::geography, o.p::geography) AS near_d,
+                       ST_Distance(r.geom::geography, pr.p::geography) AS ahead_d
+                FROM roads r
+                CROSS JOIN origin o
+                CROSS JOIN probe pr
+                WHERE r.id <> CAST(? AS integer)
+                  AND ST_DWithin(r.geom::geography, o.p::geography, ?)
+            )
+            SELECT c.road_id, c.name, c.highway, c.oneway, c.near_d, c.ahead_d,
+                   ST_Y(ST_ClosestPoint(c.geom, (SELECT p FROM origin))) AS lat,
+                   ST_X(ST_ClosestPoint(c.geom, (SELECT p FROM origin))) AS lng,
+                   ST_AsGeoJSON(c.geom) AS geometry
+            FROM candidates c
+            ORDER BY c.ahead_d ASC, c.near_d ASC, c.name ASC NULLS LAST, c.road_id ASC
+            LIMIT 1',
+            $bindings,
+        );
+
+        // 204 rather than an empty body, matching snap(): nothing continues here,
+        // which is a normal answer and not a failure.
+        if ($street === null) {
+            return response()->json(null, 204);
+        }
+
+        return response()->json([
+            'road_id' => (int) $street->road_id,
+            'name' => $street->name,
+            'highway' => $street->highway,
+            /**
+             * The raw OSM token, exactly as on the other two lookups. See snap()
+             * for why casting it to a bool would report every road as one-way.
+             */
+            'oneway' => $street->oneway,
+            'distance_m' => (float) $street->near_d,
+            /**
+             * Where the walk enters the new street: the point on it nearest to the
+             * junction, which is the shared node. Sent as an explicit entry rather
+             * than left for the client to derive, because deriving it means
+             * projecting onto a geometry that can hold several parts with real gaps
+             * between them and guessing which part a chainage refers to.
+             */
+            'lat' => (float) $street->lat,
+            'lng' => (float) $street->lng,
+            'geometry' => json_decode($street->geometry, true),
+        ]);
     }
 }

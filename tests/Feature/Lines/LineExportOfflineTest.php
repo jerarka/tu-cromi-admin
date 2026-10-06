@@ -341,6 +341,115 @@ class LineExportOfflineTest extends TestCase
             ->run();
     }
 
+    public function test_a_hand_corrected_line_with_computed_transfers_warns()
+    {
+        Storage::fake('local');
+
+        $line = Line::factory()->create([
+            'geo_json' => self::geometry(self::points()),
+            'geometry_adjusted' => true,
+        ]);
+
+        LineTransfer::factory()->create([
+            'line_a_id' => $line->id,
+            'line_b_id' => Line::factory()->create()->id,
+        ]);
+
+        $this->fakeDartCli();
+
+        // `geometry_adjusted` is set by every geometry save in the editor, and
+        // several of those tools remove vertices — a re-spacing rewrites the
+        // interior of a selection, and laying a dragged stretch along a street
+        // drops whatever runs past the end of it. `line_transfers` addresses
+        // vertices by index, so the published indexes now describe different
+        // pairs of points, and this is the sentence that says so before they
+        // reach riders.
+        //
+        // One substring per test rather than two here: each expectation matches a
+        // single `doWrite` call, so two substrings drawn from the same warning
+        // cannot both be satisfied — the framework gives the write to one of them.
+        $this->artisan('lines:export-offline', [
+            '--data-version' => 6,
+            '--path' => self::BUNDLE_PATH,
+        ])->expectsOutputToContain('hold point indexes that no longer describe the geometry')
+            ->assertSuccessful()
+            ->run();
+    }
+
+    public function test_the_stale_transfer_warning_says_what_to_do_about_it()
+    {
+        Storage::fake('local');
+
+        $line = Line::factory()->create([
+            'geo_json' => self::geometry(self::points()),
+            'geometry_adjusted' => true,
+        ]);
+
+        LineTransfer::factory()->create([
+            'line_a_id' => $line->id,
+            'line_b_id' => Line::factory()->create()->id,
+        ]);
+
+        $this->fakeDartCli();
+
+        // A warning with no instruction is a note. This one names the command and
+        // says what shipping without it costs, because the alternative to running
+        // it is a decision somebody has to make on purpose.
+        $this->artisan('lines:export-offline', [
+            '--data-version' => 6,
+            '--path' => self::BUNDLE_PATH,
+        ])->expectsOutputToContain('Re-run transfers:compute')
+            ->assertSuccessful()
+            ->run();
+    }
+
+    public function test_an_uncorrected_line_does_not_warn_about_stale_transfers()
+    {
+        Storage::fake('local');
+
+        $line = Line::factory()->create([
+            'geo_json' => self::geometry(self::points()),
+        ]);
+
+        LineTransfer::factory()->create([
+            'line_a_id' => $line->id,
+            'line_b_id' => Line::factory()->create()->id,
+        ]);
+
+        $this->fakeDartCli();
+
+        // The warning costs a line the reviewer never edited nothing, and a
+        // preflight that fires on every clean run is a preflight people learn
+        // to skip past.
+        $this->artisan('lines:export-offline', [
+            '--data-version' => 6,
+            '--path' => self::BUNDLE_PATH,
+        ])->doesntExpectOutputToContain('hold point indexes that no longer describe the geometry')
+            ->assertSuccessful()
+            ->run();
+    }
+
+    public function test_a_corrected_line_with_no_computed_transfers_does_not_warn()
+    {
+        Storage::fake('local');
+
+        // Nothing to be stale about. `transfers:compute` has not run for this
+        // line yet, so there is nothing recomputing would change.
+        Line::factory()->create([
+            'geo_json' => self::geometry(self::points()),
+            'geometry_adjusted' => true,
+        ]);
+
+        $this->fakeDartCli();
+
+        $this->artisan('lines:export-offline', [
+            '--data-version' => 6,
+            '--path' => self::BUNDLE_PATH,
+        ])->doesntExpectOutputToContain('hold point indexes that no longer describe the geometry')
+            ->assertSuccessful()
+            ->run();
+    }
+
     public function test_the_preflight_runs_before_the_dump()
     {
         Storage::fake('local');

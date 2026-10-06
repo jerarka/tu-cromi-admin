@@ -2,6 +2,7 @@ import type {
     Coordinates,
     Position,
     SnapCandidate,
+    StreetContinuation,
     StreetLookup,
 } from '@/lib/routeEditing';
 
@@ -24,6 +25,17 @@ import type {
 
 /** What `POST /roads/snap` sends and receives. */
 export interface SnapWireResponse {
+    /**
+     * The chosen street's identity.
+     *
+     * Read leniently into a nullable field rather than required, because a
+     * response without it is still a complete snap: the position and the distance
+     * decide the drop on their own. What it costs is the one thing a snap cannot
+     * do — hand the street to a continuation lookup at a corner, which has to
+     * exclude the street the route is already on and cannot do that without an id
+     * to compare.
+     */
+    road_id: number;
     lat: number;
     lng: number;
     name: string | null;
@@ -82,6 +94,15 @@ function isFiniteNumber(value: unknown): value is number {
  */
 export interface SnapLookup {
     candidate: SnapCandidate;
+    /**
+     * Which street was chosen, or null when the answer did not say.
+     *
+     * Carried beside the centreline rather than inside it, because the two answer
+     * different questions: the geometry is what the route is laid onto, and this
+     * is what the editor needs to name when it runs out of it. Nullable for the
+     * reason on the wire field — nothing about the drop depends on it.
+     */
+    roadId: number | null;
     name: string | null;
     votes: number;
     samples: number;
@@ -201,6 +222,7 @@ export function snapLookupFromResponse(data: unknown): SnapLookup | null {
         // Back to the module's own order. This is the line that would mirror
         // every vertex in the route if the two fields were ever swapped.
         candidate: { position: [lng, lat], distance },
+        roadId: isFiniteNumber(response.road_id) ? response.road_id : null,
         name: typeof response.name === 'string' ? response.name : null,
         votes: isFiniteNumber(response.votes) ? response.votes : 0,
         samples: isFiniteNumber(response.samples) ? response.samples : 0,
@@ -287,4 +309,66 @@ export function relayLookupsFromResponse(data: unknown): StreetLookup[] {
     }
 
     return found;
+}
+
+/** What `POST /roads/continue` receives. */
+export interface ContinueWireResponse {
+    road_id: number;
+    name: string | null;
+    highway: string | null;
+    /** The raw OSM token, as on a drop. Never a boolean; 'no' is truthy. */
+    oneway: string | null;
+    distance_m: number;
+    lat: number;
+    lng: number;
+    geometry: unknown;
+}
+
+/**
+ * A validated answer about the street that continues past another one.
+ *
+ * Road, position and geometry are all required here, which is stricter than a
+ * drop's answer and for a different reason. A drop can lose its street and still
+ * be a complete snap, because the position and the distance already decided the
+ * edit. A continuation has nothing else to offer: with no road there is no
+ * exclusion, and with no entry point the walk would be told to carry on at a place
+ * on the geometry that it cannot locate — so the whole answer is refused.
+ *
+ * The entry point is read in the module's order like every other position here,
+ * and it is the field this whole endpoint exists to deliver. Getting it backwards
+ * puts the walk's continuation at the wrong end of the street, which is a correct
+ * street and a route that jumps to the wrong place.
+ */
+export function continuationFromResponse(
+    data: unknown,
+): StreetContinuation | null {
+    if (typeof data !== 'object' || data === null) {
+        return null;
+    }
+
+    const response = data as Partial<ContinueWireResponse>;
+
+    if (
+        !isFiniteNumber(response.road_id) ||
+        !isFiniteNumber(response.lat) ||
+        !isFiniteNumber(response.lng)
+    ) {
+        return null;
+    }
+
+    const line = snapLineFromGeometry(response.geometry);
+
+    // A response with no usable centreline is not a continuation. Handing one back
+    // with a null line would cost the caller a walk that starts from a position it
+    // cannot follow, and the walk already treats a missing line as "no crossing".
+    if (line === null) {
+        return null;
+    }
+
+    return {
+        roadId: response.road_id,
+        name: typeof response.name === 'string' ? response.name : null,
+        line,
+        entry: [response.lng, response.lat],
+    };
 }

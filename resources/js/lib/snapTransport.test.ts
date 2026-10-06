@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { SNAP_PRESETS } from '@/lib/routeEditing';
-import type { Position } from '@/lib/routeEditing';
+import type { LayStreet, Position } from '@/lib/routeEditing';
 import type { SnapLookup } from '@/lib/snapWire';
 import {
     SNAP_LOOKUP_TIMEOUT_MS,
+    continueRoad,
     csrfToken,
     describeRelay,
     describeSnap,
@@ -53,6 +54,7 @@ describe('describeSnap', () => {
         name: string | null = 'Avenida Siempre Viva',
     ): SnapLookup => ({
         candidate: { position: [0, 0], distance: 1 },
+        roadId: 1,
         name,
         votes,
         samples,
@@ -294,6 +296,18 @@ describe('lookupSnapStreets', () => {
         expect(signal).toBeInstanceOf(AbortSignal);
         expect(SNAP_LOOKUP_TIMEOUT_MS).toBeGreaterThan(0);
     });
+
+    test('carries the deadline it is given, so a chain shares one budget', async () => {
+        // A group move can look up the street and then ask what continues at the
+        // corner. Two chained fetches with per-request timeouts leave the reviewer
+        // watching a committed drop for twice the budget, and the second fetch has
+        // not started when the first has used it up.
+        const deadline = new AbortController().signal;
+
+        await lookupSnapStreets(points, options, 'XSRF-TOKEN=t', deadline);
+
+        expect(fetchMock.mock.calls[0][1].signal).toBe(deadline);
+    });
 });
 
 describe('describeRelay', () => {
@@ -505,5 +519,173 @@ describe('lookupRelayStreets', () => {
     test('asks about nothing without spending a request', async () => {
         expect(await lookupRelayStreets([], options, '')).toEqual([]);
         expect(fetchMock).not.toHaveBeenCalled();
+    });
+});
+
+describe('continueRoad', () => {
+    const street: LayStreet = {
+        roadId: 42,
+        name: 'Avenida Siempre Viva',
+        line: [
+            [
+                [-63.18, -17.78],
+                [-63.179, -17.78],
+            ],
+        ],
+    };
+
+    const from: Position = [-63.179, -17.78];
+
+    const body = {
+        road_id: 77,
+        name: 'Calle Sin Nombre',
+        highway: 'residential',
+        oneway: 'no',
+        distance_m: 0.8,
+        lat: -17.78,
+        lng: -63.179,
+        geometry: {
+            type: 'MultiLineString',
+            coordinates: [
+                [
+                    [-63.179, -17.78],
+                    [-63.178, -17.78],
+                ],
+            ],
+        },
+    };
+
+    const response = (status: number, payload: unknown = body): Response =>
+        ({
+            status,
+            ok: status >= 200 && status < 300,
+            json: async () => payload,
+        }) as Response;
+
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        fetchMock = vi.fn().mockResolvedValue(response(200));
+        vi.stubGlobal('fetch', fetchMock);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    const call = (
+        over: Partial<{
+            street: LayStreet;
+            from: Position;
+            bearing: number;
+            cookie: string;
+            signal: AbortSignal;
+        }> = {},
+    ) =>
+        continueRoad(
+            over.street ?? street,
+            over.from ?? from,
+            over.bearing ?? 90,
+            over.cookie ?? 'XSRF-TOKEN=t',
+            over.signal,
+        );
+
+    test('returns the street that continues, with its entry point', async () => {
+        const found = await call();
+
+        expect(found?.roadId).toBe(77);
+        expect(found?.entry).toEqual([-63.179, -17.78]);
+        expect(found?.line).toHaveLength(1);
+    });
+
+    test('sends the road it is leaving, the junction and the bearing', async () => {
+        // The bearing is the whole question, and it is the client's to answer: the
+        // server holds one row per way with no record of which way a route runs
+        // along it, and the two senses of a line are separate rows.
+        await call({ from: [-63.179, -17.78], bearing: 275 });
+
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+            road_id: 42,
+            lat: -17.78,
+            lng: -63.179,
+            bearing: 275,
+        });
+    });
+
+    test('sends the junction as lat and lng, not as an array', async () => {
+        // The wire convention is the one the other two lookups use, and the
+        // endpoint reads named fields — an array here validates as nothing and the
+        // junction arrives as zero.
+        await call();
+
+        const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+
+        expect(body.lat).toBeCloseTo(-17.78, 9);
+        expect(body.lng).toBeCloseTo(-63.179, 9);
+    });
+
+    test('refuses to ask about a street with no identity', () => {
+        // Without an id to exclude, the server answers with the street the walk is
+        // already on and the walk goes in a circle — a correct-looking answer and a
+        // crossing that never leaves the block. Cheaper to not ask.
+        return call({ street: { ...street, roadId: null } }).then((found) => {
+            expect(found).toBeNull();
+            expect(fetchMock).not.toHaveBeenCalled();
+        });
+    });
+
+    test('treats 204 as nothing continuing, which is a normal answer', async () => {
+        fetchMock.mockResolvedValue(response(204));
+
+        expect(await call()).toBeNull();
+    });
+
+    test('warns about a broken lookup rather than swallowing it', async () => {
+        // A 419 here means continuations are not working at all, and it would
+        // otherwise be indistinguishable from a route that never turns a corner.
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        fetchMock.mockResolvedValue(response(419));
+
+        expect(await call()).toBeNull();
+        expect(warn).toHaveBeenCalledWith(
+            'Road continuation lookup failed',
+            419,
+        );
+    });
+
+    test('survives a body that is not a continuation', async () => {
+        fetchMock.mockResolvedValue(response(200, { road_id: 77 }));
+
+        expect(await call()).toBeNull();
+    });
+
+    test('survives the request failing outright', async () => {
+        fetchMock.mockRejectedValue(new Error('offline'));
+
+        expect(await call()).toBeNull();
+    });
+
+    test('carries the deadline it is given, so the chain shares one budget', async () => {
+        const deadline = new AbortController().signal;
+
+        await call({ signal: deadline });
+
+        expect(fetchMock.mock.calls[0][1].signal).toBe(deadline);
+    });
+
+    test('carries a deadline of its own when it is given none', async () => {
+        await call({ signal: undefined });
+
+        expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    });
+
+    test('attaches the CSRF token, without which the lookup is a silent 419', async () => {
+        await call({ cookie: 'XSRF-TOKEN=tok123' });
+
+        expect(fetchMock.mock.calls[0][1].headers['X-XSRF-TOKEN']).toBe(
+            'tok123',
+        );
     });
 });

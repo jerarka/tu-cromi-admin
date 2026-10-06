@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
+    continuationFromResponse,
     relayLookupsFromResponse,
     snapLineFromGeometry,
     snapLookupFromResponse,
@@ -42,6 +43,7 @@ describe('toWirePoints', () => {
 
 describe('snapLookupFromResponse', () => {
     const response = {
+        road_id: 4213,
         lat: -17.78,
         lng: -63.18,
         name: 'Avenida Siempre Viva',
@@ -65,11 +67,54 @@ describe('snapLookupFromResponse', () => {
     test('carries the name and the vote counts through', () => {
         expect(snapLookupFromResponse(response)).toEqual({
             candidate: { position: [-63.18, -17.78], distance: 3.5 },
+            roadId: 4213,
             name: 'Avenida Siempre Viva',
             votes: 4,
             samples: 7,
             line: null,
         });
+    });
+
+    test('carries the street identity, which is what a corner lookup needs', () => {
+        // Without it the editor cannot ask what continues past the end of this
+        // street, because it cannot exclude this street from the candidates and
+        // the continuation comes back as the way the route is already on.
+        expect(snapLookupFromResponse(response)?.roadId).toBe(4213);
+    });
+
+    test('a response with no street identity is still a usable snap', () => {
+        // Read leniently on purpose, like the vote counts: the position and the
+        // distance decide the drop on their own, so a missing id costs the
+        // crossing at a corner and nothing about the edit.
+        const lookup = snapLookupFromResponse({
+            lat: response.lat,
+            lng: response.lng,
+            name: response.name,
+            highway: response.highway,
+            oneway: response.oneway,
+            distance_m: response.distance_m,
+            votes: response.votes,
+            samples: response.samples,
+        });
+
+        expect(lookup?.roadId).toBeNull();
+        expect(lookup?.candidate.position).toEqual([-63.18, -17.78]);
+        expect(lookup?.candidate.distance).toBe(3.5);
+    });
+
+    test('a street identity that is not a number reads as absent, not as a road', () => {
+        // The failure this has to avoid is a NaN or 0 travelling into a query
+        // that excludes roads by id, where it would silently exclude nothing.
+        expect(
+            snapLookupFromResponse({ ...response, road_id: null })?.roadId,
+        ).toBeNull();
+        expect(
+            snapLookupFromResponse({ ...response, road_id: Number.NaN })
+                ?.roadId,
+        ).toBeNull();
+        expect(
+            snapLookupFromResponse({ ...response, road_id: '4213' })?.roadId,
+        ).toBeNull();
     });
 
     test('carries the street geometry through, in the module order', () => {
@@ -485,5 +530,105 @@ describe('relayLookupsFromResponse', () => {
         // why an empty list rather than a null: it leaves the selection alone,
         // which is the right outcome for a lookup that cannot run.
         expect(relayLookupsFromResponse(null)).toEqual([]);
+    });
+});
+
+describe('continuationFromResponse', () => {
+    const geometry = {
+        type: 'MultiLineString',
+        coordinates: [
+            [
+                [-63.18, -17.78],
+                [-63.179, -17.78],
+            ],
+        ],
+    };
+
+    const response = {
+        road_id: 77,
+        name: 'Calle Sin Nombre',
+        highway: 'residential',
+        oneway: 'no',
+        distance_m: 1.2,
+        lat: -17.78,
+        lng: -63.18,
+        geometry,
+    };
+
+    test('reads the entry point in the module order, which is the whole answer', () => {
+        const continuation = continuationFromResponse(response);
+
+        // This is the field the endpoint exists to deliver, and a transpose is
+        // silent: the walk would carry on at the wrong end of a correct street,
+        // which draws a route that jumps across the block rather than turning.
+        expect(continuation?.entry).toEqual([-63.18, -17.78]);
+        expect(continuation?.roadId).toBe(77);
+        expect(continuation?.name).toBe('Calle Sin Nombre');
+    });
+
+    test('carries the street geometry through, in the module order', () => {
+        expect(continuationFromResponse(response)?.line).toEqual([
+            [
+                [-63.18, -17.78],
+                [-63.179, -17.78],
+            ],
+        ]);
+    });
+
+    test('an unnamed street is named as such rather than dropped', () => {
+        // Most of this network has no name, and a continuation is exactly as true
+        // of an unnamed lane as of a named one.
+        expect(
+            continuationFromResponse({ ...response, name: null })?.name,
+        ).toBeNull();
+    });
+
+    test('a response with no geometry is not a continuation at all', () => {
+        // Stricter than a drop's answer on purpose. A drop can lose its street and
+        // still be complete, because the position already decided the edit; here
+        // there is nothing else to offer, and a walk handed a position it cannot
+        // follow would lay the rest of a selection onto nothing.
+        expect(
+            continuationFromResponse({ ...response, geometry: null }),
+        ).toBeNull();
+        expect(
+            continuationFromResponse({
+                ...response,
+                geometry: { type: 'Polygon', coordinates: [] },
+            }),
+        ).toBeNull();
+        expect(
+            continuationFromResponse({ ...response, geometry: [[[0, 0]]] }),
+        ).toBeNull();
+    });
+
+    test('without a road there is nothing to exclude, so there is no continuation', () => {
+        // The failure this prevents is quiet and looks like a working answer: the
+        // server is asked what continues from a junction without being told which
+        // street it is leaving, hands back that same street, and the walk crosses
+        // onto the road it was already on and goes in a circle.
+        expect(
+            continuationFromResponse({ ...response, road_id: null }),
+        ).toBeNull();
+    });
+
+    test('rejects an entry point it cannot use', () => {
+        for (const broken of [
+            { lat: null },
+            { lng: null },
+            { lat: Number.NaN },
+            { lng: Number.POSITIVE_INFINITY },
+            { lat: '0' },
+        ]) {
+            expect(
+                continuationFromResponse({ ...response, ...broken }),
+            ).toBeNull();
+        }
+    });
+
+    test('rejects things that are not responses at all', () => {
+        for (const junk of [null, undefined, {}, 'street', 42, []]) {
+            expect(continuationFromResponse(junk)).toBeNull();
+        }
     });
 });

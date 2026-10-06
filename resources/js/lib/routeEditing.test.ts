@@ -4,6 +4,8 @@ import {
     clampRange,
     decideSnap,
     describeRelayHint,
+    describeLay,
+    describeLayHint,
     describeModeHelp,
     describeRemoval,
     describePropagationTooltip,
@@ -16,7 +18,9 @@ import {
     distanceMeters,
     findClosestSegment,
     formatDistance,
+    LAY_MAX_CROSSINGS,
     insertVertexAt,
+    laySelectionAlongStreet,
     longitudeScale,
     projectOnSegment,
     propagationLimitsFor,
@@ -44,11 +48,17 @@ import {
     verticesWithinBounds,
 } from './routeEditing';
 import type {
+    ContinueStreet,
     Coordinates,
+    LayLimits,
+    LayResult,
+    LayStreet,
+    LayStreetReport,
     Position,
     PropagationDirection,
     PropagationLimits,
     RelayLimits,
+    StreetContinuationRequest,
     StreetLookup,
     VertexRef,
 } from './routeEditing';
@@ -1904,6 +1914,595 @@ describe('propagateAlongStreet', () => {
     });
 });
 
+/**
+ * Fixtures for the lay, in Santa Cruz at about -17.78 again.
+ *
+ * The street runs east in whole thousandths of a degree and the selection in
+ * three-eighths of one, so a street vertex is at 106 m and a selection leg about
+ * 40 m. That is not tidiness: it keeps the two incommensurable, so no chainage a
+ * vertex asks for ever lands exactly on the start or the end of a street and no
+ * assertion below is decided by the last bit of a float sum. A fixture that puts a
+ * target on the threshold is a case this project has already been bitten by once,
+ * where `straight(10, 20)` produced a gap of exactly 100 m and the outcome came
+ * down to 100.0001.
+ *
+ * `withReference` builds a selection whose legs are all identical AND whose
+ * reference sits exactly on the centreline, which is the state the snap leaves
+ * behind. Building it by overwriting one vertex's latitude instead — which is how
+ * this started — silently changes the legs either side of it, and a lopsided
+ * selection makes the feature look broken for a reason that is in the fixture.
+ *
+ * Nothing is asserted as a rounded figure. Expected spacings are measured with the
+ * same `distanceMeters` the walk uses, so a test cannot pass on a rounding error
+ * or fail on a latitude.
+ */
+describe('laySelectionAlongStreet', () => {
+    const LAT = -17.78;
+    const STEP = 0.000375;
+
+    /**
+     * A single-part street of `segments` 106 m legs.
+     *
+     * It starts a whole segment WEST of `withReference`'s default reference, so
+     * the reference lands one segment in rather than on the street's first
+     * vertex — where a drop of the selection behind it would ask for a negative
+     * chainage and half the fixture would be a refusal instead of a placement.
+     */
+    const street = (segments: number, from = -63.181): Coordinates => [
+        Array.from({ length: segments + 1 }, (_, i) => [from + i * 0.001, LAT]),
+    ];
+
+    /** Metres per whole thousandth of a degree at this latitude. */
+    const perDeg = distanceMeters([-63.18, LAT], [-63.179, LAT]);
+
+    /** Metres between two positions: the number the feature preserves. */
+    const metres = (a: number[], b: number[]): number =>
+        distanceMeters([a[0], a[1]], [b[0], b[1]]);
+
+    /**
+     * Two distances agree to the millimetre.
+     *
+     * Its own assertion because every spacing in this block is a chainage walked
+     * along a street and read back through an interpolation, and the two numbers
+     * differ in the eighth decimal for that reason alone. `toBeCloseTo`'s digit
+     * count would have to be spelled out at every call site and would read as
+     * "six significant figures" rather than as a tolerance anyone chose; a
+     * millimetre is a real distance that a reviewer cannot see on a map.
+     */
+    const expectMetres = (actual: number, expected: number): void => {
+        expect(Math.abs(actual - expected)).toBeLessThanOrEqual(0.001);
+    };
+
+    /**
+     * A selection of `count` vertices a leg apart, all 11 m south of the
+     * centreline except the one at `index`, which is on it.
+     */
+    const withReference = (
+        count: number,
+        index: number,
+        from = -63.18,
+    ): Coordinates => [
+        Array.from({ length: count }, (_, i) => [
+            from + (i - index) * STEP,
+            i === index ? LAT : LAT - 0.0001,
+        ]),
+    ];
+
+    /** The street as the editor hands it over: an id, a name and a centreline. */
+    const asStreet = (
+        line: Coordinates | null,
+        roadId: number | null = 1,
+    ): LayStreet => ({ roadId, name: 'Avenida Siempre Viva', line });
+
+    const limits = (over: Partial<LayLimits> = {}): LayLimits => ({
+        maxCrossings: 0,
+        ...over,
+    });
+
+    /** The whole route selected, which is what a box gesture hands over. */
+    const everything = (route: Coordinates): VertexRef[] =>
+        route[0].map((_, index) => ({ segment: 0, index }));
+
+    const lay = (
+        route: Coordinates,
+        streetGeometry: Coordinates | null = street(6),
+        over: Partial<LayLimits> = {},
+        reference: VertexRef = { segment: 0, index: 2 },
+        cont?: ContinueStreet,
+    ) =>
+        laySelectionAlongStreet(
+            route,
+            everything(route),
+            reference,
+            asStreet(streetGeometry),
+            limits(over),
+            cont,
+        );
+
+    test('lays the selection onto the street at the spacing it already had', async () => {
+        // The case the feature exists for. Four vertices a leg apart and 11 m south
+        // of the centreline come back on the centreline, still a leg apart — the
+        // shape is the street's, the spacing is the selection's.
+        const route = withReference(5, 2);
+
+        const result = await lay(route);
+
+        expect(result.blocked).toBeNull();
+        expect(result.dropped).toEqual([]);
+        // Backwards before forwards, which is the order the message reads in.
+        expect(result.placed).toEqual([
+            { segment: 0, index: 1 },
+            { segment: 0, index: 0 },
+            { segment: 0, index: 3 },
+            { segment: 0, index: 4 },
+        ]);
+
+        for (const index of [0, 1, 3, 4]) {
+            expect(result.coordinates[0][index][1]).toBeCloseTo(LAT, 9);
+        }
+
+        // The spacing, measured rather than asserted as a literal.
+        expectMetres(
+            metres(result.coordinates[0][0], result.coordinates[0][1]),
+            metres(route[0][0], route[0][1]),
+        );
+        expectMetres(
+            metres(result.coordinates[0][3], result.coordinates[0][4]),
+            metres(route[0][3], route[0][4]),
+        );
+    });
+
+    test('leaves the reference exactly where the snap put it', async () => {
+        // It is not in `placed` and it did not move. The snap is the step the
+        // reviewer watched happen, and the walk starts from it rather than
+        // re-deriving where it should be.
+        const result = await lay(withReference(5, 2));
+
+        expect(result.placed).not.toContainEqual({ segment: 0, index: 2 });
+        expect(result.dropped).toEqual([]);
+        expect(result.coordinates[0][2]).toEqual([-63.18, LAT]);
+    });
+
+    test('drops a vertex past the end of the street instead of clamping it', async () => {
+        // The catastrophic case, and the reason this function can remove vertices
+        // at all. A clamped placement would put these at the far end of the street
+        // — having teleported past the block they were dropped beside, onto a piece
+        // of road the selection never covered.
+        const result = await lay(
+            withReference(7, 3),
+            street(2, -63.181),
+            {},
+            {
+                segment: 0,
+                index: 3,
+            },
+        );
+
+        // In walk order, not index order: the backward side is walked outwards
+        // first, so index 1 is reached before index 0. Reading this as a set of
+        // dropped positions rather than a sequence is what the reviewer's message
+        // needs and is not what the walk produces.
+        expect(result.dropped).toEqual([
+            { segment: 0, index: 0 },
+            { segment: 0, index: 6 },
+        ]);
+
+        // Five of seven left, spread along the street at the selection's spacing
+        // and with no two of them on the same point — the pile-up a clamp produces
+        // would show up here as a repeated longitude.
+        expect(result.coordinates[0]).toHaveLength(5);
+        expect(new Set(result.coordinates[0].map((p) => p[0])).size).toBe(5);
+        expect(result.coordinates[0][4][0]).toBeCloseTo(-63.179236, 6);
+    });
+
+    test('never answers a chainage in a street with the end of the way', async () => {
+        // The regression test for a bug this feature found in code that was already
+        // shipped. The lookup that turns a chainage into a position looped over the
+        // street's segments with `i < last`, which never covers the final one, so
+        // anything inside it fell through to a fallback that returned the end of the
+        // way. Every vertex placed in a street's last segment landed on the same
+        // point, at the far end of the block, which is the pile-up the spacing
+        // rules exist to prevent.
+        //
+        // It was in the re-lay too, which is why this asserts the property rather
+        // than one fixture's numbers.
+        const result = await lay(
+            withReference(7, 3),
+            street(2, -63.181),
+            {},
+            {
+                segment: 0,
+                index: 3,
+            },
+        );
+
+        const longitudes = result.coordinates[0].map((p) =>
+            Number(p[0].toFixed(9)),
+        );
+
+        expect(new Set(longitudes).size).toBe(longitudes.length);
+    });
+
+    test('drops a vertex that asks for street before the street begins', async () => {
+        // The same rule at the other end, which is a separate branch: the forward
+        // walk overruns the last chainage and the backward one goes negative. The
+        // street begins half a segment ahead of the reference, so the three legs
+        // behind it are what fall off — nearest first, which is the walk order and
+        // not the index order.
+        const result = await lay(
+            withReference(9, 4),
+            street(3, -63.1805),
+            {},
+            {
+                segment: 0,
+                index: 4,
+            },
+        );
+
+        expect(result.dropped).toEqual([
+            { segment: 0, index: 2 },
+            { segment: 0, index: 1 },
+            { segment: 0, index: 0 },
+        ]);
+        expect(result.placed).toEqual([
+            { segment: 0, index: 3 },
+            { segment: 0, index: 5 },
+            { segment: 0, index: 6 },
+            { segment: 0, index: 7 },
+            { segment: 0, index: 8 },
+        ]);
+    });
+
+    test('drops everything further along once the street has run out', async () => {
+        // Offsets only grow in each direction, so a vertex that will not fit is
+        // followed by more that will not either. Refusing them one at a time would
+        // produce the same geometry and a longer report.
+        const result = await lay(
+            withReference(9, 4),
+            street(2, -63.181),
+            {},
+            {
+                segment: 0,
+                index: 4,
+            },
+        );
+
+        expect(result.dropped).toEqual([
+            { segment: 0, index: 1 },
+            { segment: 0, index: 0 },
+            { segment: 0, index: 7 },
+            { segment: 0, index: 8 },
+        ]);
+    });
+
+    test('follows the street round a bend, spacing intact and shape not', async () => {
+        // The trade this feature makes, asserted rather than described: the
+        // selection was a straight line and the street is not, so the shape that
+        // comes back is the street's. Only the spacing survives, and this is why
+        // the drag's rigid offset could never be the answer.
+        const bent: Coordinates = [
+            [
+                [-63.181, LAT],
+                [-63.18, LAT],
+                [-63.17925, LAT + 0.0003],
+                [-63.1785, LAT + 0.0003],
+                [-63.17775, LAT + 0.0003],
+                [-63.177, LAT + 0.0003],
+            ],
+        ];
+        const route = withReference(5, 2);
+
+        const result = await lay(route, bent);
+
+        expect(result.dropped).toEqual([]);
+
+        // Partway up the bend: on the street, and not on the line the reviewer
+        // drew. A range rather than an equality, because where on the bend each
+        // vertex lands is a consequence of the chainage arithmetic and pinning it
+        // would make this test fail on a rounding change instead of on a behaviour
+        // change.
+        const last = result.coordinates[0][4];
+
+        expect(last[1]).toBeGreaterThan(LAT);
+        expect(last[1]).toBeLessThan(LAT + 0.0003);
+        expect(last[0]).not.toBeCloseTo(route[0][4][0], 6);
+        expectMetres(
+            metres(result.coordinates[0][3], last),
+            metres(route[0][3], route[0][4]),
+        );
+    });
+
+    test('crosses one corner onto the street that continues', async () => {
+        // The reason the continuation lookup exists. Street A runs out before the
+        // selection does, so the walk crosses onto B — and the vertex that ran out of
+        // road lands the metres it still owed *beyond* B's entry point.
+        //
+        // That arithmetic is the whole test. A `reached` taken from the crossing
+        // vertex's own offset instead of from where the street ran out would answer
+        // zero, putting it on B's first point: 28 m short, which is four times
+        // anything visible at map zoom and one segment of B.
+        const second = street(3, -63.179);
+        const asked: StreetContinuationRequest[] = [];
+
+        const result = await lay(
+            withReference(5, 2, -63.1795),
+            street(2, -63.181),
+            { maxCrossings: 1 },
+            { segment: 0, index: 2 },
+            async (request) => {
+                asked.push(request);
+
+                return {
+                    roadId: 2,
+                    name: 'Calle Sin Nombre',
+                    line: second,
+                    entry: [-63.179, LAT],
+                };
+            },
+        );
+
+        expect(result.dropped).toEqual([]);
+
+        // Asked from the far end of A, in the direction the walk was going — the
+        // opposite end would return a street that begins behind the route.
+        expect(asked).toHaveLength(1);
+        expect(asked[0].direction).toBe(1);
+        // Compared in metres rather than by equality, because the point has been
+        // out of the metric frame and back and the round trip costs the last bit of
+        // the longitude — a comparison that would fail on arithmetic nobody reads.
+        expectMetres(metres(asked[0].from, [-63.179, LAT]), 0);
+
+        // How far along B it landed, measured from B's entry point. A window rather
+        // than an equality for the same reason the bend test uses one; the two
+        // answers this is distinguishing — zero and thirty-odd metres — are a
+        // segment apart, which no plausible rounding reaches.
+        const pastEntry = metres([-63.179, LAT], result.coordinates[0][4]);
+
+        expect(pastEntry).toBeGreaterThan(20);
+        expect(pastEntry).toBeLessThan(40);
+        expect(result.streets.map((street) => street.placed)).toEqual([3, 1]);
+    });
+
+    test('spends the crossing budget once, and drops past the second street', async () => {
+        // One corner per drop is the cap, and it has to be a cap rather than a
+        // preference: each crossing is a heuristic answer whose confidence falls
+        // with every branch the junction could have taken.
+        let calls = 0;
+
+        const result = await lay(
+            withReference(9, 3, -63.1795),
+            street(2, -63.181),
+            { maxCrossings: LAY_MAX_CROSSINGS },
+            { segment: 0, index: 3 },
+            async () => {
+                calls += 1;
+
+                return {
+                    roadId: 2,
+                    name: null,
+                    // One street segment, so the second street runs out almost at
+                    // once and the walk has nothing left to give.
+                    line: street(1, -63.179),
+                    entry: [-63.179, LAT],
+                };
+            },
+        );
+
+        // The constant rather than a literal, because this is the budget the editor
+        // actually passes: the assertion is about what ships, not about a number
+        // written here.
+        expect(LAY_MAX_CROSSINGS).toBe(1);
+        expect(calls).toBe(1);
+        expect(result.dropped).toEqual([
+            { segment: 0, index: 7 },
+            { segment: 0, index: 8 },
+        ]);
+    });
+
+    test('drops the rest of that side when nothing continues', async () => {
+        // A refusal is not a failure: the vertices it took stay placed, and the
+        // reviewer is told about the ones that did not rather than being handed a
+        // route with a hole in it and no explanation.
+        const result = await lay(
+            withReference(5, 2, -63.1795),
+            street(2, -63.181),
+            { maxCrossings: 1 },
+            { segment: 0, index: 2 },
+            async () => null,
+        );
+
+        expect(result.dropped).toEqual([{ segment: 0, index: 4 }]);
+        expect(result.placed).toEqual([
+            { segment: 0, index: 1 },
+            { segment: 0, index: 0 },
+            { segment: 0, index: 3 },
+        ]);
+    });
+
+    test('gives up on a continuation it cannot read', async () => {
+        // Every unusable answer has to cost the crossing and nothing else, or one
+        // malformed response takes the whole drop down with it.
+        for (const cont of [
+            async () => null,
+            async () => ({ roadId: 2, name: null, line: null, entry: [0, 0] }),
+            async () => ({
+                roadId: 2,
+                name: null,
+                line: [[[0, 0]]],
+                entry: [0, 0],
+            }),
+            async () => ({
+                roadId: 2,
+                name: null,
+                // A real, usable street whose entry point is twelve degrees away:
+                // the one failure a geometry check cannot catch, and the reason the
+                // entry is located rather than trusted.
+                line: street(1),
+                entry: [-63.9, 12],
+            }),
+        ]) {
+            const result = await lay(
+                withReference(5, 2, -63.1795),
+                street(2, -63.181),
+                { maxCrossings: 1 },
+                { segment: 0, index: 2 },
+                cont as ContinueStreet,
+            );
+
+            // Identical to the null case in every case, which is the property: a
+            // continuation that cannot be read costs the crossing and nothing else.
+            expect(result.dropped).toEqual([{ segment: 0, index: 4 }]);
+            expect(result.placed).toEqual([
+                { segment: 0, index: 1 },
+                { segment: 0, index: 0 },
+                { segment: 0, index: 3 },
+            ]);
+        }
+    });
+
+    test('removes every dropped vertex in one pass', async () => {
+        // The trap this is here for. Removing them one at a time renumbers
+        // everything after each removal, so the second removal would already be
+        // aimed at a different vertex — and a route where that goes wrong has the
+        // right *number* of vertices in the wrong places, which is not something a
+        // reviewer can check by counting them.
+        //
+        // Drops on both sides of the reference, so the survivors are renumbered
+        // from both ends at once.
+        const result = await lay(
+            withReference(9, 4),
+            street(2, -63.181),
+            {},
+            {
+                segment: 0,
+                index: 4,
+            },
+        );
+
+        expect(result.dropped).toEqual([
+            { segment: 0, index: 1 },
+            { segment: 0, index: 0 },
+            { segment: 0, index: 7 },
+            { segment: 0, index: 8 },
+        ]);
+
+        // Five survivors, all on the centreline, and the reference — which never
+        // moved — sitting at the third of them. A stale-address removal would have
+        // left the reference at a different slot and kept a vertex off the street.
+        expect(result.coordinates[0]).toHaveLength(5);
+        expect(result.coordinates[0][2]).toEqual([-63.18, LAT]);
+
+        for (const position of result.coordinates[0]) {
+            expect(position[1]).toBeCloseTo(LAT, 9);
+        }
+    });
+
+    test('refuses a selection that crosses a segment', async () => {
+        // A MultiLineString's parts are not a continuation of each other, so there
+        // is no path to measure a spacing along across one.
+        const split: Coordinates = [
+            [
+                [-63.18, LAT],
+                [-63.1795, LAT],
+            ],
+            [
+                [-63.177, LAT],
+                [-63.1765, LAT],
+            ],
+        ];
+
+        const result = await laySelectionAlongStreet(
+            split,
+            [
+                { segment: 0, index: 0 },
+                { segment: 0, index: 1 },
+                { segment: 1, index: 0 },
+            ],
+            { segment: 0, index: 0 },
+            asStreet(street(6)),
+            limits(),
+        );
+
+        expect(result.blocked).toBe('spans-segments');
+        expect(result.coordinates).toBe(split);
+    });
+
+    test('refuses a selection of one, which is what propagation is for', async () => {
+        // Named rather than left to the caller, and the reason is worth keeping: a
+        // single vertex is the propagation's case, where the neighbours are pulled
+        // onto the street and the dragged one keeps its own shape.
+        const route = withReference(1, 0);
+
+        const result = await laySelectionAlongStreet(
+            route,
+            [{ segment: 0, index: 0 }],
+            { segment: 0, index: 0 },
+            asStreet(street(6)),
+            limits(),
+        );
+
+        expect(result.blocked).toBe('too-few');
+        expect(result.coordinates).toBe(route);
+    });
+
+    test('gives up rather than guess when there is no street', async () => {
+        const route = withReference(5, 2);
+
+        for (const streetGeometry of [null, [[[0, 0]]]]) {
+            expect((await lay(route, streetGeometry)).coordinates).toBe(route);
+        }
+
+        expect(
+            (
+                await laySelectionAlongStreet(
+                    route,
+                    everything(route),
+                    { segment: 0, index: 2 },
+                    null,
+                    limits(),
+                )
+            ).coordinates,
+        ).toBe(route);
+    });
+
+    test('gives up when the reference is not where the selection says', async () => {
+        const route = withReference(5, 2);
+
+        const result = await laySelectionAlongStreet(
+            route,
+            everything(route),
+            { segment: 0, index: 99 },
+            asStreet(street(6)),
+            limits(),
+        );
+
+        expect(result.placed).toEqual([]);
+        expect(result.coordinates).toBe(route);
+    });
+
+    test('does not mutate the route it was given', async () => {
+        const route = withReference(5, 2);
+        const before = snapshot(route);
+
+        await lay(route);
+
+        expect(route).toEqual(before);
+    });
+
+    test('reports what each street did, which is not always what was asked', async () => {
+        // The report is what makes a drop that quietly placed nine of twenty
+        // vertices legible. Without the street's own length the count is just a
+        // number and the reviewer has nothing to compare it against.
+        const result = await lay(withReference(6, 2), street(6));
+
+        expect(result.streets).toHaveLength(1);
+        expect(result.streets[0].roadId).toBe(1);
+        expect(result.streets[0].name).toBe('Avenida Siempre Viva');
+        expect(result.streets[0].placed).toBe(5);
+        expectMetres(result.streets[0].streetMeters, perDeg * 6);
+    });
+});
+
 describe('relayLimitsFor', () => {
     test('takes the offset from the preset and the spacing from the project', () => {
         // The offset is the reviewer's own calibration; the spacing is the ten
@@ -2340,6 +2939,66 @@ describe('relaySelectionOntoNetwork', () => {
         expect(split.length).toBe(2);
         expect(result.coordinates.length).toBe(2);
         expect(result.moved).toHaveLength(4);
+    });
+
+    test('spreads a stretch over the whole street rather than its last point', () => {
+        // A regression test for a bug this feature found in code that had already
+        // shipped. Turning a chainage into a position looped over the street's
+        // segments with `i < last`, which never covers the final one, so anything
+        // inside it fell through to a fallback that returned the end of the way.
+        // Every vertex the re-lay put in a street's last segment was therefore
+        // placed on that segment's last vertex instead — a run of them collapsed
+        // onto one point at the end of the block, which is the exact pile-up the
+        // ten-metre spacing rule exists to prevent.
+        //
+        // Both vertices are inside that final segment, and the assertion is that
+        // the spacing rule had to do any work at all: they come out ten metres
+        // apart rather than on the same point. A re-lay on a longer stretch piled
+        // up; two is the smallest case that shows it.
+        // Both vertices project into the street's LAST segment, which is the whole
+        // point: the bug only reached that one. They are placed in route order
+        // along the street — 383 m then 394 m — so the cursor moves forwards and
+        // the second one's own projection is the answer rather than the spacing
+        // rule's.
+        const result = run(
+            [
+                [
+                    [-63.1763, LAT - 0.0001],
+                    [-63.1762, LAT - 0.0001],
+                ],
+            ],
+            [
+                { segment: 0, index: 0 },
+                { segment: 0, index: 1 },
+            ],
+            [
+                lookup(street(4), { distance: 11 }),
+                lookup(street(4), { distance: 11 }),
+            ],
+        );
+
+        expect(result.moved).toHaveLength(2);
+
+        // Neither vertex may sit at the street's last point, which is where the
+        // bug put both of them. Stated as a position because that is what the bug
+        // was: two correct answers to the same wrong question.
+        expect(
+            result.coordinates[0].map((position) =>
+                Number(position[0].toFixed(6)),
+            ),
+        ).not.toContain(-63.176);
+
+        // And they keep their own separation, which is what is left once neither
+        // one has been collapsed onto the end of the way. The floor is the
+        // project's own spacing constant rather than a figure from this fixture:
+        // the bug put them at zero, which is the only thing worth distinguishing
+        // from here.
+        const apart = distanceMeters(
+            [result.coordinates[0][0][0], result.coordinates[0][0][1]],
+            [result.coordinates[0][1][0], result.coordinates[0][1][1]],
+        );
+
+        expect(apart).toBeGreaterThan(RELAY_MIN_SPACING_METERS);
     });
 });
 
@@ -2852,6 +3511,120 @@ describe('describeResampleHint', () => {
 
         expect(hint).toContain('even intervals');
         expect(hint).toContain('line itself does not move');
+    });
+});
+
+describe('describeLay', () => {
+    const street = (name: string | null, placed: number): LayStreetReport => ({
+        roadId: 1,
+        name,
+        placed,
+        streetMeters: 640,
+    });
+
+    const result = (over: Partial<LayResult> = {}): LayResult => ({
+        coordinates: [],
+        placed: [
+            { segment: 0, index: 1 },
+            { segment: 0, index: 0 },
+            { segment: 0, index: 3 },
+        ],
+        dropped: [],
+        streets: [street('Avenida Siempre Viva', 3)],
+        blocked: null,
+        ...over,
+    });
+
+    test('names the street and how many vertices went onto it', () => {
+        // A count alone is a number the reviewer cannot check. The street name is
+        // what can be held against the map in a glance, which is the whole reason
+        // the other two lookups report by street.
+        const message = describeLay(result());
+
+        expect(message).toContain('3 vertices');
+        expect(message).toContain('Avenida Siempre Viva');
+        expect(message).toContain('640 m');
+    });
+
+    test('says nothing was dropped when nothing was', () => {
+        const message = describeLay(result());
+
+        expect(message).not.toContain('dropped');
+        expect(message).not.toContain('transfers:compute');
+    });
+
+    test('names the count it dropped, and what dropping costs', () => {
+        // The second clause is the whole reason the first one is allowed. A lay is
+        // the only action in this editor that can remove a vertex, and a removed
+        // vertex re-points every transfer index above it at a different vertex.
+        // Saying only "2 dropped" tells the reviewer what happened to the geometry
+        // and nothing about the transfer rows that now describe the wrong pairs.
+        const message = describeLay(
+            result({
+                dropped: [
+                    { segment: 0, index: 4 },
+                    { segment: 0, index: 5 },
+                ],
+            }),
+        );
+
+        expect(message).toContain('2 past the end of the street were dropped');
+        expect(message).toContain('transfers:compute');
+    });
+
+    test('says which street ran out when several were used', () => {
+        // A drop that crossed a corner placed vertices on two roads, and the one
+        // that fell short of the second is the one worth naming.
+        const message = describeLay(
+            result({
+                streets: [street('Avenida Siempre Viva', 4), street(null, 1)],
+                dropped: [{ segment: 0, index: 6 }],
+            }),
+        );
+
+        expect(message).toContain('Avenida Siempre Viva');
+        expect(message).toContain('an unnamed street');
+        expect(message).toContain('1 past the end');
+    });
+
+    test('says a blocked lay did nothing, rather than reporting no placements', () => {
+        // Zero placed and zero dropped would read as a drop that found a street and
+        // declined to use it, which is not what happened.
+        for (const [blocked, expected] of [
+            ['too-few', 'single vertex'],
+            ['spans-segments', 'segment boundary'],
+        ] as const) {
+            const message = describeLay(result({ blocked }));
+
+            expect(message).toContain('Nothing to lay');
+            expect(message).toContain(expected);
+            expect(message).not.toContain('0 vertices');
+        }
+    });
+});
+
+describe('describeLayHint', () => {
+    test('names the missing selection', () => {
+        expect(describeLayHint('too-few')).toContain('at least two');
+    });
+
+    test('names the boundary, and not the count to select more of', () => {
+        const hint = describeLayHint('spans-segments');
+
+        expect(hint).toContain('segment boundary');
+        expect(hint).not.toContain('at least two');
+    });
+
+    test('says the trade it makes, because it is a change of contract', () => {
+        // A drag preserves the shape it was given. A lay does not, and a reviewer
+        // who has not been told that will read the result as the tool having got
+        // the shape wrong.
+        const hint = describeLayHint(null);
+
+        expect(hint).toContain('keeping the spacing');
+        expect(hint).toContain('shape of the street');
+        expect(hint).toContain('one corner');
+        expect(hint).toContain('Alt');
     });
 });
 

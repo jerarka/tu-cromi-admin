@@ -10,6 +10,7 @@ use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 
 /**
  * Build the offline bundle for the Flutter app.
@@ -193,6 +194,7 @@ class LinesExportOffline extends Command
             }
 
             $this->warnIfVersionNotIncreasing($metaPath, $dataVersion);
+            $this->warnIfTransfersAreStale();
         }
 
         if (! $this->dumpNdjson($ndjsonPath, $dataVersion, $updatedAt, $generatedAt)) {
@@ -414,6 +416,58 @@ class LinesExportOffline extends Command
             "Version {$dataVersion} is not greater than the previous local export (version {$previousVersion}). "
             .'Clients already on that version will not be prompted to update — bump --data-version if the data changed.'
         );
+    }
+
+    /**
+     * Warn when a line in the bundle has been hand-corrected since the transfers
+     * were computed.
+     *
+     * `geometry_adjusted` is a dirty flag and its documented meaning is exactly
+     * this: the line's geometry no longer matches what the transfer rows were
+     * measured against. `line_transfers` addresses vertices by index, so an edited
+     * line publishes transfers that now describe different pairs of points — and
+     * the app ships those indexes to riders, who are then told to transfer between
+     * two places a block apart.
+     *
+     * `lines:refresh-geometry` has always said so when it invalidates the indexes
+     * itself. This is the same warning from the other end, and it is here because
+     * the flag is set by *every* geometry save in the editor, not only by that
+     * command: the editor's own tools remove vertices — a re-spacing rewrites the
+     * interior of a selection, and laying a dragged stretch along a street drops
+     * whatever runs past the end of it — so this is now a routine way for the
+     * indexes to go stale rather than an exceptional one.
+     *
+     * A warning and not a refusal. The bundle may well be wanted anyway — the
+     * geometry is the reviewer's work and shipping it is the point — and the
+     * decision to spend seventeen minutes on `transfers:compute` belongs to
+     * whoever is holding the deploy. What was missing was the sentence, and a
+     * silence here reads as a clean run.
+     */
+    private function warnIfTransfersAreStale(): void
+    {
+        $adjusted = Line::query()->where('geometry_adjusted', true)->count();
+
+        if ($adjusted === 0) {
+            return;
+        }
+
+        $stale = DB::table('line_transfers')
+            ->whereIn('line_a_id', Line::query()->where('geometry_adjusted', true)->select('id'))
+            ->orWhereIn('line_b_id', Line::query()->where('geometry_adjusted', true)->select('id'))
+            ->count();
+
+        if ($stale === 0) {
+            return;
+        }
+
+        $this->warn(sprintf(
+            '%d %s on %d hand-corrected %s hold point indexes that no longer describe the geometry. '
+            .'Re-run transfers:compute before publishing, or riders will be given transfer points a block apart.',
+            $stale,
+            Str::plural('transfer', $stale),
+            $adjusted,
+            Str::plural('line', $adjusted),
+        ));
     }
 
     /**

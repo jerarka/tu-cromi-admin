@@ -395,11 +395,11 @@ onUnmounted(() => {
  */
 function onMapUpdate(
     geoJson: NonNullable<Line['geo_json']>,
-    meta?: { snap?: boolean; propagated?: number },
+    meta?: { snap?: boolean; propagated?: number; laid?: boolean },
 ): void {
     // A snap is the tool refining a move the reviewer already made, not a
-    // second move. Recording it would put "drag the vertex" and "pull it onto
-    // the street" in the history as separate steps, so the first undo would
+    // second move. Recording it would put "drag the vertex" and "pull it onto the
+    // street" in the history as separate steps, so the first undo would
     // appear to do nothing and the second would take back the move itself.
     //
     // Propagation is the exception that proves why that rule needs saying out
@@ -412,9 +412,17 @@ function onMapUpdate(
     // different route than the one they were looking at, with nothing on screen
     // to say so. Recording it costs one history entry and makes the round trip
     // an identity.
-    const isPropagation = (meta?.propagated ?? 0) > 0;
+    //
+    // A lay is recorded for the same reason and a stronger one: it replaced the
+    // shape the reviewer dragged with the shape of a street, and it may have
+    // removed vertices outright. Every vertex it moved was the reviewer's own,
+    // which is why it needs its own flag rather than a count — but a stretch that
+    // comes back different from the one that was dragged, with fewer vertices than
+    // it started with, is exactly the thing an undo stack exists to be able to
+    // take back.
+    const isSecondMove = (meta?.propagated ?? 0) > 0 || meta?.laid === true;
 
-    if (!meta?.snap || isPropagation) {
+    if (!meta?.snap || isSecondMove) {
         history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
     }
 
