@@ -19,7 +19,7 @@ Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue 
 | TypeScript check | `npm run types:check` | `vue-tsc --noEmit` |
 | Everything | `composer ci:check` | Runs **both** stacks: frontend lint → format → vue-tsc → vitest → `composer test` |
 | Build | `npm run build` | |
-| Codegen | `php artisan wayfinder:generate` | Regenerates the gitignored `resources/js/{actions,routes,wayfinder}/` |
+| Codegen | `composer codegen` | Regenerates the gitignored `resources/js/{actions,routes,wayfinder}/`. **`--with-form` is not optional** — see below |
 
 Use **npm**, not pnpm. `pnpm-workspace.yaml` exists but the lockfile and CI are npm. `.npmrc` sets `ignore-scripts=true`, so no postinstall hooks run.
 
@@ -114,6 +114,7 @@ The version has one source of truth: `--data-version` → NDJSON meta record →
 - **ESLint**: `1tbs` braces, padding around control statements, sorted imports (builtin → external → internal → parent → sibling → index). Ignores codegen output.
 - **shadcn-vue**: `cn()` from `@/lib/utils` (clsx + tailwind-merge), lucide icons.
 - **Wayfinder**: controllers from `@/actions/`, named routes from `@/routes/`. Generated dirs are gitignored — regenerate, never edit.
+- **`--with-form` is not optional, and running the command without it looks like success.** Seventeen components call `SomeController.method.form()`, which is the `{ action, method }` shape Inertia's `<Form v-bind="…">` takes. Wayfinder emits those helpers only under the `--with-form` flag (`method.blade.ts:77,116`), and without it the generated files come out perfectly well-formed with the helpers simply absent — so the command reports success, and the failure lands later as `vue-tsc` saying `Property 'form' does not exist` in seventeen unrelated-looking files. Measured both directions: without the flag, zero `.form` assignments and 17 type errors; with it, 103 assignments and zero errors. `composer codegen` wraps the flag so the working invocation is the short one.
 - **Cookies excluded from encryption**: `appearance`, `sidebar_state` (`bootstrap/app.php`).
 - **Passkeys**: `PASSKEYS_USER_HANDLE_SECRET`, falling back to `APP_KEY`.
 - **Migrations**: `$table->timestamps()`; `$table->softDeletes()`; `string()` defaults to 255; `foreignId('foo_id')->constrained()` resolves by convention. `numeric` columns come back from PDO as strings — cast at the boundary.

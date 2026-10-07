@@ -55,6 +55,9 @@
             "Composer\\Config::disableProcessTimeout",
             "@php artisan dev"
         ],
+        "codegen": [
+            "@php artisan wayfinder:generate --with-form"
+        ],
         "lint": [
             "pint --parallel"
         ],
