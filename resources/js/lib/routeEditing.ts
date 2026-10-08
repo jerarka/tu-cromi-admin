@@ -2753,7 +2753,21 @@ export function describePropagationTooltip(threshold: number): string {
  * new mode fails to compile at the call site rather than quietly falling through
  * to the default branch below.
  */
-export function describeModeHelp(mode: 'move' | 'add' | 'delete'): string {
+export function describeModeHelp(
+    mode: 'move' | 'add' | 'delete' | 'guide',
+): string {
+    if (mode === 'guide') {
+        return (
+            'Click to place control points along the streets the route should ' +
+            'take. The tramo between two points is traced along the road network ' +
+            'and shown dashed: press Accept to keep it, Reject to dismiss it, or ' +
+            'click "Draw by hand" to place vertices without routing. A click away ' +
+            'from the route extends the end chosen in "Extend at" — pick Start to ' +
+            "grow it backwards, which also makes the new point the route's first. " +
+            'Escape cancels the pending preview.'
+        );
+    }
+
     if (mode === 'add') {
         return (
             'Click on the route to add a vertex. A click within about 10 m of one ' +
@@ -2806,10 +2820,10 @@ export function describeModeHelp(mode: 'move' | 'add' | 'delete'): string {
  * `describeModeHelp` instead.
  */
 export function describeSelectionState(
-    mode: 'move' | 'add' | 'delete',
+    mode: 'move' | 'add' | 'delete' | 'guide',
     selected: number,
 ): string {
-    if (mode === 'add' || selected === 0) {
+    if (mode === 'add' || mode === 'guide' || selected === 0) {
         return '';
     }
 

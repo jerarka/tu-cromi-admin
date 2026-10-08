@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Form, Head } from '@inertiajs/vue3';
 import { ArrowLeft } from '@lucide/vue';
+import { computed, ref } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
@@ -11,6 +12,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
+import type { Waypoint } from '@/lib/guidedRouting';
+import type { Coordinates } from '@/lib/routeEditing';
 
 const {
     geoJsonText,
@@ -25,6 +28,71 @@ const {
     toggleEditing,
     confirmDiscard,
 } = useRouteGeometry();
+
+/**
+ * The control points the guided mode accepted, owned here for the same
+ * reason the geometry text is: a new line has no record yet, so the list is
+ * client-only until the first save — where it becomes the line's recipe.
+ */
+const waypoints = ref<Waypoint[]>([]);
+
+/**
+ * Whether this visit actually touched the recipe.
+ *
+ * Same rule as the edit page: a new line whose reviewer never opened the
+ * guided mode has no recipe to save, and sending the bootstrap's derived
+ * controls would be inventing one.
+ */
+const waypointsTouched = ref(false);
+
+/**
+ * Tells the map to keep its framing across a guided accept.
+ *
+ * The same one-shot the edit page uses for undo and redo. A guided accept is
+ * driven by a click on the map, so the geometry it produces is by definition
+ * in view already — refitting the whole route underneath the reviewer is the
+ * one thing that cannot help them here.
+ */
+const preserveViewToken = ref(0);
+
+/**
+ * The recipe as the form posts it — only when this visit touched it.
+ */
+const waypointsField = computed<string | null>(() => {
+    if (!waypointsTouched.value || waypoints.value.length === 0) {
+        return null;
+    }
+
+    return JSON.stringify(
+        waypoints.value.map((waypoint) => ({
+            lat: waypoint.position[1],
+            lng: waypoint.position[0],
+        })),
+    );
+});
+
+/**
+ * One guided result in, both halves stored.
+ *
+ * A guided accept is one edit, so this is one assignment pair and not two
+ * events for the parent to race.
+ */
+function onGuidedUpdate(payload: {
+    coordinates: Coordinates | null;
+    waypoints: Waypoint[];
+}): void {
+    if (payload.coordinates !== null) {
+        setGeometry({
+            type: 'MultiLineString',
+            coordinates: payload.coordinates,
+        });
+    }
+
+    waypoints.value = payload.waypoints;
+    waypointsTouched.value = true;
+    preserveViewToken.value += 1;
+    markDirty();
+}
 </script>
 
 <template>
@@ -146,6 +214,13 @@ const {
                         {{ geoJsonError }}
                     </p>
                 </div>
+                <!-- The guided editor's control-point recipe, posted only when touched. -->
+                <input
+                    v-if="waypointsField !== null"
+                    type="hidden"
+                    name="waypoints"
+                    :value="waypointsField"
+                />
                 <div class="flex items-center gap-4">
                     <Button :disabled="processing">Save</Button>
                     <Button
@@ -180,7 +255,10 @@ const {
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
                 :mode="mode"
+                :guided-waypoints="waypoints"
+                :preserve-view-token="preserveViewToken"
                 @update:geo-json="setGeometry"
+                @update:guided="onGuidedUpdate"
             >
                 <template #toolbar>
                     <RouteModePicker v-if="isEditingMap" v-model="mode" />

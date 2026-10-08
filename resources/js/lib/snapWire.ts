@@ -372,3 +372,154 @@ export function continuationFromResponse(
         entry: [response.lng, response.lat],
     };
 }
+
+/** What `POST /roads/route` answers with when it found a path. */
+export interface RouteWireStreet {
+    road_id: number;
+    osm_id: number;
+    name: string | null;
+    highway: string;
+    meters: number;
+}
+
+export interface RouteWireResponse {
+    status: 'ok' | 'none';
+    coordinates: unknown;
+    streets: RouteWireStreet[] | null;
+    distance_m: number | null;
+    warnings: string[];
+    reason: string | null;
+}
+
+/**
+ * A validated answer from the guided route search.
+ *
+ * Both branches are kept on the same discriminated shape the server sends —
+ * `status: 'none'` with a reason rather than a 204 — because the editor has
+ * to say WHICH fix applies to a refused tramo: moving a control point that
+ * was nowhere near a street and splitting a stretch the network will not
+ * connect are different corrections.
+ *
+ * Every field is read defensively and refused as a whole on one bad piece,
+ * the same rule as the other lookups here: a response the editor cannot
+ * trust must be a preview that never appears, not a polyline that was drawn
+ * from whoever knows what.
+ */
+export function routeLookupFromResponse(data: unknown): RouteLookup | null {
+    if (typeof data !== 'object' || data === null) {
+        return null;
+    }
+
+    const response = data as Partial<RouteWireResponse>;
+
+    if (response.status !== 'ok' && response.status !== 'none') {
+        return null;
+    }
+
+    if (response.status === 'none') {
+        return {
+            status: 'none',
+            coordinates: null,
+            streets: null,
+            distanceM: null,
+            warnings: [],
+            reason:
+                typeof response.reason === 'string' ? response.reason : null,
+        };
+    }
+
+    const coordinates = positionListFromResponse(response.coordinates);
+
+    if (coordinates === null || coordinates.length < 2) {
+        return null;
+    }
+
+    const streets: RouteWireStreet[] = [];
+
+    if (Array.isArray(response.streets)) {
+        for (const street of response.streets) {
+            if (
+                typeof street !== 'object' ||
+                street === null ||
+                !isFiniteNumber(street.road_id) ||
+                !isFiniteNumber(street.meters) ||
+                (typeof street.highway !== 'string' && street.highway !== null)
+            ) {
+                return null;
+            }
+
+            streets.push({
+                road_id: street.road_id,
+                osm_id: isFiniteNumber(street.osm_id) ? street.osm_id : 0,
+                name: typeof street.name === 'string' ? street.name : null,
+                highway:
+                    typeof street.highway === 'string'
+                        ? street.highway
+                        : 'road',
+                meters: street.meters,
+            });
+        }
+    }
+
+    return {
+        status: 'ok',
+        coordinates,
+        streets: streets,
+        distanceM: isFiniteNumber(response.distance_m)
+            ? response.distance_m
+            : null,
+        warnings: arrayStringList(response.warnings),
+        reason: null,
+    };
+}
+
+/**
+ * A validated route answer, in the module's own coordinate order.
+ */
+export interface RouteLookup {
+    status: 'ok' | 'none';
+    coordinates: Position[] | null;
+    streets: RouteWireStreet[] | null;
+    distanceM: number | null;
+    warnings: string[];
+    reason: string | null;
+}
+
+/**
+ * A list of [lng, lat] positions, or null when anything in it is not.
+ *
+ * Same shape of demand as the snap candidate above, applied to a whole
+ * polyline: one bad coordinate anywhere would splice a broken vertex into
+ * the route and be visible forever after.
+ */
+function positionListFromResponse(value: unknown): Position[] | null {
+    if (!Array.isArray(value) || value.length === 0) {
+        return null;
+    }
+
+    const positions: Position[] = [];
+
+    for (const entry of value) {
+        if (
+            !Array.isArray(entry) ||
+            entry.length < 2 ||
+            !isFiniteNumber(entry[0]) ||
+            !isFiniteNumber(entry[1])
+        ) {
+            return null;
+        }
+
+        positions.push([entry[0], entry[1]]);
+    }
+
+    return positions;
+}
+
+/** A list that is all strings, or empty when the response carried anything else. */
+function arrayStringList(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    return value.filter((entry): entry is string => typeof entry === 'string');
+}

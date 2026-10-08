@@ -10,9 +10,11 @@ import type {
 import {
     continuationFromResponse,
     relayLookupsFromResponse,
+    routeLookupFromResponse,
     snapLookupFromResponse,
     toWirePoints,
 } from '@/lib/snapWire';
+import type { RouteLookup } from '@/lib/snapWire';
 import type { SnapLookup } from '@/lib/snapWire';
 import roads from '@/routes/roads';
 
@@ -41,6 +43,18 @@ import roads from '@/routes/roads';
  * still working.
  */
 export const SNAP_LOOKUP_TIMEOUT_MS = 3000;
+
+/**
+ * How long a route search may take before the preview is left unmade.
+ *
+ * Longer than a snap lookup, because this one is a search: the server loads a
+ * corridor of the graph and runs A* over it, where a snap is one indexed
+ * query. Still a deadline rather than patience — a preview that arrives after
+ * the reviewer has moved on to the next click is worse than none, because the
+ * map it would decorate is already stale. The revision guard is what catches
+ * that case; the deadline is what keeps a stuck request from pinning it open.
+ */
+export const ROUTE_LOOKUP_TIMEOUT_MS = 8000;
 
 /**
  * The CSRF token from the XSRF-TOKEN cookie.
@@ -346,6 +360,72 @@ export async function continueRoad(
         }
 
         return continuationFromResponse(await response.json());
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Ask the server to trace a route between two control points.
+ *
+ * The fourth lookup and the first one that is a search. The origin carries
+ * the bearing the walk was travelling — only the caller knows, for the same
+ * reason as continueRoad above — and it is what the server uses to pick the
+ * carriageway when two one-way halves run side by side.
+ *
+ * Unlike the other three lookups, `status: 'none'` with a reason IS the
+ * answer, not a failure to paper over: the editor tells the reviewer which
+ * correction applies. So this returns the validated shape on 200 whatever
+ * the status inside it, and only a broken lookup (non-2xx, network, garbage)
+ * is null.
+ */
+export async function lookupRoute(
+    origin: Position,
+    destination: Position,
+    bearing: number | null,
+    cookie: string,
+    signal: AbortSignal = AbortSignal.timeout(ROUTE_LOOKUP_TIMEOUT_MS),
+): Promise<RouteLookup | null> {
+    try {
+        const response = await fetch(roads.route.url(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-XSRF-TOKEN': csrfToken(cookie),
+            },
+            credentials: 'same-origin',
+            signal,
+            body: JSON.stringify({
+                origin: { lat: origin[1], lng: origin[0] },
+                destination: { lat: destination[1], lng: destination[0] },
+                ...(bearing !== null ? { bearing } : {}),
+            }),
+        });
+
+        if (!response.ok) {
+            // 404 is the graph's own "not built yet" answer, and it is a real
+            // outcome with its own message — surfaced as a refusal rather
+            // than swallowed, because a reviewer stuck on it deserves to know
+            // no edit of theirs fixes it.
+            if (response.status === 404) {
+                return {
+                    status: 'none' as const,
+                    coordinates: null,
+                    streets: null,
+                    distanceM: null,
+                    warnings: [],
+                    reason: 'graph-not-built',
+                };
+            }
+
+            console.warn('Route lookup failed', response.status);
+
+            return null;
+        }
+
+        return routeLookupFromResponse(await response.json());
     } catch {
         return null;
     }

@@ -4,6 +4,7 @@ namespace App\Http\Requests\Line;
 
 use App\Rules\GeoJsonMultiLineString;
 use App\Rules\LineCode;
+use App\Rules\WaypointsPayload;
 use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Validation\Rule;
 
@@ -38,6 +39,10 @@ class StoreLineRequest extends FormRequest
             'color' => ['nullable', 'string', 'max:255'],
             'syndicate' => ['nullable', 'string', 'max:255'],
             'geo_json' => ['nullable', new GeoJsonMultiLineString],
+            // The guided editor's control points, validated as a whole like
+            // geometry. Absent means "no recipe with this line" — empty is a
+            // payload the editor never sends unnaturally.
+            'waypoints' => ['nullable', 'string', new WaypointsPayload],
         ];
     }
 

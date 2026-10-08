@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { MousePointer2, Plus, Trash2 } from '@lucide/vue';
+import { MousePointer2, Plus, Route, Trash2 } from '@lucide/vue';
 import { Button } from '@/components/ui/button';
 import {
     Tooltip,
@@ -37,6 +37,7 @@ const modes: {
     icon: typeof MousePointer2;
 }[] = [
     { value: 'move', label: 'Move', icon: MousePointer2 },
+    { value: 'guide', label: 'Guide along streets', icon: Route },
     { value: 'add', label: 'Add vertex', icon: Plus },
     { value: 'delete', label: 'Delete vertex', icon: Trash2 },
 ];

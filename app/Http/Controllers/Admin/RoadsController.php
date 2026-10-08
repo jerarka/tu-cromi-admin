@@ -2,9 +2,12 @@
 
 namespace App\Http\Controllers\Admin;
 
+use App\Geo\GreatCircle;
+use App\Geo\Router;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Road\ContinueRoadRequest;
 use App\Http\Requests\Road\RelayRoadRequest;
+use App\Http\Requests\Road\RouteRoadRequest;
 use App\Http\Requests\Road\SnapRoadRequest;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\DB;
@@ -109,6 +112,17 @@ class RoadsController extends Controller
         $bindings[] = $request->threshold();
         $bindings[] = SnapRoadRequest::TIE_BAND_METERS;
 
+        // Link roads are excluded at every scan of the table — in `matched`
+        // and in `near` below, not only at the winner. A ramp beside an
+        // intersection would otherwise take both the per-point vote and the
+        // reference on distance alone, and the votes would never get to agree
+        // otherwise. The table was imported without them until the routing
+        // graph needed them (roads:import-overpass), so the exclusion lives
+        // here rather than at the import: same rows, different consumers.
+        //
+        // The backslash is Postgres LIKE's own escape for the underscore (a
+        // wildcard); the `\\` and `\'` sit in the PHP source so the statement
+        // the driver sees carries the real characters.
         $street = DB::selectOne(
             'WITH targets(idx, p) AS (VALUES '.implode(', ', $rows).'),
             ref AS (
@@ -121,6 +135,7 @@ class RoadsController extends Controller
                     SELECT r.id, r.geom
                     FROM roads r
                     WHERE ST_DWithin(r.geom::geography, t.p::geography, ?)
+                      AND r.highway NOT LIKE \'%\\_link\'
                     ORDER BY r.geom::geography <-> t.p::geography
                     LIMIT 1
                 ) r
@@ -136,6 +151,7 @@ class RoadsController extends Controller
                 FROM roads r
                 CROSS JOIN ref
                 WHERE ST_DWithin(r.geom::geography, ref.p::geography, ?)
+                  AND r.highway NOT LIKE \'%\\_link\'
             ),
             closest AS (
                 SELECT min(ref_d) AS ref_d FROM near
@@ -335,6 +351,7 @@ class RoadsController extends Controller
                 FROM targets t
                 CROSS JOIN roads r
                 WHERE ST_DWithin(r.geom::geography, t.p::geography, ?)
+                  AND r.highway NOT LIKE \'%\\_link\'
             ),
             local_votes AS (
                 SELECT c.idx, c.road_id, count(n.idx) AS votes
@@ -462,6 +479,7 @@ class RoadsController extends Controller
                 CROSS JOIN probe pr
                 WHERE r.id <> CAST(? AS integer)
                   AND ST_DWithin(r.geom::geography, o.p::geography, ?)
+                  AND r.highway NOT LIKE \'%\\_link\'
             )
             SELECT c.road_id, c.name, c.highway, c.oneway, c.near_d, c.ahead_d,
                    ST_Y(ST_ClosestPoint(c.geom, (SELECT p FROM origin))) AS lat,
@@ -500,5 +518,278 @@ class RoadsController extends Controller
             'lng' => (float) $street->lng,
             'geometry' => json_decode($street->geometry, true),
         ]);
+    }
+
+    /**
+     * The path the network legally offers between two control points.
+     *
+     * The fourth lookup, and the one that starts where continue()'s comments
+     * stop short: that one guesses what street comes next because "there is
+     * no graph in this table". There is now — road_nodes and road_edges,
+     * rebuilt by roads:build-graph — and App\Geo\Router searches it edge by
+     * edge. Here is the other half: which slice of the network the question
+     * needs, where the two control points land on it, and what the editor's
+     * caller does with the answer.
+     *
+     * The corridor only carries edges whose two endpoints sit inside the
+     * origin-destination box, padded by a quarter of the distance plus a
+     * floor. The full graph is ~175k edges and a tramo is a few kilometres,
+     * so loading the city whole per request would pay for streets the answer
+     * cannot cross; the same box the padded query asks the (lat, lng) index
+     * for is a few thousand instead. The floor exists because a route may
+     * leave the straight line without leaving the sensible answer — a detour
+     * around a one-way block is precisely the legal path a bare box would
+     * cut in half.
+     *
+     * The refusal shape is richer than snap()'s 204 on purpose. A tramo the
+     * router cannot draw has to say why: a control point nowhere near a
+     * street is fixed by moving it, an impossible pairing is fixed by adding
+     * a control point, and a client that cannot tell the two apart would ask
+     * for the correction nobody needed.
+     */
+    public function route(RouteRoadRequest $request): JsonResponse
+    {
+        // The graph is driver-agnostic (plain columns), so there is no driver
+        // gate here — unlike the three lookups above. What is checked instead
+        // is that it exists at all: an empty road_edges is "no resource built
+        // yet", which is a missing-route answer, not a 500.
+        if (DB::selectOne('SELECT 1 AS one FROM road_edges LIMIT 1') === null) {
+            return response()->json(null, 404);
+        }
+
+        $origin = $request->origin();
+        $destination = $request->destination();
+        $bearing = $request->bearing();
+        $radius = $request->radius();
+
+        $distance = GreatCircle::metersBetween(
+            [$origin['lng'], $origin['lat']],
+            [$destination['lng'], $destination['lat']],
+        );
+
+        $pad = max(300.0, $distance * 0.25);
+        $midLat = ($origin['lat'] + $destination['lat']) / 2;
+        $latPad = $pad / 110574.0;
+        $lngPad = $pad / (111320.0 * max(cos(deg2rad($midLat)), 0.01));
+
+        $west = min($origin['lng'], $destination['lng']) - $lngPad;
+        $east = max($origin['lng'], $destination['lng']) + $lngPad;
+        $south = min($origin['lat'], $destination['lat']) - $latPad;
+        $north = max($origin['lat'], $destination['lat']) + $latPad;
+
+        $nodes = [];
+
+        foreach (
+            DB::table('road_nodes')
+                ->whereBetween('lat', [$south, $north])
+                ->whereBetween('lng', [$west, $east])
+                ->get(['id', 'lat', 'lng']) as $node
+        ) {
+            $nodes[(int) $node->id] = [(float) $node->lng, (float) $node->lat];
+        }
+
+        $edges = [];
+
+        foreach (
+            DB::table('road_edges as e')
+                ->join('road_nodes as f', fn ($join) => $join
+                    ->on('f.id', '=', 'e.from_node_id')
+                    ->whereBetween('f.lat', [$south, $north])
+                    ->whereBetween('f.lng', [$west, $east]))
+                ->join('road_nodes as t', fn ($join) => $join
+                    ->on('t.id', '=', 'e.to_node_id')
+                    ->whereBetween('t.lat', [$south, $north])
+                    ->whereBetween('t.lng', [$west, $east]))
+                ->get(['e.from_node_id', 'e.to_node_id', 'e.road_id', 'e.length_m', 'e.forward_ok', 'e.backward_ok']) as $edge
+        ) {
+            $edges[] = [
+                'from' => (int) $edge->from_node_id,
+                'to' => (int) $edge->to_node_id,
+                'road_id' => (int) $edge->road_id,
+                'length_m' => (float) $edge->length_m,
+                'forward_ok' => (bool) $edge->forward_ok,
+                'backward_ok' => (bool) $edge->backward_ok,
+            ];
+        }
+
+        $roadIds = array_values(array_unique(array_map(
+            fn (array $edge): int => $edge['road_id'],
+            $edges,
+        )));
+
+        $roads = [];
+
+        if ($roadIds !== []) {
+            foreach (
+                DB::table('roads')->whereIn('id', $roadIds)->get(['id', 'osm_id', 'name', 'highway']) as $road
+            ) {
+                $roads[(int) $road->id] = [
+                    'osm_id' => (int) $road->osm_id,
+                    'name' => $road->name,
+                    'highway' => (string) $road->highway,
+                ];
+            }
+        }
+
+        $restrictions = [];
+
+        foreach (
+            DB::table('turn_restrictions')
+                ->whereBetween('via_lat', [$south, $north])
+                ->whereBetween('via_lng', [$west, $east])
+                ->get(['from_osm_way', 'to_osm_way', 'via_lat', 'via_lng', 'kind']) as $restriction
+        ) {
+            $restrictions[] = [
+                'from_osm_way' => (int) $restriction->from_osm_way,
+                'to_osm_way' => (int) $restriction->to_osm_way,
+                'via' => [(float) $restriction->via_lng, (float) $restriction->via_lat],
+                'kind' => (string) $restriction->kind,
+            ];
+        }
+
+        $outgoingBearings = [];
+
+        foreach ($edges as $edge) {
+            $from = $nodes[$edge['from']];
+            $to = $nodes[$edge['to']];
+
+            if ($edge['forward_ok']) {
+                $outgoingBearings[$edge['from']][] = self::compassHeading($from, $to);
+            }
+
+            if ($edge['backward_ok']) {
+                $outgoingBearings[$edge['to']][] = self::compassHeading($to, $from);
+            }
+        }
+
+        $originNode = $this->snapNode($nodes, $origin, $radius, $outgoingBearings, $bearing);
+
+        if ($originNode === null) {
+            return $this->routeRefusal('origin-too-far');
+        }
+
+        $destinationNode = $this->snapNode($nodes, $destination, $radius, [], null);
+
+        if ($destinationNode === null) {
+            return $this->routeRefusal('destination-too-far');
+        }
+
+        $outcome = (new Router($nodes, $edges, $roads, $restrictions))
+            ->route($originNode['id'], $destinationNode['id']);
+
+        if (! $outcome->found()) {
+            return $this->routeRefusal((string) $outcome->reason);
+        }
+
+        $warnings = [];
+
+        // The editor's normal snap threshold: anything below it is a placement
+        // the reviewer cannot tell apart from the exact vertex, so a number
+        // here would be noise, not news.
+        if ($originNode['distance'] > 25.0) {
+            $warnings[] = sprintf('origin-snapped-%dm', (int) round($originNode['distance']));
+        }
+
+        if ($destinationNode['distance'] > 25.0) {
+            $warnings[] = sprintf('destination-snapped-%dm', (int) round($destinationNode['distance']));
+        }
+
+        return response()->json([
+            'status' => 'ok',
+            'coordinates' => $outcome->coordinates,
+            'streets' => $outcome->streets,
+            'distance_m' => $outcome->distanceM,
+            'warnings' => $warnings,
+            'reason' => null,
+        ]);
+    }
+
+    private function routeRefusal(string $reason): JsonResponse
+    {
+        return response()->json([
+            'status' => 'none',
+            'coordinates' => null,
+            'streets' => null,
+            'distance_m' => null,
+            'warnings' => [],
+            'reason' => $reason,
+        ]);
+    }
+
+    /**
+     * The node a control point lands on.
+     *
+     * The bearing is what picks the carriageway. On a divided road the wrong
+     * half is metres closer and completely wrong, so distance alone is the
+     * question that has a different answer from the right one — and each
+     * degree of disagreement costs a metre of equivalent distance, which for
+     * a 180-degree mistake means the wrong half loses even when it is fifteen
+     * metres nearer. No heading to argue with (a destination end has none),
+     * the plain nearest node wins.
+     *
+     * @param  array<int, array{0: float, 1: float}>  $nodes  nodeId => [lng, lat]
+     * @param  array{lat: float, lng: float}  $point
+     * @param  array<int, list<float>>  $outgoingBearings  nodeId => compass headings of legs leaving it
+     * @return array{id: int, distance: float}|null
+     */
+    private function snapNode(
+        array $nodes,
+        array $point,
+        float $radius,
+        array $outgoingBearings,
+        ?float $bearing,
+    ): ?array {
+        $bestId = null;
+        $bestScore = INF;
+        $bestDistance = 0.0;
+
+        foreach ($nodes as $id => $position) {
+            $distance = GreatCircle::metersBetween([$point['lng'], $point['lat']], $position);
+
+            if ($distance > $radius) {
+                continue;
+            }
+
+            $score = $distance;
+
+            if ($bearing !== null) {
+                $disagreement = 180.0;
+
+                foreach ($outgoingBearings[$id] ?? [] as $heading) {
+                    $disagreement = min($disagreement, self::headingDiff($heading, $bearing));
+                }
+
+                $score += $disagreement;
+            }
+
+            if ($score < $bestScore) {
+                $bestScore = $score;
+                $bestId = $id;
+                $bestDistance = $distance;
+            }
+        }
+
+        return $bestId === null ? null : ['id' => $bestId, 'distance' => $bestDistance];
+    }
+
+    /**
+     * The angle between two compass headings, folded to [0, 180].
+     *
+     * @param  array{0: float, 1: float}  $from
+     * @param  array{0: float, 1: float}  $to
+     */
+    private static function compassHeading(array $from, array $to): float
+    {
+        $east = ($to[0] - $from[0]) * cos(deg2rad($from[1]));
+        $north = $to[1] - $from[1];
+
+        return fmod(atan2($east, $north) * 180.0 / M_PI + 360.0, 360.0);
+    }
+
+    private static function headingDiff(float $one, float $other): float
+    {
+        $delta = abs($one - $other);
+
+        return $delta > 180.0 ? 360.0 - $delta : $delta;
     }
 }

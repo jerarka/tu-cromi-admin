@@ -16,8 +16,8 @@ import type { History } from './undoStack';
  * record() pushes the state being left behind, so the undo stack holds the
  * states a step would return to — never the one on screen.
  */
-function built(limit = 10): History {
-    return record(record(emptyHistory(), 'a', limit), 'b', limit);
+function built(limit = 10): History<string> {
+    return record(record(emptyHistory<string>(), 'a', limit), 'b', limit);
 }
 
 describe('record', () => {
@@ -195,5 +195,56 @@ describe('canUndo and canRedo', () => {
     test('a fresh history can do neither', () => {
         expect(canUndo(emptyHistory())).toBe(false);
         expect(canRedo(emptyHistory())).toBe(false);
+    });
+});
+
+/**
+ * The guided editor's state: the geometry text and the control points a
+ * tramo hangs from travel as one entry, because two parallel stacks could
+ * desync — one undoing what the other never saw.
+ */
+interface GuidedState {
+    geometry: string;
+    waypoints: string[];
+}
+
+describe('a composite state (the guided pair)', () => {
+    const state = (geometry: string, ...waypoints: string[]): GuidedState => ({
+        geometry,
+        waypoints,
+    });
+
+    test('the pair is restored whole, geometry and controls together', () => {
+        const history = record(
+            record(emptyHistory<GuidedState>(), state('a', 'w1'), 10),
+            state('b', 'w1', 'w2'),
+            10,
+        );
+
+        const step = undoStep(history, state('c', 'w1', 'w2', 'w3'));
+
+        expect(step.value).toEqual(state('b', 'w1', 'w2'));
+    });
+
+    test('redo replays the composite pair too', () => {
+        const first = record(emptyHistory<GuidedState>(), state('a', 'w1'), 10);
+        const undone = undoStep(first, state('b', 'w1', 'w2'));
+        const redone = redoStep(undone.history, undone.value!);
+
+        expect(redone.value).toEqual(state('b', 'w1', 'w2'));
+    });
+
+    test('an aliased object in the stack is not the entry the next record pushed', () => {
+        // The caller builds one state object and hands it over; if the stack
+        // kept it by reference and the caller then mutated it, the stack's
+        // "old" state would change under it. record() stores what it was
+        // handed, so the caller who mutates after recording lies to the
+        // stack — the assertion documents which side owns the copy.
+        const shared = state('a', 'w1');
+        const history = record(emptyHistory<GuidedState>(), shared, 10);
+
+        shared.waypoints.push('w2');
+
+        expect(history.undo[0].waypoints).toEqual(['w1', 'w2']);
     });
 });

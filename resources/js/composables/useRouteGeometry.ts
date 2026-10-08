@@ -5,7 +5,7 @@ import lines from '@/routes/lines';
 import type { Line } from '@/types/line';
 
 /** What the map editor is doing with a click. */
-export type EditMode = 'move' | 'add' | 'delete';
+export type EditMode = 'move' | 'add' | 'delete' | 'guide';
 
 export type RouteGeometry = NonNullable<Line['geo_json']>;
 

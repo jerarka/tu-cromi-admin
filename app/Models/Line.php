@@ -488,6 +488,68 @@ class Line extends Model
         return $this->hasMany(self::class, 'parent_line_id');
     }
 
+    /** @return HasMany<LineWaypoint, $this> */
+    public function waypoints(): HasMany
+    {
+        return $this->hasMany(LineWaypoint::class)
+            ->orderBy('ordinal');
+    }
+
+    /**
+     * Replace the route's control points with the ones the editor sent.
+     *
+     * Wipe-and-rebuild, like every derived table here: a line has at most
+     * ~200 waypoints, so a diff would price more reasoning than the rows it
+     * saves, and a whole-replace can never leave half of an old recipe below
+     * a new one. Runs inside the caller's transaction — a save writes the
+     * geometry and its recipe as one edit or not at all.
+     *
+     * Ordinal and role are derived here from the array's order and never
+     * taken from the client: ordinal is the array position, role is first =
+     * start, last = end, everything between = via. Same rule as the editor's
+     * own waypointRoleAt(), so neither side can drift about what a role is;
+     * and a payload the client cannot lie about needs no validation of those
+     * two fields at all.
+     *
+     * An empty payload clears the recipe — the caller's own decision, which
+     * is why a missing form field means "leave it alone" at the controller
+     * and this method only ever sees a list someone chose to send.
+     *
+     * @param  list<array{lat: float, lng: float}>  $waypoints
+     */
+    public function syncWaypoints(array $waypoints): void
+    {
+        $this->waypoints()->delete();
+
+        if ($waypoints === []) {
+            return;
+        }
+
+        $rows = [];
+
+        foreach ($waypoints as $ordinal => $point) {
+            $count = count($waypoints);
+            $isFirst = $ordinal === 0;
+            $isLast = $ordinal === $count - 1;
+
+            $rows[] = [
+                'line_id' => $this->id,
+                'ordinal' => $ordinal,
+                'role' => match (true) {
+                    $isFirst => 'start',
+                    $isLast => 'end',
+                    default => 'via',
+                },
+                'lat' => (float) $point['lat'],
+                'lng' => (float) $point['lng'],
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+        }
+
+        $this->waypoints()->createMany($rows);
+    }
+
     /** @return HasMany<Favorite, $this> */
     public function favorites(): HasMany
     {

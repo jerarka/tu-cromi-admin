@@ -1,5 +1,13 @@
 <script setup lang="ts">
-import { HelpCircle, Ruler, Trash2, Waves } from '@lucide/vue';
+import {
+    Check,
+    HelpCircle,
+    PencilLine,
+    Ruler,
+    Trash2,
+    Waves,
+    X,
+} from '@lucide/vue';
 import L from 'leaflet';
 import { computed, nextTick, ref, watch, onMounted, onUnmounted } from 'vue';
 import 'leaflet/dist/leaflet.css';
@@ -16,6 +24,30 @@ import {
     TooltipTrigger,
 } from '@/components/ui/tooltip';
 import { usePropagation } from '@/composables/usePropagation';
+import {
+    appendVertexToTail,
+    appendWaypoint,
+    describeDetached,
+    describeRoute,
+    describeRouteRefusal,
+    describeRouteWarnings,
+    describeRoutedPending,
+    detachedWaypoints,
+    DETACHED_TOLERANCE_METERS,
+    extensionEndpoints,
+    finalHeading,
+    findVertexForWaypoint,
+    headingAtVertex,
+    headingBetween,
+    insertWaypointAt,
+    prependTramo,
+    prependWaypoint,
+    removeWaypoint,
+    replaceTramoSpan,
+    spliceTramo,
+    WAYPOINT_LIMIT,
+} from '@/lib/guidedRouting';
+import type { GuideEnd, VertexAddress, Waypoint } from '@/lib/guidedRouting';
 import { consumePreserveToken } from '@/lib/mapView';
 import {
     applyDeltaToSelection,
@@ -28,6 +60,7 @@ import {
     describeResample,
     describeResampleHint,
     describeSelectionState,
+    distanceMeters,
     findClosestSegment,
     insertVertexAt,
     LAY_MAX_CROSSINGS,
@@ -60,6 +93,7 @@ import {
     describeRelay,
     describeSnap,
     lookupRelayStreets,
+    lookupRoute,
     lookupSnapStreets,
     SNAP_LOOKUP_TIMEOUT_MS,
 } from '@/lib/snapTransport';
@@ -71,7 +105,17 @@ const props = defineProps<{
         coordinates: number[][][];
     } | null;
     editable?: boolean;
-    mode?: 'move' | 'add' | 'delete';
+    mode?: 'move' | 'add' | 'delete' | 'guide';
+    /**
+     * The control points accepted so far, owned by the parent.
+     *
+     * The parent is the source of truth — they are the state that gets
+     * persisted with the route — and the map only renders them and asks for
+     * changes through the update:guided event. Holding a local copy would
+     * make undo restoration a second synchronization problem, and undo is
+     * exactly the thing that must restore geometry and controls together.
+     */
+    guidedWaypoints?: Waypoint[];
     /**
      * How hard a drop is pulled onto the street network.
      *
@@ -156,6 +200,22 @@ const emit = defineEmits<{
      * of truth for the distance the next press will actually use.
      */
     (e: 'update:resampleSpacing', value: ResampleSpacing): void;
+    /**
+     * A guided action produced its result, and the parent owns both halves.
+     *
+     * One event rather than two because accepting a tramo is one edit: the
+     * geometry splice and the control point that anchors it. The parent
+     * records its composite undo entry from the state it held BEFORE this
+     * event, so splitting the emit would record a half-state — new geometry
+     * with old controls — between the two.
+     *
+     * `coordinates` is null when only the control list changed (a first
+     * control placed on an empty route, which has no tramo yet).
+     */
+    (
+        e: 'update:guided',
+        payload: { coordinates: Coordinates | null; waypoints: Waypoint[] },
+    ): void;
 }>();
 
 /**
@@ -215,6 +275,139 @@ let endpointMarkers: L.Marker[] = [];
 /** Which street a dropped vertex was pulled onto, shown briefly. */
 const snapLabel = ref<string | null>(null);
 let snapLabelTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** The control points of the guided mode, drawn over the route. */
+let guidedMarkers: L.CircleMarker[] = [];
+
+/**
+ * The look of a control point: the same dot-and-ring language as a vertex,
+ * in amber — the colour of a proposal rather than an edit — and one size up,
+ * because a control sits over a vertex most of the time and must read as
+ * something above it. A selected one fills: the same filled-not-recoloured
+ * rule the delete mode's selection uses.
+ */
+function guidedMarkerStyle(selected = false): L.CircleMarkerOptions {
+    return {
+        radius: 8,
+        color: '#d97706',
+        fillColor: selected ? '#d97706' : '#ffffff',
+        fillOpacity: 1,
+        weight: 3,
+    };
+}
+
+function clearGuidedMarkers(): void {
+    guidedMarkers.forEach((marker) => map?.removeLayer(marker));
+    guidedMarkers = [];
+}
+
+/** Repaint the controls' fills for the current selection, without rebuilding. */
+function refreshWaypointSelection(): void {
+    if (isDragging) {
+        return;
+    }
+
+    const waypoints = props.guidedWaypoints;
+
+    if (!waypoints?.length) {
+        return;
+    }
+
+    guidedMarkers.forEach((marker, index) => {
+        marker.setStyle(guidedMarkerStyle(selectedWaypoint.value === index));
+    });
+}
+
+function renderGuidedMarkers(): void {
+    clearGuidedMarkers();
+
+    const waypoints = props.guidedWaypoints;
+
+    if (!map || !waypoints?.length) {
+        return;
+    }
+
+    waypoints.forEach((waypoint, index) => {
+        const marker = L.circleMarker(
+            L.latLng(waypoint.position[1], waypoint.position[0]),
+            guidedMarkerStyle(selectedWaypoint.value === index),
+        );
+
+        // Clicking a control selects it: the row's Remove control is what
+        // acts on the selection, per §4.5. A click during a pending offer
+        // would move state under the thing being judged — refused.
+        marker.on('click', (e: L.LeafletMouseEvent) => {
+            L.DomEvent.stopPropagation(e.originalEvent);
+
+            if (props.mode !== 'guide' || guidedOffer.value !== null) {
+                return;
+            }
+
+            selectedWaypoint.value =
+                selectedWaypoint.value === index ? null : index;
+        });
+
+        marker.on('mousedown', (e: L.LeafletMouseEvent) => {
+            beginWaypointDrag(marker, index, e);
+        });
+
+        marker.addTo(map!);
+        guidedMarkers.push(marker);
+    });
+}
+
+/**
+ * Drag one control; the recalculation happens on the drop.
+ *
+ * The live marker moves under the cursor; nothing is emitted until the mouse
+ * comes up, because the recalculation is two chained route searches and a
+ * change of mind mid-drag must not leave half of it behind. A press that
+ * never moved is a click — selection's gesture — and the drag is abandoned
+ * without touching anything.
+ */
+function beginWaypointDrag(
+    marker: L.CircleMarker,
+    index: number,
+    e: L.LeafletMouseEvent,
+): void {
+    if (props.mode !== 'guide' || guidedOffer.value !== null) {
+        return;
+    }
+
+    L.DomEvent.stopPropagation(e.originalEvent);
+
+    isDragging = true;
+    map?.dragging.disable();
+
+    const origin = e.latlng;
+    let latest = origin;
+    let wasMoved = false;
+
+    const onMouseMove = (move: L.LeafletMouseEvent): void => {
+        wasMoved = true;
+        latest = move.latlng;
+        marker.setLatLng(move.latlng);
+    };
+
+    const onMouseUp = (): void => {
+        map?.off('mousemove', onMouseMove);
+        map?.dragging.enable();
+        document.removeEventListener('mouseup', onMouseUp);
+        isDragging = false;
+
+        if (!wasMoved) {
+            return;
+        }
+
+        const dropped: Position = [latest.lng, latest.lat];
+
+        selectedWaypoint.value = null;
+        void recalculateMovedWaypoint(index, dropped);
+    };
+
+    map?.on('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+}
 
 /**
  * The vertices a drag would move.
@@ -291,7 +484,12 @@ function verticesWithin(bounds: L.LatLngBounds): VertexRef[] {
  * placing vertices, and a selection there would have nothing to select for.
  */
 function startMarquee(e: L.LeafletMouseEvent): void {
-    if (!map || !props.editable || (props.mode ?? 'move') === 'add') {
+    if (
+        !map ||
+        !props.editable ||
+        (props.mode ?? 'move') === 'add' ||
+        (props.mode ?? 'move') === 'guide'
+    ) {
         return;
     }
 
@@ -494,16 +692,23 @@ function handleWindowResize(): void {
     }, 150);
 }
 
-function updateMapClickListener(mode: 'move' | 'add' | 'delete'): void {
+function updateMapClickListener(
+    mode: 'move' | 'add' | 'delete' | 'guide',
+): void {
     if (!map) {
         return;
     }
 
     map.off('click', handleAddVertexClick);
+    map.off('click', handleGuidedClick);
     map.off('mousedown', startMarquee);
 
     if (props.editable && mode === 'add') {
         map.on('click', handleAddVertexClick);
+    }
+
+    if (props.editable && mode === 'guide') {
+        map.on('click', handleGuidedClick);
     }
 
     if (props.editable && (mode === 'move' || mode === 'delete')) {
@@ -660,6 +865,13 @@ function renderMap(): void {
     const coordinates = props.geoJson?.coordinates;
 
     if (!coordinates?.length) {
+        // An empty route still needs its click listener: drawing starts
+        // here, in add mode and in guided mode alike. Skipping this bound
+        // the listener for the whole visit and the first click did nothing.
+        if (props.editable) {
+            updateMapClickListener(props.mode ?? 'move');
+        }
+
         return;
     }
 
@@ -722,7 +934,7 @@ function consumePreserveView(): boolean {
  */
 function vertexStyle(
     selected: boolean,
-    mode: 'move' | 'add' | 'delete',
+    mode: 'move' | 'add' | 'delete' | 'guide',
 ): L.CircleMarkerOptions {
     if (mode === 'delete') {
         /**
@@ -787,7 +999,7 @@ function refreshMarkerStyles(): void {
 function addVertexMarkers(
     coords: Coordinates,
     latlngs: L.LatLngTuple[][],
-    mode: 'move' | 'add' | 'delete',
+    mode: 'move' | 'add' | 'delete' | 'guide',
 ): void {
     coords.forEach((segment, segIdx) => {
         segment.forEach((_, pointIdx) => {
@@ -1451,6 +1663,923 @@ function announceResample(label: string | null): void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Guided mode: control points, one routed tramo at a time.
+// ---------------------------------------------------------------------------
+
+/** What a pending offer carries, and what accepting it will do. */
+interface GuidedOffer {
+    /**
+     * Extending grows the list at the active frontier; inserting splits a
+     * span; removing joints its neighbours' tramo back together. Each kind
+     * has its own acceptance geometry, which is why the kind travels with
+     * the offer rather than being re-derived at accept time.
+     */
+    kind: 'extend-tail' | 'extend-head' | 'insert' | 'remove';
+    /** The router answers this offer is made of, in travel order. */
+    tramos: Position[][];
+    label: string;
+    /** Insertion: the waypoint index the new control will take. */
+    insertIndex?: number;
+    /** Insertion: the span's bounding waypoints, as current vertex addresses. */
+    spanFrom?: VertexAddress;
+    spanTo?: VertexAddress;
+    /** Removal: the waypoint index this offer would take away. */
+    removeIndex?: number;
+}
+
+const guidedOffer = ref<GuidedOffer | null>(null);
+
+/** Whether the next clicks place vertices directly instead of asking the router. */
+const guidedManual = ref(false);
+
+/**
+ * Which end a plain away-from-the-route click extends.
+ *
+ * The tail is the default — routes are drawn in their travel order — and the
+ * toggle flips the frontier so the same gesture can build the route the
+ * other way around. Retained only for the visit; the extended route itself
+ * does not care which end built it.
+ */
+const guideFrontier = ref<GuideEnd>('tail');
+
+/**
+ * The control point selected by clicking its marker, if any.
+ *
+ * Selection is what makes an interior control removable (§4.5): the row
+ * gains a "Remove control" while a selection lives, and the preview of the
+ * joined tramo is what the reviewer confirms.
+ */
+const selectedWaypoint = ref<number | null>(null);
+
+/** What the guided mode last did or refused, said in the overlay. */
+const guidedLabel = ref<string | null>(null);
+let guidedLabelTimer: ReturnType<typeof setTimeout> | null = null;
+
+function announceGuided(label: string | null): void {
+    if (guidedLabelTimer) {
+        clearTimeout(guidedLabelTimer);
+    }
+
+    guidedLabel.value = label;
+
+    if (label !== null) {
+        guidedLabelTimer = setTimeout(() => {
+            guidedLabel.value = null;
+        }, 9000);
+    }
+}
+
+let guidedLayers: L.Polyline[] = [];
+
+function clearGuidedLayer(): void {
+    guidedLayers.forEach((layer) => map?.removeLayer(layer));
+    guidedLayers = [];
+}
+
+function renderGuidedPreview(): void {
+    clearGuidedLayer();
+
+    const offer = guidedOffer.value;
+
+    if (!map || !offer) {
+        return;
+    }
+
+    for (const tramo of offer.tramos) {
+        guidedLayers.push(
+            L.polyline(
+                tramo.map((position) => L.latLng(position[1], position[0])),
+                {
+                    color: '#f59e0b',
+                    weight: 4,
+                    opacity: 0.9,
+                    dashArray: '8 6',
+                },
+            ).addTo(map),
+        );
+    }
+}
+
+/** The last control's position, or null with nothing to route from. */
+function lastGuidedPosition(waypoints: Waypoint[]): Position | null {
+    const last = waypoints[waypoints.length - 1];
+
+    return last ? [last.position[0], last.position[1]] : null;
+}
+
+/** The first control's position — the end a head extension grows from. */
+function firstGuidedPosition(waypoints: Waypoint[]): Position | null {
+    const first = waypoints[0];
+
+    return first ? [first.position[0], first.position[1]] : null;
+}
+
+/**
+ * The insertion this click offers, when it lands on a span the recipe owns.
+ *
+ * The recipe's spans are delimited by its waypoints' vertices — re-derived,
+ * never stored — and a click lands within one of them when the closest
+ * segment of the route sits between two consecutive bounds. Outside the
+ * bounds (behind the start, past the end) there is no tramo to split, and
+ * extension is the honest answer.
+ */
+function insertionTarget(
+    clicked: Position,
+): { from: VertexAddress; to: VertexAddress; insertIndex: number } | null {
+    const coordinates = props.geoJson?.coordinates;
+
+    if (!coordinates?.length) {
+        return null;
+    }
+
+    const waypoints = props.guidedWaypoints ?? [];
+    const waypointsCount = waypoints.length;
+
+    if (waypointsCount < 2) {
+        return null;
+    }
+
+    // The bounds, in vertex-index order. A detached bound (no vertex within
+    // tolerance) cannot delimit anything — the route stopped agreeing with
+    // that end, which is the detached warning's business, not a split's.
+    const bounds: (VertexAddress | null)[] = waypoints.map((waypoint) =>
+        findVertexForWaypoint(coordinates, waypoint),
+    );
+
+    if (bounds.some((bound) => bound === null)) {
+        return null;
+    }
+
+    const ordered = bounds.map((bound, index) => ({
+        waypointIndex: index,
+        address: bound as VertexAddress,
+    }));
+
+    // Climb: the clicked vertex must sit inside exactly one consecutive pair.
+    const hit = findClosestSegment(clicked, coordinates);
+
+    if (hit === null || hit.segIdx !== 0) {
+        return null;
+    }
+
+    const a = coordinates[0][hit.pointIdx];
+    const b = coordinates[0][hit.pointIdx + 1];
+
+    if (!a || !b) {
+        return null;
+    }
+
+    const projection = projectOnSegment(clicked, a as Position, b as Position);
+
+    if (distanceMeters(clicked, projection.point) > DETACHED_TOLERANCE_METERS) {
+        return null;
+    }
+
+    // The span whose first bound's vertex index is <= the clicked segment's
+    // start and whose second bound follows it. Ties (a bound exactly on the
+    // clicked segment's start) belong to the span BEFORE it — insertion on a
+    // boundary vertex makes no sense anyway, since that is where splits
+    // already exist.
+    let anchor = -1;
+
+    for (let i = 0; i < ordered.length - 1; i += 1) {
+        const from = ordered[i].address;
+        const to = ordered[i + 1].address;
+
+        if (from.segment !== 0) {
+            continue;
+        }
+
+        if (from.index <= hit.pointIdx && to.index >= hit.pointIdx + 1) {
+            anchor = i;
+
+            break;
+        }
+    }
+
+    if (anchor === -1) {
+        return null;
+    }
+
+    return {
+        from: ordered[anchor].address,
+        to: ordered[anchor + 1].address,
+        insertIndex: ordered[anchor + 1].waypointIndex,
+    };
+}
+
+/**
+ * A click in guided mode: place a control point, then route to it.
+ *
+ * Three questions answer in order. Nothing behind the click starts the list.
+ * A hand-drawing session places the vertex straight out. And a click that
+ * lands on a span the recipe owns is an insertion — split that span — while
+ * everything else extends the route from the active frontier. Spec §2: the
+ * system proposes, the user decides; §4: the existing recipe is editable at
+ * its own points.
+ *
+ * The revision guard is the same one a drop's refinement uses: a click
+ * while a route search is in flight is a change of mind, and applying a
+ * stale answer would draw a tramo for a control point nobody kept.
+ */
+async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
+    if (props.mode !== 'guide' || !map || guidedOffer.value !== null) {
+        return;
+    }
+
+    const clicked: Position = [e.latlng.lng, e.latlng.lat];
+    const waypoints = props.guidedWaypoints ?? [];
+    const from =
+        guideFrontier.value === 'tail'
+            ? lastGuidedPosition(waypoints)
+            : firstGuidedPosition(waypoints);
+
+    if (from === null) {
+        // First control, nothing behind it. The position is the raw click:
+        // only the router's answer knows the road, and there is no answer
+        // to take a position from yet.
+        emitGuided(null, [{ position: clicked, role: 'start' }]);
+        announceGuided(
+            'Control point placed. Click the next one to trace the tramo.',
+        );
+
+        return;
+    }
+
+    if (waypoints.length >= WAYPOINT_LIMIT) {
+        announceGuided('This route holds too many control points already.');
+
+        return;
+    }
+
+    if (guidedManual.value) {
+        // Drawing by hand: the click IS the vertex. Appended at the tail
+        // like a routed tramo would be, and it becomes a control all the
+        // same — the next click traces from it.
+        const coordinates = props.geoJson?.coordinates ?? [];
+
+        emitGuided(
+            appendVertexToTail(coordinates, clicked),
+            appendWaypoint(waypoints, clicked),
+        );
+        announceGuided('Vertex placed by hand.');
+
+        return;
+    }
+
+    if (guideFrontier.value === 'tail') {
+        const target = insertionTarget(clicked);
+
+        if (target !== null) {
+            await offerInsertion(clicked, waypoints, target);
+
+            return;
+        }
+    }
+
+    await offerExtension(clicked, waypoints, from);
+}
+
+/**
+ * Two chained route calls for an insertion, offered as one judgement.
+ *
+ * The first tramo runs from the span's start bound to the click, leaving
+ * with the heading the route arrives at that bound with; the second runs
+ * from the click to the end bound with the FIRST answer's arrival heading —
+ * chained, so a detour's second half leaves pointing where the detour
+ * came back from. Both or neither: an offer that splits a span but cannot
+ * join the other side would leave the recipe describing a route it does
+ * not draw.
+ */
+async function offerInsertion(
+    clicked: Position,
+    waypoints: Waypoint[],
+    target: { from: VertexAddress; to: VertexAddress; insertIndex: number },
+): Promise<void> {
+    const coordinates = props.geoJson?.coordinates ?? [];
+    const from = waypoints[target.insertIndex - 1].position;
+    const to = waypoints[target.insertIndex].position;
+
+    announceGuided(describeRoutedPending());
+
+    const firstRevision = ++geometryRevision;
+    const first = await lookupRoute(
+        from,
+        clicked,
+        headingAtVertex(coordinates, target.from.segment, target.from.index) ??
+            headingBetween(from, clicked),
+        document.cookie,
+    );
+
+    if (props.mode !== 'guide' || geometryRevision !== firstRevision) {
+        return;
+    }
+
+    if (first === null || first.status !== 'ok' || first.coordinates === null) {
+        announceGuided(describeRouteRefusal(first?.reason ?? null));
+
+        return;
+    }
+
+    const second = await lookupRoute(
+        clicked,
+        to,
+        finalHeading([first.coordinates]),
+        document.cookie,
+    );
+
+    if (props.mode !== 'guide' || geometryRevision !== firstRevision) {
+        return;
+    }
+
+    if (
+        second === null ||
+        second.status !== 'ok' ||
+        second.coordinates === null
+    ) {
+        announceGuided(describeRouteRefusal(second?.reason ?? null));
+
+        return;
+    }
+
+    const streets = [...(first.streets ?? []), ...(second.streets ?? [])];
+
+    guidedOffer.value = {
+        kind: 'insert',
+        tramos: [first.coordinates, second.coordinates],
+        insertIndex: target.insertIndex,
+        spanFrom: target.from,
+        spanTo: target.to,
+        label:
+            describeRoute(
+                streets,
+                (first.distanceM ?? 0) + (second.distanceM ?? 0),
+            ) + describeRouteWarnings([...first.warnings, ...second.warnings]),
+    };
+
+    announceGuided(
+        `${guidedOffer.value.label}. Accept to split the tramo, or Reject.`,
+    );
+    renderGuidedPreview();
+}
+
+async function offerExtension(
+    clicked: Position,
+    waypoints: Waypoint[],
+    from: Position,
+): Promise<void> {
+    const atHead = guideFrontier.value === 'head';
+    const { origin, destination } = extensionEndpoints(
+        guideFrontier.value,
+        from,
+        clicked,
+    );
+
+    // The tail extends with the heading the route arrives with; the head
+    // extends from empty air, and the nearest thing to an intent the click
+    // carries is the straight line it aims at the route with — which is also
+    // the approach the snap should be looking for, now that the head's origin
+    // IS the click.
+    const bearing = atHead
+        ? headingBetween(clicked, from)
+        : finalHeading(props.geoJson?.coordinates ?? null);
+
+    const revision = ++geometryRevision;
+
+    announceGuided(describeRoutedPending());
+
+    const found = await lookupRoute(
+        origin,
+        destination,
+        bearing,
+        document.cookie,
+    );
+
+    if (props.mode !== 'guide' || geometryRevision !== revision) {
+        return;
+    }
+
+    if (found === null || found.status !== 'ok' || found.coordinates === null) {
+        guidedOffer.value = null;
+        announceGuided(describeRouteRefusal(found?.reason ?? null));
+
+        return;
+    }
+
+    guidedOffer.value = {
+        kind: atHead ? 'extend-head' : 'extend-tail',
+        tramos: [found.coordinates],
+        label:
+            describeRoute(found.streets ?? [], found.distanceM) +
+            describeRouteWarnings(found.warnings),
+    };
+    announceGuided(
+        `${guidedOffer.value.label}. Accept, or Reject to draw it yourself.`,
+    );
+    renderGuidedPreview();
+}
+
+/** One guided event out, with roles derived from the position in the list. */
+function emitGuided(
+    coordinates: Coordinates | null,
+    waypoints: Waypoint[],
+): void {
+    emit('update:guided', { coordinates, waypoints });
+}
+
+function acceptPreview(): void {
+    const offer = guidedOffer.value;
+    const waypoints = props.guidedWaypoints ?? [];
+
+    if (!offer || waypoints.length === 0) {
+        return;
+    }
+
+    const coordinates = props.geoJson?.coordinates ?? [];
+
+    switch (offer.kind) {
+        case 'extend-tail': {
+            const tramo = offer.tramos[0];
+            const freshRoute = waypoints.length === 1;
+
+            // On the first tramo the start control takes the router's own
+            // origin: the waypoint was placed on a raw click, the tramo
+            // starts where the network actually begins, and a control that
+            // sits off its own route is the disagreement a persisted record
+            // must not carry.
+            const accepted = appendWaypoint(
+                freshRoute
+                    ? [{ position: tramo[0], role: 'start' as const }]
+                    : waypoints,
+                tramo[tramo.length - 1],
+            );
+
+            emitGuided(spliceTramo(coordinates, tramo), accepted);
+
+            break;
+        }
+
+        case 'extend-head': {
+            const tramo = offer.tramos[0];
+
+            // The answer arrives new point -> the start the route already had
+            // (see extensionEndpoints), so its head is the new control and its
+            // tail is the join prependTramo drops. Reversing it here is the bug
+            // that sent the route back to its own origin.
+            emitGuided(
+                prependTramo(coordinates, tramo),
+                prependWaypoint(waypoints, tramo[0]),
+            );
+
+            break;
+        }
+
+        case 'insert': {
+            const tramos = offer.tramos;
+
+            if (
+                offer.spanFrom === undefined ||
+                offer.spanTo === undefined ||
+                offer.insertIndex === undefined
+            ) {
+                return;
+            }
+
+            // The bounds may have moved since the offer was made (an undo,
+            // another edit); re-derived rather than trusted.
+            const from = findVertexForWaypoint(
+                coordinates,
+                waypoints[offer.insertIndex - 1],
+            );
+            const to = findVertexForWaypoint(
+                coordinates,
+                waypoints[offer.insertIndex],
+            );
+
+            if (from === null || to === null || to.index <= from.index) {
+                announceGuided(describeRouteRefusal(null));
+
+                return;
+            }
+
+            emitGuided(
+                replaceTramoSpan(coordinates, from, to, [
+                    ...tramos[0],
+                    ...tramos[1].slice(1),
+                ]),
+                insertWaypointAt(
+                    waypoints,
+                    offer.insertIndex,
+                    tramos[0][tramos[0].length - 1],
+                ),
+            );
+
+            break;
+        }
+
+        case 'remove': {
+            const tramo = offer.tramos[0];
+
+            if (
+                offer.removeIndex === undefined ||
+                offer.spanFrom === undefined ||
+                offer.spanTo === undefined
+            ) {
+                return;
+            }
+
+            const next = removeWaypoint(waypoints, offer.removeIndex);
+
+            if (next === null) {
+                return;
+            }
+
+            // Spec §4.5's confirmation is this acceptance: the joined tramo
+            // was shown dashed and the reviewer pressed Accept on it.
+            emitGuided(
+                replaceTramoSpan(
+                    coordinates,
+                    offer.spanFrom,
+                    offer.spanTo,
+                    tramo,
+                ),
+                next,
+            );
+
+            break;
+        }
+    }
+
+    guidedOffer.value = null;
+    clearGuidedLayer();
+    announceGuided('Applied. Click the next control, or finish when done.');
+}
+
+function rejectPreview(): void {
+    guidedOffer.value = null;
+    clearGuidedLayer();
+    announceGuided(
+        'Preview dismissed. Click again to re-trace, or draw by hand.',
+    );
+}
+
+function toggleGuidedManual(): void {
+    guidedManual.value = !guidedManual.value;
+
+    announceGuided(
+        guidedManual.value
+            ? 'Drawing by hand: each click places a vertex directly.'
+            : 'Back to guided tracing.',
+    );
+}
+
+/**
+ * Pick the end the next click grows.
+ *
+ * Takes the target rather than flipping, because the two buttons say where
+ * they will take it and a click that lands somewhere else than its label
+ * promises is the confusion this replaced. Re-picking the end already active
+ * announces nothing: there is no change to report.
+ */
+function setGuideFrontier(end: GuideEnd): void {
+    if (guideFrontier.value === end) {
+        return;
+    }
+
+    guideFrontier.value = end;
+
+    announceGuided(
+        end === 'head'
+            ? 'Extending at the start of the route.'
+            : 'Extending at the end of the route.',
+    );
+}
+
+/** A stale preview is dismissed; a manual choice survives it. */
+function dismissPendingPreview(): void {
+    if (guidedOffer.value !== null) {
+        guidedOffer.value = null;
+        clearGuidedLayer();
+    }
+}
+
+/** Leaving guided mode takes the pending preview and the manual switch with it. */
+function cancelPendingPreview(): void {
+    dismissPendingPreview();
+    guidedManual.value = false;
+    guideFrontier.value = 'tail';
+    selectedWaypoint.value = null;
+}
+
+/** The recipe as a computed, for the template and the drag handlers. */
+const waypointsForGuide = computed<Waypoint[]>(
+    () => props.guidedWaypoints ?? [],
+);
+
+/**
+ * How many accepted controls no longer sit on their route, for the §3 pill.
+ *
+ * Computed rather than announced-once because the state it describes is
+ * derived: it changes under hand edits of the geometry and returns when the
+ * tramo is retraced. A pill that said it once and forgot would lie about the
+ * visit's actual state.
+ */
+const detachedCount = computed(
+    () =>
+        detachedWaypoints(
+            props.geoJson?.coordinates ?? [],
+            waypointsForGuide.value,
+        ).length,
+);
+
+/** The §3 sentence for the detached count, or '' when there is nothing to say. */
+const detachedText = computed(() => describeDetached(detachedCount.value));
+
+// ---------------------------------------------------------------------------
+// Spec §4.3: moving a control recalculates its two adjacent tramos.
+// ---------------------------------------------------------------------------
+
+/**
+ * A dropped control, recalculated.
+ *
+ * The two adjacent tramos are the only ones allowed to change (spec §4.3),
+ * and they are recalculated CHAINED on purpose: the arriving tramo runs to
+ * where the control was dropped and the waypoint takes that answer's on-road
+ * end, then the departing tramo leaves from THAT position — so both halves
+ * agree on where the control is, instead of two searches snapping it to two
+ * different nodes and the route splitting at its own control.
+ *
+ * Either side may refuse (§3): it keeps its old geometry and the warning is
+ * the honest outcome — the state emitted is whatever actually happened,
+ * partial included, because undo restores it all the same.
+ */
+async function recalculateMovedWaypoint(
+    index: number,
+    position: Position,
+): Promise<void> {
+    const waypoints = waypointsForGuide.value;
+    const coordinates = props.geoJson?.coordinates ?? [];
+
+    if (waypoints[index] === undefined || waypoints.length < 2) {
+        // A lone control has no tramos; the move is the whole edit.
+        emitGuided(
+            null,
+            waypoints.map((waypoint, i) =>
+                i === index ? { position, role: waypoint.role } : waypoint,
+            ),
+        );
+
+        return;
+    }
+
+    const revision = ++geometryRevision;
+
+    announceGuided(describeRoutedPending());
+
+    let workingCoordinates = coordinates;
+    let workingWaypoints = waypoints;
+    const failed: string[] = [];
+
+    if (index > 0) {
+        const previous = waypoints[index - 1];
+        const previousVertex = findVertexForWaypoint(
+            workingCoordinates,
+            previous,
+        );
+        const movedOldVertex = findVertexForWaypoint(
+            workingCoordinates,
+            waypoints[index],
+        );
+
+        if (previousVertex === null || movedOldVertex === null) {
+            // Either bound detached: the span cannot be delimited, which is
+            // the detached warning's ground, not a guess's.
+            failed.push(
+                'the tramo behind it could not be traced: a bound control is detached',
+            );
+        } else if (movedOldVertex.index <= previousVertex.index) {
+            failed.push(
+                'the tramo behind it is degenerate; it cannot be replaced',
+            );
+        } else {
+            const arrivalHeading =
+                headingAtVertex(
+                    workingCoordinates,
+                    previousVertex.segment,
+                    previousVertex.index,
+                ) ?? headingBetween(previous.position, position);
+
+            const tramo = await lookupRoute(
+                previous.position,
+                position,
+                arrivalHeading,
+                document.cookie,
+            );
+
+            if (props.mode !== 'guide' || geometryRevision !== revision) {
+                return;
+            }
+
+            if (
+                tramo === null ||
+                tramo.status !== 'ok' ||
+                tramo.coordinates === null
+            ) {
+                failed.push(describeRouteRefusal(tramo?.reason ?? null));
+            } else {
+                // The span behind the moved control disappears whole: the
+                // answer now runs to where the control was dropped, and the
+                // waypoint takes that on-road end as its position.
+                const movedEnd =
+                    tramo.coordinates[tramo.coordinates.length - 1];
+
+                workingCoordinates = replaceTramoSpan(
+                    workingCoordinates,
+                    previousVertex,
+                    movedOldVertex,
+                    tramo.coordinates,
+                );
+
+                workingWaypoints = workingWaypoints.map((waypoint, i) =>
+                    i === index
+                        ? {
+                              position: movedEnd,
+                              role: waypoint.role,
+                          }
+                        : waypoint,
+                );
+            }
+        }
+    }
+
+    if (index < waypoints.length - 1) {
+        const next = workingWaypoints[index + 1];
+        const origin = workingWaypoints[index];
+        const originVertex = findVertexForWaypoint(
+            workingCoordinates,
+            origin,
+            Number.POSITIVE_INFINITY,
+        );
+
+        if (originVertex === null) {
+            failed.push(
+                'the tramo ahead could not be traced: the moved control is off the route',
+            );
+        } else {
+            const departureHeading =
+                headingAtVertex(
+                    workingCoordinates,
+                    originVertex.segment,
+                    originVertex.index,
+                ) ?? headingBetween(origin.position, next.position);
+
+            const tramo = await lookupRoute(
+                origin.position,
+                next.position,
+                departureHeading,
+                document.cookie,
+            );
+
+            if (props.mode !== 'guide' || geometryRevision !== revision) {
+                return;
+            }
+
+            if (
+                tramo === null ||
+                tramo.status !== 'ok' ||
+                tramo.coordinates === null
+            ) {
+                failed.push(describeRouteRefusal(tramo?.reason ?? null));
+            } else {
+                const nextEnd = tramo.coordinates[tramo.coordinates.length - 1];
+                const nextVertex = findVertexForWaypoint(
+                    workingCoordinates,
+                    next,
+                );
+
+                if (nextVertex === null) {
+                    failed.push(
+                        'the control ahead is detached; its tramo cannot be replaced',
+                    );
+                } else {
+                    workingCoordinates = replaceTramoSpan(
+                        workingCoordinates,
+                        originVertex,
+                        nextVertex,
+                        tramo.coordinates,
+                    );
+
+                    workingWaypoints = workingWaypoints.map((waypoint, i) =>
+                        i === index + 1
+                            ? {
+                                  position: nextEnd,
+                                  role: waypoint.role,
+                              }
+                            : waypoint,
+                    );
+                }
+            }
+        }
+    }
+
+    emitGuided(
+        workingCoordinates === coordinates ? null : workingCoordinates,
+        workingWaypoints,
+    );
+
+    announceGuided(
+        failed.length > 0
+            ? `The control moved, but ${failed.join('; ')}.`
+            : 'Tramos recalculated around the moved control.',
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spec §4.5: removing an interior control, offered and confirmed.
+// ---------------------------------------------------------------------------
+
+/** The removal offer: the joined tramo, dashed, awaiting the confirm. */
+function startRemovePreview(): void {
+    const index = selectedWaypoint.value;
+
+    if (index === null || guidedOffer.value !== null) {
+        return;
+    }
+
+    const waypoints = waypointsForGuide.value;
+    const coordinates = props.geoJson?.coordinates ?? [];
+    const from = waypoints[index - 1];
+    const to = waypoints[index + 1];
+
+    if (from === undefined || to === undefined) {
+        return;
+    }
+
+    const fromVertex = findVertexForWaypoint(coordinates, from);
+    const toVertex = findVertexForWaypoint(coordinates, to);
+
+    if (
+        fromVertex === null ||
+        toVertex === null ||
+        toVertex.index <= fromVertex.index
+    ) {
+        announceGuided(
+            'The controls around this one are not on the route; the tramo cannot be joined.',
+        );
+
+        return;
+    }
+
+    void offerRemoval(index, from, to, fromVertex, toVertex);
+}
+
+async function offerRemoval(
+    index: number,
+    from: Waypoint,
+    to: Waypoint,
+    fromVertex: VertexAddress,
+    toVertex: VertexAddress,
+): Promise<void> {
+    const coordinates = props.geoJson?.coordinates ?? [];
+
+    announceGuided(describeRoutedPending());
+
+    const revision = ++geometryRevision;
+
+    const found = await lookupRoute(
+        from.position,
+        to.position,
+        headingAtVertex(coordinates, fromVertex.segment, fromVertex.index) ??
+            headingBetween(from.position, to.position),
+        document.cookie,
+    );
+
+    if (props.mode !== 'guide' || geometryRevision !== revision) {
+        return;
+    }
+
+    if (found === null || found.status !== 'ok' || found.coordinates === null) {
+        announceGuided(describeRouteRefusal(found?.reason ?? null));
+
+        return;
+    }
+
+    guidedOffer.value = {
+        kind: 'remove',
+        tramos: [found.coordinates],
+        removeIndex: index,
+        spanFrom: fromVertex,
+        spanTo: toVertex,
+        label: describeRoute(found.streets ?? [], found.distanceM),
+    };
+
+    announceGuided(
+        `${guidedOffer.value.label}. Accept to join the tramo without the control, or Reject.`,
+    );
+    renderGuidedPreview();
+}
+
 /**
  * How to select vertices in the mode on, behind a toggle rather than in prose.
  *
@@ -1655,17 +2784,26 @@ function clearLayers(): void {
     endpointMarkers = [];
 
     clearVertexMarkers();
+    clearGuidedMarkers();
+    clearGuidedLayer();
 }
 
 /**
- * Escape drops the selection.
+ * Escape drops the selection, and the pending preview with it.
  *
  * Without it there is no way back to a single-vertex drag once a range is
- * picked, short of shift-clicking somewhere useless.
+ * picked, short of shift-clicking somewhere useless; a preview judged by
+ * accident needs the same escape hatch.
  */
 function handleKeydown(e: KeyboardEvent): void {
     if (e.key === 'Escape') {
         clearSelection();
+        selectedWaypoint.value = null;
+
+        if (guidedOffer.value !== null) {
+            guidedOffer.value = null;
+            clearGuidedLayer();
+        }
     }
 }
 
@@ -1677,13 +2815,31 @@ onMounted(() => {
 
 // A selection addresses vertices by index, so it only means something against
 // the geometry it was picked from. New geometry means a new route to select on.
+// A preview offered against geometry that has since changed is stale by the
+// same token — dismissed, not applied.
 watch(() => props.geoJson, renderMap, { deep: true });
 watch(() => props.geoJson, clearSelection, { deep: true });
+watch(() => props.geoJson, dismissPendingPreview, { deep: true });
+watch(() => props.guidedWaypoints, renderGuidedMarkers, { deep: true });
+watch(selectedWaypoint, () => {
+    refreshWaypointSelection();
+});
 watch(
     () => props.mode,
     async (newMode) => {
-        if (!props.editable || !polyline) {
+        if (!props.editable) {
             return;
+        }
+
+        // Guided mode owns a state the other modes do not: entering it
+        // starts a fresh proposal session (nothing pending, hand drawing
+        // off), leaving it takes both down. The control list itself is the
+        // parent's — it survives the mode switch and the undo stack with it.
+        if (newMode === 'guide') {
+            cancelPendingPreview();
+            announceGuided('Click to place the first control point.');
+        } else {
+            cancelPendingPreview();
         }
 
         clearVertexMarkers();
@@ -1753,6 +2909,11 @@ onUnmounted(() => {
     if (removalLabelTimer) {
         clearTimeout(removalLabelTimer);
         removalLabelTimer = null;
+    }
+
+    if (guidedLabelTimer) {
+        clearTimeout(guidedLabelTimer);
+        guidedLabelTimer = null;
     }
 
     clearLayers();
@@ -1937,6 +3098,98 @@ onUnmounted(() => {
                     </template>
 
                     <!--
+                        Guided mode's own row: the judgement on a pending
+                        tramo lives next to the map it decorates; the frontier
+                        toggle, the manual switch and the removal of a selected
+                        control are the four gestures spec §4 allows on a recipe
+                        that already exists.
+                    -->
+                    <template v-if="mode === 'guide'">
+                        <template v-if="guidedOffer">
+                            <Button
+                                type="button"
+                                variant="default"
+                                size="sm"
+                                @click="acceptPreview"
+                            >
+                                <Check class="size-4" />
+                                Accept tramo
+                            </Button>
+                            <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                @click="rejectPreview"
+                            >
+                                <X class="size-4" />
+                                Reject
+                            </Button>
+                        </template>
+                        <Button
+                            v-if="selectedWaypoint !== null"
+                            type="button"
+                            variant="destructive"
+                            size="sm"
+                            @click="startRemovePreview"
+                        >
+                            <Trash2 class="size-4" />
+                            Remove control
+                        </Button>
+                        <!--
+                            Which end the next click grows, said as the two
+                            options with the live one filled in. A single
+                            button here had to name the OTHER end, because a
+                            toggle's label is an action — and the label
+                            contradicting the highlight is exactly how
+                            "Extend at end" came to read as a statement about
+                            the end currently being extended.
+                        -->
+                        <span
+                            v-if="waypointsForGuide.length > 0"
+                            class="inline-flex items-center gap-1"
+                        >
+                            <span class="text-xs text-muted-foreground">
+                                Extend at
+                            </span>
+                            <Button
+                                type="button"
+                                :variant="
+                                    guideFrontier === 'head'
+                                        ? 'default'
+                                        : 'outline'
+                                "
+                                size="sm"
+                                @click="setGuideFrontier('head')"
+                            >
+                                Start
+                            </Button>
+                            <Button
+                                type="button"
+                                :variant="
+                                    guideFrontier === 'head'
+                                        ? 'outline'
+                                        : 'default'
+                                "
+                                size="sm"
+                                @click="setGuideFrontier('tail')"
+                            >
+                                End
+                            </Button>
+                        </span>
+                        <Button
+                            type="button"
+                            :variant="guidedManual ? 'default' : 'outline'"
+                            size="sm"
+                            @click="toggleGuidedManual"
+                        >
+                            <PencilLine class="size-4" />
+                            {{
+                                guidedManual ? 'Back to guided' : 'Draw by hand'
+                            }}
+                        </Button>
+                    </template>
+
+                    <!--
                         Pushed to the far end of the row, and the reason is the
                         one thing colour alone cannot carry. Destructive stands
                         apart from safe by shade; what keeps a re-space from
@@ -2001,7 +3254,8 @@ onUnmounted(() => {
         <div
             class="relative"
             :class="{
-                'cursor-crosshair': editable && mode === 'add',
+                'cursor-crosshair':
+                    editable && (mode === 'add' || mode === 'guide'),
                 'cursor-pointer': editable && mode === 'delete',
             }"
         >
@@ -2086,6 +3340,18 @@ onUnmounted(() => {
                     class="rounded-md bg-background/90 px-2 py-1 text-xs text-emerald-700 shadow-sm backdrop-blur-sm dark:text-emerald-400"
                 >
                     Snapped onto {{ snapLabel }}.
+                </p>
+                <p
+                    v-if="guidedLabel"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs font-medium text-amber-700 shadow-sm backdrop-blur-sm dark:text-amber-400"
+                >
+                    {{ guidedLabel }}
+                </p>
+                <p
+                    v-if="detachedText"
+                    class="rounded-md bg-background/90 px-2 py-1 text-xs text-amber-700 shadow-sm backdrop-blur-sm dark:text-amber-400"
+                >
+                    {{ detachedText }}
                 </p>
                 <p
                     v-if="relayLabel"

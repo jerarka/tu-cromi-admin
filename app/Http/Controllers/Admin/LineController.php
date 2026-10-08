@@ -8,6 +8,7 @@ use App\Http\Requests\Line\DirectionOperationRequest;
 use App\Http\Requests\Line\StoreLineRequest;
 use App\Http\Requests\Line\UpdateLineRequest;
 use App\Models\Line;
+use App\Rules\WaypointsPayload;
 use Illuminate\Console\Command;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\RedirectResponse;
@@ -62,6 +63,10 @@ class LineController extends Controller
             $line->syncGeometry();
             $line->linkCounterpart();
 
+            if (isset($data['waypoints'])) {
+                $line->syncWaypoints(WaypointsPayload::decode($data['waypoints']));
+            }
+
             return $line;
         });
 
@@ -77,6 +82,11 @@ class LineController extends Controller
     {
         return Inertia::render('lines/Edit', [
             'line' => $line,
+            // The control points the guided editor left behind, if any. A
+            // line with none boots from its own geometry — that fallback is
+            // the client's §4.1 bootstrap, not the server's; the server only
+            // hands back what it stored.
+            'waypoints' => $line->waypoints,
             // Resolved by code and sense instead of parent_line_id, which is
             // only a cache that the import fills in and that can be null or
             // stale on a row whose counterpart plainly exists. The direction
@@ -183,6 +193,14 @@ class LineController extends Controller
                 // run by counting rows rather than diffing geometries.
                 $line->geometry_adjusted = true;
                 $line->save();
+            }
+
+            // Same asymmetry as the geometry: a payload that never carried
+            // waypoints means this save used no control points, and an edit
+            // made on a surface below the guided mode must not invent a
+            // recipe that points at vertices it did not look at.
+            if (isset($data['waypoints'])) {
+                $line->syncWaypoints(WaypointsPayload::decode($data['waypoints']));
             }
         });
 

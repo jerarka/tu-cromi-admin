@@ -1,5 +1,5 @@
 /**
- * An immutable undo/redo history for a single piece of text.
+ * An immutable undo/redo history for a single piece of state.
  *
  * Pulled out of the component so it can be tested without a DOM. The two bugs
  * it guards against are both aliasing: a stack mutated in place leaves the
@@ -8,24 +8,32 @@
  * twice. Every operation here returns a new history and never touches the one
  * it was given.
  *
- * States are stored as raw text rather than parsed objects on purpose. A map
- * edit emits valid GeoJSON, but the surrounding textarea can hold anything the
- * reviewer typed, including a half-finished edit that does not parse. Storing
- * the text means undo restores exactly what was there.
+ * Generic over the state it carries. The first consumer stored raw text on
+ * purpose — a map edit emits valid GeoJSON, but the surrounding textarea can
+ * hold anything the reviewer typed, including a half-finished edit that does
+ * not parse, and storing the text means undo restores exactly what was there.
+ * Guided drawing made the state a pair: the geometry text and the control
+ * points that tramos hang from. Storing those in two parallel stacks would
+ * let the pair desync — one stack undoing what the other never saw — so the
+ * pair is one entry, and the type is honest about carrying whatever the
+ * caller says a step is.
  *
  * This is per-visit history for one line. It is not a version log: a direction
  * change, a save, or navigating to another line all reload the page, and the
  * history goes with them.
  */
 
-export interface History {
+export interface History<T> {
     /** Past states, oldest first. The last entry is the one undo restores. */
-    undo: string[];
+    undo: T[];
     /** States that were undone, oldest first. The last is the one redo restores. */
-    redo: string[];
+    redo: T[];
 }
 
-export const emptyHistory = (): History => ({ undo: [], redo: [] });
+export const emptyHistory = <T = unknown>(): History<T> => ({
+    undo: [],
+    redo: [],
+});
 
 /**
  * Push the state being left behind, so it can be returned to.
@@ -38,11 +46,11 @@ export const emptyHistory = (): History => ({ undo: [], redo: [] });
  * deepest history rather than the shallowest is deliberate: the recent edits
  * are the ones still being worked on.
  */
-export function record(
-    history: History,
-    current: string,
+export function record<T>(
+    history: History<T>,
+    current: T,
     limit: number,
-): History {
+): History<T> {
     const undo = [...history.undo, current];
 
     return {
@@ -51,10 +59,10 @@ export function record(
     };
 }
 
-export interface Step {
-    history: History;
+export interface Step<T> {
+    history: History<T>;
     /** The state to apply, or null when there was nothing to move to. */
-    value: string | null;
+    value: T | null;
 }
 
 /**
@@ -64,7 +72,7 @@ export interface Step {
  * the undo stack holds — the reviewer may have typed in the textarea since the
  * last map edit. Whichever it is, it is the state redo has to come back to.
  */
-export function undoStep(history: History, current: string): Step {
+export function undoStep<T>(history: History<T>, current: T): Step<T> {
     const undo = [...history.undo];
     const previous = undo.pop();
 
@@ -85,7 +93,7 @@ export function undoStep(history: History, current: string): Step {
  * consumes the redo stack, so an empty one is a genuine no-op rather than a
  * silent "undo back".
  */
-export function redoStep(history: History, current: string): Step {
+export function redoStep<T>(history: History<T>, current: T): Step<T> {
     const redo = [...history.redo];
     const next = redo.pop();
 
@@ -105,10 +113,10 @@ export function redoStep(history: History, current: string): Step {
  * Kept next to the stack so the disabled state of a button cannot drift from
  * what the step would actually do.
  */
-export function canUndo(history: History): boolean {
+export function canUndo(history: History<unknown>): boolean {
     return history.undo.length > 0;
 }
 
-export function canRedo(history: History): boolean {
+export function canRedo(history: History<unknown>): boolean {
     return history.redo.length > 0;
 }

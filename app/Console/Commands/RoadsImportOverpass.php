@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Osm\TurnRestriction;
 use Carbon\CarbonInterface;
 use Illuminate\Console\Command;
 use Illuminate\Http\Client\ConnectionException;
@@ -49,16 +50,27 @@ class RoadsImportOverpass extends Command
      *
      * Excluded on purpose: footway, path, steps, pedestrian, cycleway and track
      * are not drivable, and `service` is overwhelmingly driveways, parking
-     * aisles and alleys — a large share of OSM volume with no value here. Link
-     * roads are excluded because a vertex snapped onto an intersection slip
-     * road is a mistake, not an edit.
+     * aisles and alleys — a large share of OSM volume with no value here.
+     *
+     * Link roads are imported even though the snap lookups refuse them (see
+     * RoadsController, every scan adds a `NOT LIKE '%\_link'`). The original
+     * exclusion was about snapping, and it still holds there: a vertex snapped
+     * onto an intersection slip road is a mistake, not an edit. A slip road is
+     * also how traffic moves between the carriageways of a divided road, which
+     * is exactly what the routing graph the editor is about to grow needs — so
+     * the rows live in this table and the exclusion lives at the lookup.
      */
     private const HIGHWAY_CLASSES = [
         'motorway',
+        'motorway_link',
         'trunk',
+        'trunk_link',
         'primary',
+        'primary_link',
         'secondary',
+        'secondary_link',
         'tertiary',
+        'tertiary_link',
         'residential',
         'unclassified',
         'living_street',
@@ -111,8 +123,14 @@ class RoadsImportOverpass extends Command
         $dryRun = (bool) $this->option('dry-run');
 
         if (! $dryRun && $this->option('truncate')) {
-            $this->warn('Truncating roads...');
-            DB::statement('TRUNCATE TABLE roads');
+            // CASCADE, because road_edges now references roads: a bare TRUNCATE
+            // would refuse to run while the graph holds rows it points at.
+            // Truncating rows the graph was built from invalidates the graph
+            // all the same, so taking the edges down with it is the honest
+            // outcome — and the reason the warning below says to rebuild.
+            $this->warn('Truncating roads (and road_edges, by cascade)...');
+            DB::statement('TRUNCATE TABLE roads CASCADE');
+            $this->warn('The road graph was derived from roads. Run roads:build-graph to rebuild it.');
         }
 
         try {
@@ -140,9 +158,10 @@ class RoadsImportOverpass extends Command
         $totalWays = 0;
         $totalPoints = 0;
         $failed = 0;
+        $restrictions = ['saved' => 0, 'except_bus' => 0, 'via_way' => 0, 'malformed' => 0];
 
         foreach ($tiles as $index => [$tileWest, $tileSouth, $tileEast, $tileNorth]) {
-            $elements = $this->fetchTile($index, $tileWest, $tileSouth, $tileEast, $tileNorth);
+            $elements = $this->fetchTile($index, $this->buildQuery($tileWest, $tileSouth, $tileEast, $tileNorth));
 
             if ($elements === null) {
                 $failed++;
@@ -158,11 +177,27 @@ class RoadsImportOverpass extends Command
             $totalWays += count($elements);
             $totalPoints += $points;
 
+            // Restrictions ride on the same tile loop and the same mirror
+            // rotation rather than their own traversal: a tile whose ways were
+            // just fetched is exactly the tile whose restrictions are wanted,
+            // and one traversal over the box is one rate-limit story, not two.
+            $restrictionQuery = $this->buildRestrictionQuery($tileWest, $tileSouth, $tileEast, $tileNorth);
+            $restrictionElements = $this->fetchTile($index, $restrictionQuery);
+
+            if ($restrictionElements !== null) {
+                $counts = $this->persistRestrictions($restrictionElements, $dryRun);
+
+                foreach ($restrictions as $reason => $soFar) {
+                    $restrictions[$reason] = $soFar + $counts[$reason];
+                }
+            }
+
             $this->output->write(sprintf(
-                "\r  tile %d/%d | %d ways | %s points        ",
+                "\r  tile %d/%d | %d ways | %d restrictions | %s points        ",
                 $index + 1,
                 count($tiles),
                 $totalWays,
+                $restrictions['saved'],
                 number_format($totalPoints),
             ));
         }
@@ -188,6 +223,31 @@ class RoadsImportOverpass extends Command
                 '%d tile(s) failed. Re-run to fill the gaps: already-imported ways are upserted, not duplicated.',
                 $failed,
             ));
+        }
+
+        // The counts are the reason the restriction import is measurable.
+        // A thin stored count means one of three very different things — OSM
+        // mapped few restrictions, most of them exempt buses (which this
+        // router routes, so they are correctly absent), or the parsing wrong.
+        // Without the split there is no way to tell which, and the phase-1
+        // router would inherit a table whose quality nobody can vouch for.
+        $this->info(sprintf(
+            'Turn restrictions: %d stored, %d bus-exempt, %d via-way, %d malformed.',
+            $restrictions['saved'],
+            $restrictions['except_bus'],
+            $restrictions['via_way'],
+            $restrictions['malformed'],
+        ));
+
+        if (! $dryRun) {
+            // The backslash is Postgres LIKE's own escape: the underscore in
+            // LIKE is a wildcard, so it is the one that needs escaping, and the
+            // PHP double-quoted string turns \\ into the single one SQL sees.
+            $linkWays = (int) DB::selectOne(
+                "SELECT count(*) AS n FROM roads WHERE highway LIKE '%\\_link'",
+            )->n;
+
+            $this->info(sprintf('Link roads in the table: %d ways.', $linkWays));
         }
 
         $this->reportCoverage((int) $this->option('sample'), $dryRun);
@@ -273,16 +333,19 @@ class RoadsImportOverpass extends Command
     }
 
     /**
-     * Fetch one tile, rotating the starting mirror per tile.
+     * Fetch one tile's elements, rotating the starting mirror per tile.
      *
      * Rotating matters over a long run: without it every request retries the
      * same instance while that one recovers, and the run crawls.
      *
+     * The query is an argument rather than built here because two element
+     * kinds share this path now — ways and turn-restriction relations — and
+     * the mirror retry loop is the same for both.
+     *
      * @return list<array<string, mixed>>|null Null when every mirror failed.
      */
-    private function fetchTile(int $tileIndex, float $west, float $south, float $east, float $north): ?array
+    private function fetchTile(int $tileIndex, string $query): ?array
     {
-        $query = $this->buildQuery($west, $south, $east, $north);
         $mirrors = self::MIRRORS;
         $rotate = $tileIndex % count($mirrors);
 
@@ -334,6 +397,107 @@ class RoadsImportOverpass extends Command
             $north,
             $east,
         );
+    }
+
+    /**
+     * The turn restrictions of one tile, as a second request.
+     *
+     * Out geom, as the ways query: that is what gives the via node its
+     * coordinate, and the coordinate is what the graph can match it against
+     * — the ways table carries no node ids, so an id-based join would have
+     * nothing to join with.
+     */
+    private function buildRestrictionQuery(float $west, float $south, float $east, float $north): string
+    {
+        return sprintf(
+            '[out:json][timeout:%d];relation["type"="restriction"](%F,%F,%F,%F);out geom;',
+            self::SERVER_TIMEOUT_SECONDS,
+            $south,
+            $west,
+            $north,
+            $east,
+        );
+    }
+
+    /**
+     * Turn raw relation elements into turn_restrictions rows and write them.
+     *
+     * Upserted by the relation's osm id for the same reason ways are: a tile
+     * boundary or a re-run must repair, not duplicate. Unlike roads, there is
+     * no geometry here, so the query builder's own upsert() is safe — the raw
+     * statement on the ways side exists only because ST_GeomFromGeoJSON has to
+     * appear in the values, and nothing on this table does.
+     *
+     * @param  list<array<string, mixed>>  $elements
+     * @return array{saved: int, except_bus: int, via_way: int, malformed: int}
+     */
+    private function persistRestrictions(array $elements, bool $dryRun): array
+    {
+        /** @var array{saved: int, except_bus: int, via_way: int, malformed: int} $counts */
+        $counts = ['saved' => 0, 'except_bus' => 0, 'via_way' => 0, 'malformed' => 0];
+        $rows = [];
+        $now = now();
+
+        foreach ($elements as $element) {
+            // The ways query filters its own classes in Overpass, but a
+            // non-restriction relation reaching this loop is still possible
+            // through a leaked element from a shared bodies array. It is not a
+            // parsing failure — it is the query and the parser disagreeing —
+            // and it counts as malformed because the split exists to surface
+            // exactly that disagreement.
+            $reason = TurnRestriction::skipReason($element);
+
+            if ($reason === 'except_bus') {
+                $counts['except_bus']++;
+
+                continue;
+            }
+
+            if ($reason === 'via_way') {
+                $counts['via_way']++;
+
+                continue;
+            }
+
+            if ($reason !== null) {
+                // 'malformed' or 'not_restriction' — the two structural buckets.
+                $counts['malformed']++;
+
+                continue;
+            }
+
+            $restriction = TurnRestriction::fromElement($element);
+
+            if ($restriction === null) {
+                $counts['malformed']++;
+
+                continue;
+            }
+
+            $counts['saved']++;
+            $rows[] = [
+                'osm_id' => $restriction->osmId,
+                'kind' => $restriction->kind,
+                'from_osm_way' => $restriction->fromOsmWay,
+                'to_osm_way' => $restriction->toOsmWay,
+                'via_lat' => $restriction->viaLat,
+                'via_lng' => $restriction->viaLng,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        if ($rows !== [] && ! $dryRun) {
+            foreach (array_chunk($rows, 400) as $chunk) {
+                DB::table('turn_restrictions')->upsert(
+                    $chunk,
+                    ['osm_id'],
+                    ['kind', 'from_osm_way', 'to_osm_way', 'via_lat', 'via_lng', 'updated_at'],
+                );
+            }
+        }
+
+        return $counts;
     }
 
     /**

@@ -39,6 +39,8 @@ import { usePropagation } from '@/composables/usePropagation';
 import { useResampleSpacing } from '@/composables/useResampleSpacing';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
+import { guidesFromGeometry, waypointsFromRecord } from '@/lib/guidedRouting';
+import type { Waypoint } from '@/lib/guidedRouting';
 import {
     describePropagationTooltip,
     describeSnapPreset,
@@ -89,6 +91,9 @@ const props = defineProps<{
     line: Line;
     counterpart?: Pick<Line, 'id' | 'code' | 'sense'> | null;
     nav: LineNav;
+    /** The stored control-point rows, null on a line with no recipe yet. */
+    waypoints?:
+        { ordinal: number; role: string; lat: number; lng: number }[] | null;
 }>();
 
 /**
@@ -114,6 +119,45 @@ const {
 } = useRouteGeometry();
 
 replaceGeometry(props.line.geo_json);
+
+/**
+ * The control points the guided mode accepted, and the recipe the route's
+ * editing sessions are made of.
+ *
+ * The server sends the stored recipe when the line has one; spec 4.1 boots
+ * an existing route that carries only vertices from its own two ends. The
+ * parent owns the list — it is what gets persisted and what the undo stack
+ * restores alongside the geometry.
+ */
+const waypoints = ref<Waypoint[]>(
+    waypointsFromRecord(props.waypoints ?? []).length > 0
+        ? waypointsFromRecord(props.waypoints ?? [])
+        : (guidesFromGeometry(props.line.geo_json?.coordinates) ?? []),
+);
+
+/**
+ * Whether this visit actually touched the recipe.
+ *
+ * The form only carries the waypoints field when it did. Without the flag,
+ * opening a line and saving it without touching the guided mode would write
+ * the bootstrap's derived controls into the database — a recipe for a route
+ * nobody authored, claiming a human chose those two endpoints on roads the
+ * route may not even follow. Absent, the server leaves the stored rows
+ * alone, which is exactly what a save above the guided mode should do.
+ */
+const waypointsTouched = ref(false);
+
+/**
+ * One state of an editing visit, whole.
+ *
+ * The geometry text and the control points are one entry in the history,
+ * because a guided accept changes both and two parallel stacks would let
+ * undo restore one half while the other still claimed the splice.
+ */
+interface GuidedState {
+    geometry: string;
+    waypoints: Waypoint[];
+}
 
 /**
  * Confirm an action that navigates away from the current line.
@@ -155,6 +199,14 @@ watch(
         // stack would offer a step that restores a shape that is no longer the
         // one being edited.
         history.value = emptyHistory();
+
+        // And a new recipe to edit from — re-derived, never carried over from
+        // the previous line, for the same reason the stack resets.
+        waypoints.value =
+            waypointsFromRecord(props.waypoints ?? []).length > 0
+                ? waypointsFromRecord(props.waypoints ?? [])
+                : (guidesFromGeometry(geoJson?.coordinates) ?? []);
+        waypointsTouched.value = false;
     },
 );
 
@@ -243,7 +295,7 @@ function refreshGeometry(): void {
  * entry, and the browser's own text undo already covers it, both because it is
  * better and because the stack would fill up with noise within seconds.
  */
-const history = ref(emptyHistory());
+const history = ref(emptyHistory<GuidedState>());
 
 /**
  * Tells the map to keep its framing for the change about to happen.
@@ -257,27 +309,35 @@ const history = ref(emptyHistory());
 const preserveViewToken = ref(0);
 
 function undo(): void {
-    const step = undoStep(history.value, geoJsonText.value);
+    const step = undoStep(history.value, {
+        geometry: geoJsonText.value,
+        waypoints: waypoints.value,
+    });
 
     if (step.value === null) {
         return;
     }
 
     history.value = step.history;
-    geoJsonText.value = step.value;
+    geoJsonText.value = step.value.geometry;
+    waypoints.value = step.value.waypoints;
     preserveViewToken.value += 1;
     markDirty();
 }
 
 function redo(): void {
-    const step = redoStep(history.value, geoJsonText.value);
+    const step = redoStep(history.value, {
+        geometry: geoJsonText.value,
+        waypoints: waypoints.value,
+    });
 
     if (step.value === null) {
         return;
     }
 
     history.value = step.history;
-    geoJsonText.value = step.value;
+    geoJsonText.value = step.value.geometry;
+    waypoints.value = step.value.waypoints;
     preserveViewToken.value += 1;
     markDirty();
 }
@@ -423,10 +483,49 @@ function onMapUpdate(
     const isSecondMove = (meta?.propagated ?? 0) > 0 || meta?.laid === true;
 
     if (!meta?.snap || isSecondMove) {
-        history.value = record(history.value, geoJsonText.value, UNDO_LIMIT);
+        history.value = record(
+            history.value,
+            { geometry: geoJsonText.value, waypoints: waypoints.value },
+            UNDO_LIMIT,
+        );
     }
 
     setGeometry(geoJson);
+}
+
+/**
+ * A guided result in, both halves stored after the old state is recorded.
+ *
+ * The record happens BEFORE either assignment, so the composite entry is the
+ * state this visit actually held — assigning geometry first would push a
+ * half-state (new geometry, old controls) and undo would restore that lie.
+ *
+ * The framing is preserved for the same reason it is for an undo: the control
+ * point the reviewer just placed is the click they were looking at, so a refit
+ * can only take away the detail they chose. Without this the map refits the
+ * whole route on every accepted tramo and the reviewer loses their place.
+ */
+function onGuidedUpdate(payload: {
+    coordinates: NonNullable<Line['geo_json']>['coordinates'] | null;
+    waypoints: Waypoint[];
+}): void {
+    history.value = record(
+        history.value,
+        { geometry: geoJsonText.value, waypoints: waypoints.value },
+        UNDO_LIMIT,
+    );
+
+    if (payload.coordinates !== null) {
+        setGeometry({
+            type: 'MultiLineString',
+            coordinates: payload.coordinates,
+        });
+    }
+
+    waypoints.value = payload.waypoints;
+    waypointsTouched.value = true;
+    preserveViewToken.value += 1;
+    markDirty();
 }
 
 /**
@@ -456,6 +555,26 @@ const pageTitle = computed(
 const editToggleIcon = computed(() =>
     isEditingMap.value ? Check : PencilLine,
 );
+
+/**
+ * The recipe as the form posts it — only when this visit touched it.
+ *
+ * Flat {lat, lng} objects, the exact shape WaypointsPayload validates and
+ * syncWaypoints consumes; ordinal and role are server-derived, so they
+ * deliberately do not travel.
+ */
+const waypointsField = computed<string | null>(() => {
+    if (!waypointsTouched.value || waypoints.value.length === 0) {
+        return null;
+    }
+
+    return JSON.stringify(
+        waypoints.value.map((waypoint) => ({
+            lat: waypoint.position[1],
+            lng: waypoint.position[0],
+        })),
+    );
+});
 </script>
 
 <template>
@@ -712,6 +831,18 @@ const editToggleIcon = computed(() =>
                         Unsaved changes
                     </span>
                 </div>
+                <!--
+                    The guided editor's control-point recipe. Posted only when
+                    this visit actually changed it (see waypointsTouched), so a
+                    save above the guided mode never overwrites the stored
+                    recipe with the §4.1 bootstrap.
+                -->
+                <input
+                    v-if="waypointsField !== null"
+                    type="hidden"
+                    name="waypoints"
+                    :value="waypointsField"
+                />
             </Form>
         </div>
 
@@ -949,12 +1080,14 @@ const editToggleIcon = computed(() =>
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
                 :mode="mode"
+                :guided-waypoints="waypoints"
                 :snap-preset="snapPreset"
                 :relay="snapPreset !== 'off'"
                 :resample="true"
                 :resample-spacing="resampleSpacing"
                 :preserve-view-token="preserveViewToken"
                 @update:geo-json="onMapUpdate"
+                @update:guided="onGuidedUpdate"
                 @update:resample-spacing="updateResampleSpacing"
             >
                 <!--
