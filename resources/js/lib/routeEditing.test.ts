@@ -3748,6 +3748,25 @@ describe('describeModeHelp', () => {
         expect(describeModeHelp('delete')).toContain('Shift-click');
     });
 
+    test('guided mode says the dots are the control points and what they do', () => {
+        // The dots in this mode ARE the recipe, and a reviewer who cannot tell
+        // that from a vertex has no way to find the one they want to delete.
+        const help = describeModeHelp('guide');
+
+        expect(help).toContain('The dots on the map are your control points');
+        expect(help).toContain('click one to select it');
+        expect(help).toContain('Remove control');
+    });
+
+    test('guided mode says a pending anchor can be corrected in place', () => {
+        // The router snaps an anchor to the road it finds, so one can come back
+        // on a different street. Without this the correction is redoing the
+        // whole batch.
+        expect(describeModeHelp('guide')).toContain(
+            'dragging a pinned point re-traces the batch',
+        );
+    });
+
     test('starts a move range with a plain click, since one is free there', () => {
         // The order is the instruction, so it is asserted. A plain click in move
         // mode only picks a vertex — there is nothing else it could be doing —

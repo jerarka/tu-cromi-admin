@@ -2,7 +2,8 @@
 import {
     Check,
     HelpCircle,
-    PencilLine,
+    MapPin,
+    Route,
     Ruler,
     Trash2,
     Waves,
@@ -17,6 +18,7 @@ import {
     CollapsibleContent,
     CollapsibleTrigger,
 } from '@/components/ui/collapsible';
+import { Separator } from '@/components/ui/separator';
 import {
     Tooltip,
     TooltipContent,
@@ -25,13 +27,22 @@ import {
 } from '@/components/ui/tooltip';
 import { usePropagation } from '@/composables/usePropagation';
 import {
-    appendVertexToTail,
+    anchorsIntoRecipe,
+    anchorSnaps,
     appendWaypoint,
+    controlsInsideRegion,
+    cutRouteAt,
+    describeAnchorsNeeded,
+    describeBlockedControls,
     describeDetached,
+    describeRectifyRefusal,
+    describeRemoveControlBlock,
+    describeRemoveWithoutReroute,
     describeRoute,
     describeRouteRefusal,
     describeRouteWarnings,
     describeRoutedPending,
+    describeSimplification,
     detachedWaypoints,
     DETACHED_TOLERANCE_METERS,
     extensionEndpoints,
@@ -40,14 +51,25 @@ import {
     headingAtVertex,
     headingBetween,
     insertWaypointAt,
+    orderAnchorsByRoute,
     prependTramo,
     prependWaypoint,
+    projectOnRoute,
+    rebuildRegion,
     removeWaypoint,
     replaceTramoSpan,
+    simplifyRoutedChain,
     spliceTramo,
+    stitchedChain,
     WAYPOINT_LIMIT,
 } from '@/lib/guidedRouting';
-import type { GuideEnd, VertexAddress, Waypoint } from '@/lib/guidedRouting';
+import type {
+    GuideEnd,
+    GuideGesture,
+    RegionAnchor,
+    VertexAddress,
+    Waypoint,
+} from '@/lib/guidedRouting';
 import { consumePreserveToken } from '@/lib/mapView';
 import {
     applyDeltaToSelection,
@@ -98,6 +120,26 @@ import {
     SNAP_LOOKUP_TIMEOUT_MS,
 } from '@/lib/snapTransport';
 import type { SnapLookup } from '@/lib/snapWire';
+import {
+    canRedo,
+    canUndo,
+    emptyHistory,
+    isTextEntryTarget,
+    record,
+    redoStep,
+    undoStep,
+} from '@/lib/undoStack';
+
+import type { History } from '@/lib/undoStack';
+
+/**
+ * How many steps of a pending batch are kept.
+ *
+ * The same figure the page keeps for a line's edits, and bounded by the same
+ * thing in practice: a batch holds at most WAYPOINT_LIMIT anchors, so the stack
+ * can never be the reason an anchor is unrecallable.
+ */
+const ANCHOR_UNDO_LIMIT = 50;
 
 const props = defineProps<{
     geoJson: {
@@ -216,7 +258,30 @@ const emit = defineEmits<{
         e: 'update:guided',
         payload: { coordinates: Coordinates | null; waypoints: Waypoint[] },
     ): void;
+    /**
+     * Whether a pending-batch step would do anything.
+     *
+     * Reported rather than held by the page because the batch is the map's:
+     * the page owns the history of a saved line and this owns the history of a
+     * batch that has not been accepted into one. What the page needs from it is
+     * only the answer to "should my Undo button be greyed right now", and a
+     * greyed button next to a placed anchor is what made the reviewer conclude
+     * that undo did not work.
+     */
+    (
+        e: 'update:pending-undo',
+        state: { canUndo: boolean; canRedo: boolean },
+    ): void;
 }>();
+
+/**
+ * The two methods the page's undo and redo buttons need.
+ *
+ * Exposed rather than emitted because a button has to ASK — it cannot take the
+ * batch back by wishing, and a boolean told it whether to press would be a
+ * second source of truth about what undo will do.
+ */
+defineExpose({ undoPendingAnchors, redoPendingAnchors });
 
 /**
  * Whether a snap may also pull the vertices around the dropped one onto the same
@@ -282,15 +347,20 @@ let guidedMarkers: L.CircleMarker[] = [];
 /**
  * The look of a control point: the same dot-and-ring language as a vertex,
  * in amber — the colour of a proposal rather than an edit — and one size up,
- * because a control sits over a vertex most of the time and must read as
- * something above it. A selected one fills: the same filled-not-recoloured
- * rule the delete mode's selection uses.
+ * because a control is the only thing on the map in this mode and has to read
+ * as something you can act on.
+ *
+ * A selected one fills GREEN, not amber. Green is what "selected" means
+ * everywhere else in this editor, and a control filling amber put two colours
+ * on two meanings in the same row: amber for "this is the guided mode's
+ * business" and amber for "you have picked this one". Fill-not-recolour is the
+ * delete mode's own rule, and it is the right one here too.
  */
 function guidedMarkerStyle(selected = false): L.CircleMarkerOptions {
     return {
-        radius: 8,
+        radius: selected ? 9 : 8,
         color: '#d97706',
-        fillColor: selected ? '#d97706' : '#ffffff',
+        fillColor: selected ? '#16a34a' : '#ffffff',
         fillOpacity: 1,
         weight: 3,
     };
@@ -318,12 +388,33 @@ function refreshWaypointSelection(): void {
     });
 }
 
+/**
+ * Paint the recipe's control points.
+ *
+ * Called from renderMap rather than only from the waypoint watcher, and that
+ * relocation is the fix for a bug this function's own guard used to hide: the
+ * watcher does not fire on mount, so a line opened WITH a saved recipe had its
+ * controls cleared by renderMap and never painted again, and any edit that
+ * changed the geometry without changing the recipe — an undo, a re-space, a
+ * drag — wiped them for the rest of the visit. The map's render owns what is
+ * drawn on the map, and a control that disappears when you press Ctrl+Z is a
+ * control the reviewer cannot find to delete.
+ *
+ * Outside guide mode the controls are cleared rather than painted: they belong
+ * to that mode's editing, and elsewhere they are dots whose click handler
+ * refuses anyway.
+ */
 function renderGuidedMarkers(): void {
     clearGuidedMarkers();
 
     const waypoints = props.guidedWaypoints;
 
-    if (!map || !waypoints?.length) {
+    if (
+        props.mode !== 'guide' ||
+        !props.editable ||
+        !map ||
+        !waypoints?.length
+    ) {
         return;
     }
 
@@ -872,6 +963,12 @@ function renderMap(): void {
             updateMapClickListener(props.mode ?? 'move');
         }
 
+        // clearLayers() above still took the controls away, and a route with a
+        // recipe and no geometry is not a state the page can be in for long —
+        // but "the marker layer is repainted on every render" has to be true of
+        // every render, not the ones that happen to reach the bottom.
+        renderGuidedMarkers();
+
         return;
     }
 
@@ -902,6 +999,11 @@ function renderMap(): void {
     } else {
         map.fitBounds(polyline.getBounds().pad(0.1));
     }
+
+    // Last, and deliberately so: clearLayers() at the top of this render took
+    // the control points away with everything else, and this is the render that
+    // owns putting them back.
+    renderGuidedMarkers();
 }
 
 /**
@@ -996,11 +1098,25 @@ function refreshMarkerStyles(): void {
     }
 }
 
+/**
+ * One marker per route vertex, for the modes that edit them.
+ *
+ * Nothing in guide mode. A vertex there is inert — the drag and the selection
+ * handlers are bound only in move and delete — and it sits on top of the exact
+ * pixel a control point sits on, so an imported line with nine hundred vertices
+ * buries the recipe under nine hundred dots that do nothing. With them gone the
+ * dots in this mode ARE the controls, which is the answer to "which of these
+ * can I click" without a word of help text.
+ */
 function addVertexMarkers(
     coords: Coordinates,
     latlngs: L.LatLngTuple[][],
     mode: 'move' | 'add' | 'delete' | 'guide',
 ): void {
+    if (mode === 'guide') {
+        return;
+    }
+
     coords.forEach((segment, segIdx) => {
         segment.forEach((_, pointIdx) => {
             const ref: VertexRef = { segment: segIdx, index: pointIdx };
@@ -1675,9 +1791,11 @@ interface GuidedOffer {
      * has its own acceptance geometry, which is why the kind travels with
      * the offer rather than being re-derived at accept time.
      */
-    kind: 'extend-tail' | 'extend-head' | 'insert' | 'remove';
+    kind: 'extend-tail' | 'extend-head' | 'insert' | 'remove' | 'rectify';
     /** The router answers this offer is made of, in travel order. */
     tramos: Position[][];
+    /** Rectification: the anchors' raw clicks, in route order. */
+    anchorClicks?: Position[];
     label: string;
     /** Insertion: the waypoint index the new control will take. */
     insertIndex?: number;
@@ -1690,9 +1808,6 @@ interface GuidedOffer {
 
 const guidedOffer = ref<GuidedOffer | null>(null);
 
-/** Whether the next clicks place vertices directly instead of asking the router. */
-const guidedManual = ref(false);
-
 /**
  * Which end a plain away-from-the-route click extends.
  *
@@ -1702,6 +1817,575 @@ const guidedManual = ref(false);
  * does not care which end built it.
  */
 const guideFrontier = ref<GuideEnd>('tail');
+
+/**
+ * Which of the three things a click here can do.
+ *
+ * The re-lay gesture lives in this field rather than in a pair of toggles: two
+ * of them could be on at once, and the row would then name one while the click
+ * handler did the other. One field cannot hold a state the row contradicts.
+ */
+const guideGesture = ref<GuideGesture>('trace');
+
+/**
+ * The anchors placed and not yet accepted, in route order.
+ *
+ * Local to the map, like the pending preview: they are not part of the recipe
+ * until the reviewer accepts the rebuild, so Escape can discard them and a
+ * guided mode opened and closed leaves the saved line's recipe untouched.
+ * Re-derived from the clicks whenever one is added, because the route itself
+ * can move under a batch — an undo between two clicks must not leave an anchor
+ * ordered by a geometry that no longer exists.
+ */
+const pendingAnchors = ref<RegionAnchor[]>([]);
+
+/**
+ * The batch's own undo stack, over the anchor clicks.
+ *
+ * The anchors are map-local by design — they are not in the recipe until the
+ * rebuild is accepted, so Escape can drop them and a guided mode opened and
+ * closed leaves the saved line untouched. That is also why they need a stack of
+ * their own: without one, Ctrl+Z while a batch was half placed fell through to
+ * the page and undid the last edit the reviewer had ACCEPTED, which is the worst
+ * possible answer to "take that point back".
+ *
+ * `History<Position[]>` rather than a second undo implementation, and the
+ * payload is the clicks rather than the anchors: the anchors are derived from
+ * them (ordered by route, then snapped by the router), so stepping the clicks
+ * back re-derives everything that follows.
+ */
+const anchorHistory = ref<History<Position[]>>(emptyHistory<Position[]>());
+
+let anchorMarkers: L.Marker[] = [];
+
+function clearAnchorMarkers(): void {
+    anchorMarkers.forEach((marker) => map?.removeLayer(marker));
+    anchorMarkers = [];
+}
+
+/** An anchor's badge, numbered by its place on the route rather than by click. */
+function anchorIcon(order: number): L.DivIcon {
+    return L.divIcon({
+        className: 'route-anchor',
+        html: `<i data-anchor="${order}"></i><b>${order}</b>`,
+        iconSize: [22, 22],
+        iconAnchor: [11, 11],
+    });
+}
+
+/**
+ * The anchors, drawn with their place on the route on them.
+ *
+ * Draggable, and that is the answer to the reviewer's one complaint about a
+ * batch: the router snaps an anchor to the road it finds, so an anchor aimed at
+ * a side street can come back sitting on a different one, and the dashed stretch
+ * is then not the one that was asked for. Offering "Accept or Reject" alone
+ * meant the correction cost the whole batch — four anchors to re-place because
+ * one snapped badly. Dragging the one that is wrong re-traces the batch in
+ * place, and the proposal is still one judgement of Accept or Reject.
+ */
+function renderPendingAnchors(): void {
+    clearAnchorMarkers();
+
+    if (!map) {
+        return;
+    }
+
+    pendingAnchors.value.forEach((anchor, index) => {
+        const position = anchor.snapped ?? anchor.clicked;
+        const marker = L.marker([position[1], position[0]], {
+            icon: anchorIcon(index + 1),
+            // Interactive for the drag, and for nothing else: a click that
+            // reaches the map underneath would place another anchor under the
+            // reviewer who is trying to move this one.
+            keyboard: false,
+            bubblingMouseEvents: false,
+        });
+
+        marker.on('mousedown', (e: L.LeafletMouseEvent) => {
+            beginAnchorDrag(marker, index, e);
+        });
+
+        marker.on('click', (e: L.LeafletMouseEvent) => {
+            L.DomEvent.stopPropagation(e.originalEvent);
+        });
+
+        marker.addTo(map!);
+        anchorMarkers.push(marker);
+    });
+}
+
+/**
+ * One anchor moved; the batch is re-traced in place.
+ *
+ * The same shape as a control's drag — the marker follows the cursor and
+ * nothing is emitted until the mouse is up — because the recalculation is a
+ * router search per leg and a change of mind mid-drag must not leave half of
+ * them behind. The drop hands the new click back to the same code that placed
+ * it, so the anchor is re-ordered, re-snapped and the preview replaced by one
+ * path, and there is no second way for an anchor to be placed that could
+ * disagree with the first about where it belongs.
+ */
+function beginAnchorDrag(
+    marker: L.Marker,
+    index: number,
+    e: L.LeafletMouseEvent,
+): void {
+    if (props.mode !== 'guide') {
+        return;
+    }
+
+    L.DomEvent.stopPropagation(e.originalEvent);
+
+    if (pendingAnchors.value.length < 2) {
+        // One anchor bounds nothing, so there is nothing to re-trace; moving it
+        // would leave the batch exactly as unusable as it was.
+        announceGuided(
+            'Place a second anchor first: one of them bounds no stretch to rebuild.',
+        );
+
+        return;
+    }
+
+    isDragging = true;
+    map?.dragging.disable();
+
+    const origin = e.latlng;
+    let latest = origin;
+    let wasMoved = false;
+
+    const onMouseMove = (move: L.LeafletMouseEvent): void => {
+        wasMoved = true;
+        latest = move.latlng;
+        marker.setLatLng(move.latlng);
+    };
+
+    const onMouseUp = (): void => {
+        map?.off('mousemove', onMouseMove);
+        map?.dragging.enable();
+        document.removeEventListener('mouseup', onMouseUp);
+        isDragging = false;
+
+        if (!wasMoved) {
+            // A press that never moved is a click, and the gesture here is
+            // removal. Handled in the drag's own mouseup rather than in the
+            // marker's click handler because a real drag of five pixels can
+            // still make the browser synthesise a click, and that would delete
+            // the very anchor being moved.
+            removePendingAnchor(index);
+
+            return;
+        }
+
+        const dropped: Position = [latest.lng, latest.lat];
+        const before = pendingClicks();
+        const clicks = [...before];
+
+        clicks[index] = dropped;
+
+        // A stale offer would be a proposal over anchors that no longer exist,
+        // and the badge the reviewer just dragged is rebuilt by the re-order.
+        dismissPendingPreview();
+
+        if (!orderPendingClicks(clicks)) {
+            announceGuided(describeRectifyRefusal('no-route'));
+
+            return;
+        }
+
+        recordPendingClicks(before);
+
+        void previewRectify();
+    };
+
+    map?.on('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+}
+
+/**
+ * The batch as the route orders it.
+ *
+ * Every path that changes the clicks goes through here — a new anchor, an anchor
+ * dragged somewhere else, one taken away — so there is one implementation of
+ * "where does this anchor belong" and no second way to place one that could
+ * disagree with the first. False means the route is not there to order them
+ * against.
+ *
+ * The clicks, not the anchors: those are what the history stores, and an anchor
+ * is this function's output rather than its input.
+ */
+function orderPendingClicks(clicks: Position[]): boolean {
+    const next = orderAnchorsByRoute(clicks, props.geoJson?.coordinates ?? []);
+
+    if (next === null) {
+        return false;
+    }
+
+    pendingAnchors.value = next;
+    renderPendingAnchors();
+
+    return true;
+}
+
+/** The clicks as they stand, which is the batch's undoable state. */
+function pendingClicks(): Position[] {
+    return pendingAnchors.value.map((anchor) => anchor.clicked);
+}
+
+/** Tell the page what a pending step would do, for its undo button. */
+function announcePendingUndo(): void {
+    emit('update:pending-undo', {
+        canUndo: canUndo(anchorHistory.value),
+        canRedo: canRedo(anchorHistory.value),
+    });
+}
+
+/**
+ * Record the batch as it is about to change, so it can come back.
+ *
+ * Every mutation goes through here, discarding included: Escape dropping three
+ * anchors is a change of mind like any other, and "I discarded it, actually
+ * leave it" should be one keystroke rather than three clicks and a preview.
+ */
+function recordPendingClicks(before: Position[]): void {
+    anchorHistory.value = record(
+        anchorHistory.value,
+        before,
+        ANCHOR_UNDO_LIMIT,
+    );
+
+    announcePendingUndo();
+}
+
+/**
+ * Take one step back in the batch, or decline.
+ *
+ * The pending offer goes with it: it is derived from the anchors, and a dashed
+ * proposal over anchors that no longer exist is worse than no proposal. The
+ * trace is NOT re-run, because that is a router search per leg and an undo is
+ * not a request to re-trace — the reviewer presses Preview when they want the
+ * route back.
+ */
+function undoPendingAnchors(): boolean {
+    const step = undoStep(anchorHistory.value, pendingClicks());
+
+    if (step.value === null) {
+        return false;
+    }
+
+    anchorHistory.value = step.history;
+    dismissPendingPreview();
+
+    if (orderPendingClicks(step.value)) {
+        announcePendingUndo();
+        announceGuided(
+            pendingAnchors.value.length === 0
+                ? 'No anchors left. Click the map to place one.'
+                : `Step taken back: ${pendingAnchors.value.length} placed. Preview rebuild to trace them.`,
+        );
+    }
+
+    return true;
+}
+
+function redoPendingAnchors(): boolean {
+    const step = redoStep(anchorHistory.value, pendingClicks());
+
+    if (step.value === null) {
+        return false;
+    }
+
+    anchorHistory.value = step.history;
+    dismissPendingPreview();
+
+    if (orderPendingClicks(step.value)) {
+        announcePendingUndo();
+        announceGuided(
+            `${pendingAnchors.value.length} placed. Preview rebuild to trace them.`,
+        );
+    }
+
+    return true;
+}
+
+/**
+ * One anchor taken out of the batch by clicking it.
+ *
+ * The surgical correction, and the reason a badge is both draggable and
+ * clickable: dragging handles "this snapped onto the wrong street", clicking
+ * handles "this one should not be here at all", and step undo handles neither
+ * without replaying everything placed before it.
+ *
+ * The last anchor may go too: that leaves an empty batch, which is where Escape
+ * would have left it, one keystroke away from undoing.
+ */
+function removePendingAnchor(index: number): void {
+    const before = pendingClicks();
+    const clicks = before.filter((_, i) => i !== index);
+
+    recordPendingClicks(before);
+    dismissPendingPreview();
+
+    if (!orderPendingClicks(clicks)) {
+        announceGuided(describeRectifyRefusal('no-route'));
+
+        return;
+    }
+
+    announceGuided(
+        clicks.length === 0
+            ? 'Last anchor removed. Click the map to place one.'
+            : `Anchor ${index + 1} removed, ${clicks.length} left. Preview rebuild traces them.`,
+    );
+}
+
+/**
+ * One more anchor, placed.
+ *
+ * The whole list is re-ordered rather than the click appended: an anchor's
+ * position in the recipe decides the ordinal the server stores and the role of
+ * every control after it, and a reviewer rectifying a route clicks wherever
+ * the wrong turn is rather than in travel order.
+ */
+function addPendingAnchor(clicked: Position): void {
+    if (
+        pendingAnchors.value.length + (props.guidedWaypoints?.length ?? 0) >=
+        WAYPOINT_LIMIT
+    ) {
+        announceGuided('This route holds too many control points already.');
+
+        return;
+    }
+
+    const before = pendingClicks();
+
+    if (!orderPendingClicks([...before, clicked])) {
+        announceGuided(describeRectifyRefusal('no-route'));
+
+        return;
+    }
+
+    recordPendingClicks(before);
+
+    const placed = pendingAnchors.value.length;
+
+    announceGuided(
+        `Anchor ${placed} placed. ${
+            placed < 2
+                ? 'Place another to bound the stretch. Escape discards them.'
+                : 'Preview rebuilds the stretch between anchor 1 and anchor ' +
+                  `${placed}. Escape discards them. Drag one to move it.`
+        }`,
+    );
+}
+
+/**
+ * The batch dropped without being remembered, for the states where the batch
+ * was never a change of mind: accepted into the recipe, or left behind by
+ * leaving the mode.
+ *
+ * Separate from discardPendingAnchors() because remembering these would make
+ * them undoable, and undoing them is wrong in both cases. After an accept the
+ * page's own composite entry takes the batch back, which is the edit the
+ * reviewer actually made; and a batch from a previous visit to the mode has no
+ * business answering a Ctrl+Z in this one, so its history goes with it.
+ */
+function clearPendingAnchors(): void {
+    pendingAnchors.value = [];
+    anchorHistory.value = emptyHistory<Position[]>();
+    clearAnchorMarkers();
+    announcePendingUndo();
+}
+
+/**
+ * The batch dropped by Escape, which IS a change of mind and therefore
+ * undoable: "I discarded it, actually leave it" should be one keystroke rather
+ * than three clicks and a preview.
+ *
+ * Record-then-empty is the whole of it: the batch is the state being left
+ * behind, an empty list is what is on screen next, and undoStep between those
+ * two is the keystroke.
+ */
+function discardPendingAnchors(): void {
+    if (pendingAnchors.value.length === 0) {
+        return;
+    }
+
+    anchorHistory.value = record(
+        anchorHistory.value,
+        pendingClicks(),
+        ANCHOR_UNDO_LIMIT,
+    );
+
+    pendingAnchors.value = [];
+    clearAnchorMarkers();
+    announcePendingUndo();
+}
+
+/**
+ * A route that moved re-orders the anchors standing on it.
+ *
+ * Not cosmetic: the batch's legs are chained in this order, so badges left
+ * stale by an undo or a vertex drag would trace the stretch backwards and the
+ * reviewer would be judging a rebuild of the other direction. The snapped
+ * positions follow their own click rather than their slot, since re-ordering
+ * moves the slot and not the street.
+ */
+function reorderPendingAnchors(): void {
+    if (pendingAnchors.value.length === 0) {
+        return;
+    }
+
+    const snappedBy = new Map(
+        pendingAnchors.value.map((anchor) => [
+            `${anchor.clicked[0]},${anchor.clicked[1]}`,
+            anchor.snapped,
+        ]),
+    );
+    const next = orderAnchorsByRoute(
+        pendingAnchors.value.map((anchor) => anchor.clicked),
+        props.geoJson?.coordinates ?? [],
+    );
+
+    if (next === null) {
+        // Plain, not remembered: the route they were anchored to is gone, so
+        // restoring the batch would only fail to order itself again.
+        clearPendingAnchors();
+        announceGuided('The route is gone; the anchors with it.');
+
+        return;
+    }
+
+    pendingAnchors.value = next.map((anchor) => ({
+        ...anchor,
+        snapped:
+            snappedBy.get(`${anchor.clicked[0]},${anchor.clicked[1]}`) ?? null,
+    }));
+    renderPendingAnchors();
+}
+
+/**
+ * The batch's rebuild, offered as one judgement.
+ *
+ * The legs are chained on the router's own snap rather than on the raw clicks:
+ * the second leg starts where the first ended, so two answers cannot disagree
+ * about which carriageway of a divided road an anchor belongs to and no kink
+ * appears at the join. A leg that comes back refused ends the batch — accepting
+ * the legs that worked would leave the stretch the reviewer came to fix in
+ * place, looking as though it had been fixed.
+ */
+async function previewRectify(): Promise<void> {
+    const coordinates = props.geoJson?.coordinates ?? [];
+    const anchors = pendingAnchors.value;
+    const waypoints = props.guidedWaypoints ?? [];
+
+    if (anchors.length < 2) {
+        announceGuided(describeAnchorsNeeded(anchors.length));
+
+        return;
+    }
+
+    const blocked = controlsInsideRegion(waypoints, coordinates, anchors);
+
+    if (blocked.length > 0) {
+        announceGuided(describeBlockedControls(blocked));
+
+        return;
+    }
+
+    if (waypoints.length + anchors.length > WAYPOINT_LIMIT) {
+        announceGuided('This route holds too many control points already.');
+
+        return;
+    }
+
+    const revision = ++geometryRevision;
+
+    announceGuided(describeRoutedPending());
+
+    const tramos: Position[][] = [];
+    const streets: Array<{ name: string | null; meters: number }> = [];
+    const warnings: string[] = [];
+    let distance = 0;
+    let carried: Position | null = null;
+    let dropped = 0;
+    let maxDeviation = 0;
+
+    for (let leg = 0; leg < anchors.length - 1; leg += 1) {
+        const from = anchors[leg] as RegionAnchor;
+        const to = anchors[leg + 1] as RegionAnchor;
+        const bearing =
+            leg === 0
+                ? (headingAtVertex(coordinates, 0, from.index) ??
+                  headingBetween(from.clicked, to.clicked))
+                : finalHeading([tramos[leg - 1] as Position[]]);
+
+        const found = await lookupRoute(
+            carried ?? from.clicked,
+            to.clicked,
+            bearing,
+            document.cookie,
+        );
+
+        if (props.mode !== 'guide' || geometryRevision !== revision) {
+            return;
+        }
+
+        if (
+            found === null ||
+            found.status !== 'ok' ||
+            found.coordinates === null ||
+            found.coordinates.length < 2
+        ) {
+            announceGuided(
+                `Stretch ${leg + 1} of ${anchors.length - 1} failed: ` +
+                    describeRouteRefusal(found?.reason ?? null),
+            );
+
+            return;
+        }
+
+        // Simplified per leg, not on the stitched chain: a leg's two ends are an
+        // anchor or a join, both of which are control points that must stay
+        // vertices, and pinning them is what the helper does with a leg's own
+        // ends. Simplifying after stitching would have to recover that structure
+        // from the projections again.
+        const answer = simplifyRoutedChain(found.coordinates);
+
+        tramos.push(answer.positions);
+        streets.push(...(found.streets ?? []));
+        warnings.push(...found.warnings);
+        distance += found.distanceM ?? 0;
+        dropped += answer.dropped;
+        maxDeviation = Math.max(maxDeviation, answer.maxDeviation);
+        carried = answer.positions[answer.positions.length - 1] as Position;
+    }
+
+    // The anchors move onto the roads the router put them on, so the badges
+    // show where they will be committed rather than where they were clicked.
+    const snaps = anchorSnaps(tramos);
+
+    pendingAnchors.value = anchors.map((anchor, index) => ({
+        ...anchor,
+        snapped: snaps[index] ?? anchor.snapped,
+    }));
+    renderPendingAnchors();
+
+    guidedOffer.value = {
+        kind: 'rectify',
+        tramos,
+        anchorClicks: pendingAnchors.value.map((anchor) => anchor.clicked),
+        label:
+            describeRoute(streets, distance) +
+            describeRouteWarnings(warnings) +
+            describeSimplification(dropped, maxDeviation),
+    };
+
+    announceGuided(
+        `${guidedOffer.value.label}. Accept to rebuild the stretch, or Reject to keep the route as it is.`,
+    );
+    renderGuidedPreview();
+}
 
 /**
  * The control point selected by clicking its marker, if any.
@@ -1889,6 +2573,13 @@ async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
     }
 
     const clicked: Position = [e.latlng.lng, e.latlng.lat];
+
+    if (guideGesture.value === 'anchors') {
+        addPendingAnchor(clicked);
+
+        return;
+    }
+
     const waypoints = props.guidedWaypoints ?? [];
     const from =
         guideFrontier.value === 'tail'
@@ -1909,21 +2600,6 @@ async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
 
     if (waypoints.length >= WAYPOINT_LIMIT) {
         announceGuided('This route holds too many control points already.');
-
-        return;
-    }
-
-    if (guidedManual.value) {
-        // Drawing by hand: the click IS the vertex. Appended at the tail
-        // like a routed tramo would be, and it becomes a control all the
-        // same — the next click traces from it.
-        const coordinates = props.geoJson?.coordinates ?? [];
-
-        emitGuided(
-            appendVertexToTail(coordinates, clicked),
-            appendWaypoint(waypoints, clicked),
-        );
-        announceGuided('Vertex placed by hand.');
 
         return;
     }
@@ -2004,10 +2680,12 @@ async function offerInsertion(
     }
 
     const streets = [...(first.streets ?? []), ...(second.streets ?? [])];
+    const firstLeg = simplifyRoutedChain(first.coordinates);
+    const secondLeg = simplifyRoutedChain(second.coordinates);
 
     guidedOffer.value = {
         kind: 'insert',
-        tramos: [first.coordinates, second.coordinates],
+        tramos: [firstLeg.positions, secondLeg.positions],
         insertIndex: target.insertIndex,
         spanFrom: target.from,
         spanTo: target.to,
@@ -2015,7 +2693,12 @@ async function offerInsertion(
             describeRoute(
                 streets,
                 (first.distanceM ?? 0) + (second.distanceM ?? 0),
-            ) + describeRouteWarnings([...first.warnings, ...second.warnings]),
+            ) +
+            describeRouteWarnings([...first.warnings, ...second.warnings]) +
+            describeSimplification(
+                firstLeg.dropped + secondLeg.dropped,
+                Math.max(firstLeg.maxDeviation, secondLeg.maxDeviation),
+            ),
     };
 
     announceGuided(
@@ -2067,12 +2750,15 @@ async function offerExtension(
         return;
     }
 
+    const simplified = simplifyRoutedChain(found.coordinates);
+
     guidedOffer.value = {
         kind: atHead ? 'extend-head' : 'extend-tail',
-        tramos: [found.coordinates],
+        tramos: [simplified.positions],
         label:
             describeRoute(found.streets ?? [], found.distanceM) +
-            describeRouteWarnings(found.warnings),
+            describeRouteWarnings(found.warnings) +
+            describeSimplification(simplified.dropped, simplified.maxDeviation),
     };
     announceGuided(
         `${guidedOffer.value.label}. Accept, or Reject to draw it yourself.`,
@@ -2209,6 +2895,61 @@ function acceptPreview(): void {
 
             break;
         }
+
+        case 'rectify': {
+            const clicks = offer.anchorClicks ?? [];
+
+            // Re-derived from the clicks, never from the offer's own projections: the
+            // boundaries are vertex addresses into whatever geometry exists when
+            // the reviewer accepts, and a stored one is only right for the
+            // geometry it was cut against.
+            const ordered = orderAnchorsByRoute(clicks, coordinates);
+
+            if (ordered === null) {
+                announceGuided(describeRectifyRefusal('no-route'));
+
+                return;
+            }
+
+            const blocked = controlsInsideRegion(
+                waypoints,
+                coordinates,
+                ordered,
+            );
+
+            if (blocked.length > 0) {
+                announceGuided(describeBlockedControls(blocked));
+
+                return;
+            }
+
+            const snaps = anchorSnaps(offer.tramos);
+            const region = ordered.map((anchor, index) => ({
+                ...anchor,
+                snapped: snaps[index] ?? null,
+            }));
+            const rebuilt = rebuildRegion(
+                coordinates,
+                region,
+                stitchedChain(offer.tramos),
+            );
+
+            if (!rebuilt.rebuilt) {
+                announceGuided(describeRectifyRefusal(rebuilt.reason));
+
+                return;
+            }
+
+            emitGuided(
+                rebuilt.coordinates,
+                anchorsIntoRecipe(waypoints, coordinates, region),
+            );
+
+            clearPendingAnchors();
+            guideGesture.value = 'trace';
+
+            break;
+        }
     }
 
     guidedOffer.value = null;
@@ -2224,15 +2965,89 @@ function rejectPreview(): void {
     );
 }
 
-function toggleGuidedManual(): void {
-    guidedManual.value = !guidedManual.value;
+/**
+ * Pick the gesture the next click performs.
+ *
+ * Takes the target rather than flipping, because the three buttons name the
+ * state they lead to and a click that lands somewhere other than its label
+ * promises is the confusion this replaced. Re-picking the gesture already
+ * active changes nothing, and a pending batch survives the switch: a reviewer
+ * who pins three anchors and then wants to look at the route in move mode has
+ * not thrown their work away, and the anchors are not in the recipe until a
+ * rebuild is accepted.
+ */
+function setGuideGesture(gesture: GuideGesture): void {
+    if (guideGesture.value === gesture) {
+        return;
+    }
 
-    announceGuided(
-        guidedManual.value
-            ? 'Drawing by hand: each click places a vertex directly.'
-            : 'Back to guided tracing.',
-    );
+    guideGesture.value = gesture;
+
+    if (gesture === 'anchors') {
+        announceGuided(
+            'Placing anchors. Click the map to pin them; two bound the stretch to rebuild.',
+        );
+    }
 }
+
+/**
+ * The two gestures, as the row offers them.
+ *
+ * Declared here rather than written out twice so the buttons, their order and
+ * the state they set cannot drift apart — and rendered through `component :is`,
+ * because the icon is the only thing that differs and two fixed buttons are one
+ * thing to remember.
+ */
+const GUIDE_GESTURES: Array<{
+    id: GuideGesture;
+    label: string;
+    icon: typeof Route;
+}> = [
+    { id: 'trace', label: 'Trace', icon: Route },
+    { id: 'anchors', label: 'Anchors', icon: MapPin },
+];
+
+/** Why the removal control is disabled right now, or '' when it is live. */
+const removeControlBlock = computed(() =>
+    describeRemoveControlBlock(
+        selectedWaypoint.value,
+        waypointsForGuide.value.length,
+    ),
+);
+
+/**
+ * Whether removing the selected control can re-route the tramo it joined.
+ *
+ * The label follows this, because "Remove control" followed by no preview at
+ * all reads as the editor losing the offer — and the reviewer has no way to
+ * tell that apart from a button that is broken. Saying "Remove only" states the
+ * outcome before the press, which is the only moment at which it is useful.
+ */
+const removeReroutes = computed(() => {
+    const index = selectedWaypoint.value;
+
+    if (index === null) {
+        return false;
+    }
+
+    const waypoints = waypointsForGuide.value;
+    const coordinates = props.geoJson?.coordinates ?? [];
+    const from = waypoints[index - 1];
+    const to = waypoints[index + 1];
+
+    if (from === undefined || to === undefined) {
+        return false;
+    }
+
+    const fromVertex = findVertexForWaypoint(coordinates, from);
+    const toVertex = findVertexForWaypoint(coordinates, to);
+
+    return (
+        fromVertex !== null &&
+        toVertex !== null &&
+        toVertex.index > fromVertex.index
+    );
+});
 
 /**
  * Pick the end the next click grows.
@@ -2265,9 +3080,20 @@ function dismissPendingPreview(): void {
 }
 
 /** Leaving guided mode takes the pending preview and the manual switch with it. */
+/**
+ * Leaving guided mode takes the pending preview, the anchors, the manual switch
+ * and the control markers with it.
+ *
+ * The markers are in that list because a mode change never reaches renderMap,
+ * which is where they are painted: without this, walking out of guided mode
+ * left a route wearing the control points of a mode the reviewer had just left,
+ * over the vertex markers of the one they were in.
+ */
 function cancelPendingPreview(): void {
     dismissPendingPreview();
-    guidedManual.value = false;
+    clearPendingAnchors();
+    clearGuidedMarkers();
+    guideGesture.value = 'trace';
     guideFrontier.value = 'tail';
     selectedWaypoint.value = null;
 }
@@ -2299,6 +3125,51 @@ const detachedText = computed(() => describeDetached(detachedCount.value));
 // ---------------------------------------------------------------------------
 // Spec §4.3: moving a control recalculates its two adjacent tramos.
 // ---------------------------------------------------------------------------
+
+/**
+ * Where a control meets the route, and the geometry that meeting needs.
+ *
+ * Its own vertex when it still has one, and the point it PROJECTS onto when it
+ * has drifted off — which is the whole answer to a control that cannot be
+ * moved. The drag used to look for the vertex alone, so a control thirty metres
+ * off its route had no span to replace, the drag refused, and the row's tooltip
+ * was telling the reviewer to drag it. A route where the geometry was hand
+ * edited away from its own recipe is a normal state, not an exotic one, and the
+ * projection is what makes a control in it editable at all: the stretch it used
+ * to pin can be delimited by where it lands instead of by a vertex it has lost.
+ *
+ * The coordinates come back with it because a projection may write a vertex, and
+ * an index read before that write points one vertex too far along.
+ */
+function waypointBound(
+    coordinates: Coordinates,
+    waypoint: Waypoint,
+): { coordinates: Coordinates; address: VertexAddress } | null {
+    const vertex = findVertexForWaypoint(coordinates, waypoint);
+
+    if (vertex !== null) {
+        return { coordinates, address: vertex };
+    }
+
+    const projection = projectOnRoute(coordinates, waypoint.position);
+
+    if (projection === null) {
+        return null;
+    }
+
+    const cut = cutRouteAt(coordinates, projection);
+
+    return cut === null
+        ? null
+        : {
+              coordinates: cut.coordinates,
+              address: {
+                  segment: 0,
+                  index: cut.index,
+                  distance: distanceMeters(waypoint.position, projection.point),
+              },
+          };
+}
 
 /**
  * A dropped control, recalculated.
@@ -2340,34 +3211,41 @@ async function recalculateMovedWaypoint(
     let workingCoordinates = coordinates;
     let workingWaypoints = waypoints;
     const failed: string[] = [];
+    let dropped = 0;
+    let maxDeviation = 0;
+
+    /** One adjacent tramo, simplified on the way in and counted on the way past. */
+    const answerOf = (raw: Position[]): Position[] => {
+        const answer = simplifyRoutedChain(raw);
+
+        dropped += answer.dropped;
+        maxDeviation = Math.max(maxDeviation, answer.maxDeviation);
+
+        return answer.positions;
+    };
 
     if (index > 0) {
         const previous = waypoints[index - 1];
-        const previousVertex = findVertexForWaypoint(
-            workingCoordinates,
-            previous,
-        );
-        const movedOldVertex = findVertexForWaypoint(
-            workingCoordinates,
-            waypoints[index],
-        );
+        const previousBound = waypointBound(workingCoordinates, previous);
+        const movedBound = waypointBound(workingCoordinates, waypoints[index]);
 
-        if (previousVertex === null || movedOldVertex === null) {
-            // Either bound detached: the span cannot be delimited, which is
-            // the detached warning's ground, not a guess's.
+        if (previousBound === null || movedBound === null) {
+            failed.push('there is no route for the tramo behind it to follow');
+        } else if (movedBound.address.index <= previousBound.address.index) {
+            // Also the guard that keeps the indices honest: a cut writes a
+            // vertex and renumbers everything after it, so a bound at or before
+            // the other one is refused rather than spliced one vertex too far.
             failed.push(
-                'the tramo behind it could not be traced: a bound control is detached',
-            );
-        } else if (movedOldVertex.index <= previousVertex.index) {
-            failed.push(
-                'the tramo behind it is degenerate; it cannot be replaced',
+                'the tramo behind it is degenerate: the two controls sit in ' +
+                    'the other order along the route. Remove it, or drag it ' +
+                    'between them.',
             );
         } else {
             const arrivalHeading =
                 headingAtVertex(
                     workingCoordinates,
-                    previousVertex.segment,
-                    previousVertex.index,
+                    previousBound.address.segment,
+                    previousBound.address.index,
                 ) ?? headingBetween(previous.position, position);
 
             const tramo = await lookupRoute(
@@ -2395,10 +3273,10 @@ async function recalculateMovedWaypoint(
                     tramo.coordinates[tramo.coordinates.length - 1];
 
                 workingCoordinates = replaceTramoSpan(
-                    workingCoordinates,
-                    previousVertex,
-                    movedOldVertex,
-                    tramo.coordinates,
+                    movedBound.coordinates,
+                    previousBound.address,
+                    movedBound.address,
+                    answerOf(tramo.coordinates),
                 );
 
                 workingWaypoints = workingWaypoints.map((waypoint, i) =>
@@ -2416,22 +3294,16 @@ async function recalculateMovedWaypoint(
     if (index < waypoints.length - 1) {
         const next = workingWaypoints[index + 1];
         const origin = workingWaypoints[index];
-        const originVertex = findVertexForWaypoint(
-            workingCoordinates,
-            origin,
-            Number.POSITIVE_INFINITY,
-        );
+        const originBound = waypointBound(workingCoordinates, origin);
 
-        if (originVertex === null) {
-            failed.push(
-                'the tramo ahead could not be traced: the moved control is off the route',
-            );
+        if (originBound === null) {
+            failed.push('there is no route for the tramo ahead to follow');
         } else {
             const departureHeading =
                 headingAtVertex(
                     workingCoordinates,
-                    originVertex.segment,
-                    originVertex.index,
+                    originBound.address.segment,
+                    originBound.address.index,
                 ) ?? headingBetween(origin.position, next.position);
 
             const tramo = await lookupRoute(
@@ -2453,21 +3325,30 @@ async function recalculateMovedWaypoint(
                 failed.push(describeRouteRefusal(tramo?.reason ?? null));
             } else {
                 const nextEnd = tramo.coordinates[tramo.coordinates.length - 1];
+                // Re-derived on the CUT geometry, not on the one it was looked
+                // up against: a projection may have written a vertex, and the
+                // far bound read before that write points one vertex too far
+                // along — which replaces somebody else's span and leaves this
+                // one untouched, with nothing on screen saying so.
                 const nextVertex = findVertexForWaypoint(
-                    workingCoordinates,
+                    originBound.coordinates,
                     next,
                 );
 
-                if (nextVertex === null) {
+                if (
+                    nextVertex === null ||
+                    nextVertex.index <= originBound.address.index
+                ) {
                     failed.push(
-                        'the control ahead is detached; its tramo cannot be replaced',
+                        'the control ahead is off the route. Drag that one ' +
+                            'onto it first, then move this one again.',
                     );
                 } else {
                     workingCoordinates = replaceTramoSpan(
-                        workingCoordinates,
-                        originVertex,
+                        originBound.coordinates,
+                        originBound.address,
                         nextVertex,
-                        tramo.coordinates,
+                        answerOf(tramo.coordinates),
                     );
 
                     workingWaypoints = workingWaypoints.map((waypoint, i) =>
@@ -2491,8 +3372,19 @@ async function recalculateMovedWaypoint(
     announceGuided(
         failed.length > 0
             ? `The control moved, but ${failed.join('; ')}.`
-            : 'Tramos recalculated around the moved control.',
+            : 'Tramos recalculated around the moved control.' +
+                  describeSimplification(dropped, maxDeviation),
     );
+
+    // The layer is reconciled from the state, last, always.
+    //
+    // The drag moved a Leaflet marker directly, so a refusal left it wherever
+    // the reviewer let go of it with the recipe unchanged and nothing to
+    // repaint it: a dot on the map that looked like a control being added and
+    // was not one. The parent's props have settled by now, so whatever actually
+    // happened is what gets drawn.
+    await nextTick();
+    renderGuidedMarkers();
 }
 
 // ---------------------------------------------------------------------------
@@ -2513,6 +3405,12 @@ function startRemovePreview(): void {
     const to = waypoints[index + 1];
 
     if (from === undefined || to === undefined) {
+        // Unreachable through the row, which disables this for a route's two
+        // ends, and kept only so a stale selection cannot fall through.
+        announceGuided(
+            'A route’s start and end are what the route is. Drag one instead.',
+        );
+
         return;
     }
 
@@ -2524,9 +3422,23 @@ function startRemovePreview(): void {
         toVertex === null ||
         toVertex.index <= fromVertex.index
     ) {
-        announceGuided(
-            'The controls around this one are not on the route; the tramo cannot be joined.',
-        );
+        // Re-routing the joined tramo is the rich half of this removal, and it
+        // needs both neighbours on the route to delimit a span. That is not a
+        // reason to refuse the whole edit: a control whose neighbours have
+        // drifted off is precisely the control a reviewer wants gone, so it goes
+        // and says what it did NOT do.
+        const without = removeWaypoint(waypoints, index);
+
+        if (without === null) {
+            announceGuided(
+                'This control cannot be removed while it is one of only two.',
+            );
+
+            return;
+        }
+
+        emitGuided(null, without);
+        announceGuided(describeRemoveWithoutReroute());
 
         return;
     }
@@ -2565,13 +3477,17 @@ async function offerRemoval(
         return;
     }
 
+    const simplified = simplifyRoutedChain(found.coordinates);
+
     guidedOffer.value = {
         kind: 'remove',
-        tramos: [found.coordinates],
+        tramos: [simplified.positions],
         removeIndex: index,
         spanFrom: fromVertex,
         spanTo: toVertex,
-        label: describeRoute(found.streets ?? [], found.distanceM),
+        label:
+            describeRoute(found.streets ?? [], found.distanceM) +
+            describeSimplification(simplified.dropped, simplified.maxDeviation),
     };
 
     announceGuided(
@@ -2789,11 +3705,21 @@ function clearLayers(): void {
 }
 
 /**
- * Escape drops the selection, and the pending preview with it.
+ * Escape drops the selection, and the pending preview and anchors with it.
  *
  * Without it there is no way back to a single-vertex drag once a range is
  * picked, short of shift-clicking somewhere useless; a preview judged by
- * accident needs the same escape hatch.
+ * accident needs the same escape hatch. Anchors go too, because a batch of
+ * them is a judgement in progress like any other and the reviewer abandoning
+ * one should not have to hunt for the button to say so.
+ *
+ * Ctrl/Cmd+Z is claimed here for the same reason it is claimed by the page for
+ * the line: while a batch is half placed, undo means taking the batch back.
+ * Letting it through would undo the last edit the reviewer ACCEPTED — the worst
+ * possible answer to "take that point back". `stopImmediatePropagation` because
+ * the page's own handler is on the same node, and it stands down anyway on the
+ * `defaultPrevented` it leaves behind: whichever of the two runs first wins, so
+ * this does not depend on which registered its listener first.
  */
 function handleKeydown(e: KeyboardEvent): void {
     if (e.key === 'Escape') {
@@ -2803,6 +3729,39 @@ function handleKeydown(e: KeyboardEvent): void {
         if (guidedOffer.value !== null) {
             guidedOffer.value = null;
             clearGuidedLayer();
+        }
+
+        if (pendingAnchors.value.length > 0) {
+            discardPendingAnchors();
+            announceGuided('Anchors discarded. Ctrl+Z takes them back.');
+        }
+
+        return;
+    }
+
+    if (props.mode !== 'guide' || (!e.metaKey && !e.ctrlKey)) {
+        return;
+    }
+
+    if (isTextEntryTarget(e.target)) {
+        return;
+    }
+
+    const key = e.key.toLowerCase();
+
+    if (key === 'z' && !e.shiftKey) {
+        if (undoPendingAnchors()) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        }
+
+        return;
+    }
+
+    if ((key === 'z' && e.shiftKey) || key === 'y') {
+        if (redoPendingAnchors()) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
         }
     }
 }
@@ -2820,6 +3779,7 @@ onMounted(() => {
 watch(() => props.geoJson, renderMap, { deep: true });
 watch(() => props.geoJson, clearSelection, { deep: true });
 watch(() => props.geoJson, dismissPendingPreview, { deep: true });
+watch(() => props.geoJson, reorderPendingAnchors, { deep: true });
 watch(() => props.guidedWaypoints, renderGuidedMarkers, { deep: true });
 watch(selectedWaypoint, () => {
     refreshWaypointSelection();
@@ -2851,6 +3811,12 @@ watch(
             addVertexMarkers(coordinates, toLatLngs(coordinates), newMode!);
         }
 
+        // Entering guided mode is not a geometry change, so renderMap never runs
+        // for it and the controls would not be painted. A saved recipe opened
+        // with this mode already active is exactly the case that used to show
+        // an empty map where the reviewer expected their control points.
+        renderGuidedMarkers();
+
         updateMapClickListener(newMode!);
 
         await nextTick();
@@ -2876,6 +3842,11 @@ watch(
         }
 
         updateMapClickListener(props.mode ?? 'move');
+
+        // The same rule the mode watcher follows: toggling the map between
+        // editing and looking never reaches renderMap, so the controls have to
+        // be repainted here or a read-only view keeps wearing them.
+        renderGuidedMarkers();
 
         await nextTick();
         map?.invalidateSize();
@@ -2998,7 +3969,25 @@ onUnmounted(() => {
                 <slot name="toolbar" />
             </div>
 
-            <div v-if="editable" class="flex flex-wrap items-center gap-3">
+            <!--
+                    This row does not wrap, and that is the whole reason the map
+                    stops lurching. The map below has a FIXED height, so anything
+                    that changes the height of the block above it moves the map:
+                    a control appearing or disappearing while the reviewer is
+                    mid-gesture takes the map out from under the click that is
+                    being judged. A row that can wrap turns every width change
+                    into a height change.
+
+                    `flex-nowrap` plus `min-w-0` and `overflow-x-auto` on the
+                    part that can grow means a narrow window scrolls the controls
+                    instead of stacking them, and the scrollbar is hidden in the
+                    styles below because a visible one is fifteen pixels tall and
+                    would reintroduce exactly the shift this is fixing.
+                -->
+            <div
+                v-if="editable"
+                class="flex min-w-0 flex-1 flex-nowrap items-center gap-2 overflow-x-auto"
+            >
                 <!--
                     A spacer, and permanently rendered rather than standing in
                     for a readout that is not there.
@@ -3098,23 +4087,200 @@ onUnmounted(() => {
                     </template>
 
                     <!--
-                        Guided mode's own row: the judgement on a pending
-                        tramo lives next to the map it decorates; the frontier
-                        toggle, the manual switch and the removal of a selected
-                        control are the four gestures spec §4 allows on a recipe
-                        that already exists.
+                        Guided mode's own row, in the order the work happens:
+                        how the next click behaves on the left, what that gesture
+                        offers beside it, and the pending judgement pushed to the
+                        far end where it cannot be pressed by accident while the
+                        reviewer is still placing points.
+
+                        The gesture is ONE three-way switch rather than the toggles
+                        it replaced: two of them could be live at once, and the row
+                        would name one while the click handler did the other.
                     -->
                     <template v-if="mode === 'guide'">
-                        <template v-if="guidedOffer">
+                        <Separator
+                            orientation="vertical"
+                            class="mx-1 hidden h-6 sm:block"
+                        />
+
+                        <div
+                            class="inline-flex items-center gap-1"
+                            role="group"
+                            aria-label="What a click on the map does"
+                        >
                             <Button
+                                v-for="option in GUIDE_GESTURES"
+                                :key="option.id"
                                 type="button"
-                                variant="default"
+                                :variant="
+                                    guideGesture === option.id
+                                        ? 'default'
+                                        : 'outline'
+                                "
                                 size="sm"
-                                @click="acceptPreview"
+                                :aria-pressed="guideGesture === option.id"
+                                @click="setGuideGesture(option.id)"
                             >
-                                <Check class="size-4" />
-                                Accept tramo
+                                <component :is="option.icon" class="size-4" />
+                                {{ option.label }}
                             </Button>
+                        </div>
+
+                        <!--
+                            Only what the live gesture can act on. The frontier is
+                            meaningless to anchors, and a control that does nothing
+                            under the gesture that is selected is a control the
+                            reviewer has to read past.
+                        -->
+                        <div class="inline-flex items-center gap-2">
+                            <span
+                                v-if="
+                                    guideGesture === 'trace' &&
+                                    waypointsForGuide.length > 0
+                                "
+                                class="inline-flex items-center gap-1"
+                            >
+                                <span class="text-xs text-muted-foreground">
+                                    Extend at
+                                </span>
+                                <Button
+                                    type="button"
+                                    :variant="
+                                        guideFrontier === 'head'
+                                            ? 'default'
+                                            : 'outline'
+                                    "
+                                    size="sm"
+                                    :aria-pressed="guideFrontier === 'head'"
+                                    @click="setGuideFrontier('head')"
+                                >
+                                    Start
+                                </Button>
+                                <Button
+                                    type="button"
+                                    :variant="
+                                        guideFrontier === 'head'
+                                            ? 'outline'
+                                            : 'default'
+                                    "
+                                    size="sm"
+                                    :aria-pressed="guideFrontier === 'tail'"
+                                    @click="setGuideFrontier('tail')"
+                                >
+                                    End
+                                </Button>
+                            </span>
+
+                            <!--
+                                A pending batch keeps its own action reachable
+                                whatever gesture is selected after it: hiding
+                                "Preview rebuild" while three anchors sit there
+                                is how a half-placed batch becomes unreachable.
+                                Escape discards it, which is why there is no
+                                second button saying so.
+                            -->
+                            <template
+                                v-if="
+                                    guideGesture === 'anchors' ||
+                                    pendingAnchors.length > 0
+                                "
+                            >
+                                <TooltipProvider :delay-duration="0">
+                                    <Tooltip>
+                                        <TooltipTrigger as-child>
+                                            <!--
+                                                The trigger wraps the button rather
+                                                than being the button: a disabled
+                                                one fires no pointer events, so the
+                                                explanation — which is wanted most
+                                                exactly when it is disabled — would
+                                                never show.
+                                            -->
+                                            <span class="inline-flex">
+                                                <Button
+                                                    type="button"
+                                                    variant="default"
+                                                    size="sm"
+                                                    :disabled="
+                                                        pendingAnchors.length <
+                                                        2
+                                                    "
+                                                    @click="previewRectify"
+                                                >
+                                                    <Route class="size-4" />
+                                                    Preview rebuild
+                                                </Button>
+                                            </span>
+                                        </TooltipTrigger>
+                                        <TooltipContent class="max-w-xs">
+                                            <p>
+                                                {{
+                                                    describeAnchorsNeeded(
+                                                        pendingAnchors.length,
+                                                    )
+                                                }}
+                                            </p>
+                                        </TooltipContent>
+                                    </Tooltip>
+                                </TooltipProvider>
+                            </template>
+                        </div>
+
+                        <div class="flex-1" />
+
+                        <!--
+                            The removal, always on screen and never hidden — a
+                            button that is not there is a button nobody learns
+                            exists, and the tooltip that explains a disabled state
+                            is only useful to someone who can already see it.
+                            Which is why it also carries the refusal: the start
+                            and end of a route cannot be removed, and saying so
+                            here beats a reviewer pressing a button that used to
+                            do nothing at all.
+
+                            It sits to the LEFT of Reject and Accept rather than
+                            beside Accept: one is how a control goes away, the
+                            other is how a proposal is committed, and a
+                            destructive button within a thumb's reach of the one
+                            that commits geometry is how a proposal gets accepted
+                            by accident.
+                        -->
+                        <TooltipProvider :delay-duration="0">
+                            <Tooltip>
+                                <TooltipTrigger as-child>
+                                    <span class="inline-flex">
+                                        <Button
+                                            type="button"
+                                            variant="destructive"
+                                            size="sm"
+                                            :disabled="
+                                                removeControlBlock !== ''
+                                            "
+                                            @click="startRemovePreview"
+                                        >
+                                            <Trash2 class="size-4" />
+                                            {{
+                                                removeReroutes
+                                                    ? 'Remove control'
+                                                    : 'Remove only'
+                                            }}
+                                        </Button>
+                                    </span>
+                                </TooltipTrigger>
+                                <TooltipContent class="max-w-xs">
+                                    <p>
+                                        {{
+                                            removeControlBlock ||
+                                            (removeReroutes
+                                                ? 'Removes the selected control and re-routes the tramo it joined, shown dashed for you to accept.'
+                                                : describeRemoveWithoutReroute())
+                                        }}
+                                    </p>
+                                </TooltipContent>
+                            </Tooltip>
+                        </TooltipProvider>
+
+                        <template v-if="guidedOffer">
                             <Button
                                 type="button"
                                 variant="outline"
@@ -3124,69 +4290,20 @@ onUnmounted(() => {
                                 <X class="size-4" />
                                 Reject
                             </Button>
+                            <Button
+                                type="button"
+                                variant="default"
+                                size="sm"
+                                @click="acceptPreview"
+                            >
+                                <Check class="size-4" />
+                                {{
+                                    guidedOffer.kind === 'rectify'
+                                        ? 'Accept rebuild'
+                                        : 'Accept tramo'
+                                }}
+                            </Button>
                         </template>
-                        <Button
-                            v-if="selectedWaypoint !== null"
-                            type="button"
-                            variant="destructive"
-                            size="sm"
-                            @click="startRemovePreview"
-                        >
-                            <Trash2 class="size-4" />
-                            Remove control
-                        </Button>
-                        <!--
-                            Which end the next click grows, said as the two
-                            options with the live one filled in. A single
-                            button here had to name the OTHER end, because a
-                            toggle's label is an action — and the label
-                            contradicting the highlight is exactly how
-                            "Extend at end" came to read as a statement about
-                            the end currently being extended.
-                        -->
-                        <span
-                            v-if="waypointsForGuide.length > 0"
-                            class="inline-flex items-center gap-1"
-                        >
-                            <span class="text-xs text-muted-foreground">
-                                Extend at
-                            </span>
-                            <Button
-                                type="button"
-                                :variant="
-                                    guideFrontier === 'head'
-                                        ? 'default'
-                                        : 'outline'
-                                "
-                                size="sm"
-                                @click="setGuideFrontier('head')"
-                            >
-                                Start
-                            </Button>
-                            <Button
-                                type="button"
-                                :variant="
-                                    guideFrontier === 'head'
-                                        ? 'outline'
-                                        : 'default'
-                                "
-                                size="sm"
-                                @click="setGuideFrontier('tail')"
-                            >
-                                End
-                            </Button>
-                        </span>
-                        <Button
-                            type="button"
-                            :variant="guidedManual ? 'default' : 'outline'"
-                            size="sm"
-                            @click="toggleGuidedManual"
-                        >
-                            <PencilLine class="size-4" />
-                            {{
-                                guidedManual ? 'Back to guided' : 'Draw by hand'
-                            }}
-                        </Button>
                     </template>
 
                     <!--
@@ -3402,6 +4519,24 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/*
+   The toolbar row scrolls rather than wraps, and its scrollbar is hidden.
+
+   Not cosmetic: a visible horizontal scrollbar is about fifteen pixels tall and
+   this row sits directly above a map of fixed height, so letting it appear is
+   the same lurch the nowrap was there to end — it just happens on the window's
+   first resize instead of on every click. The row can still be scrolled by
+   trackpad or keyboard, which is what a mouse-only reviewer would not have.
+*/
+.no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+    display: none;
+}
+
 .cursor-crosshair :deep(.leaflet-container),
 .cursor-crosshair :deep(.leaflet-interactive) {
     cursor: crosshair !important;
@@ -3422,6 +4557,42 @@ onUnmounted(() => {
     border-radius: 9999px;
     border: 2px solid #ffffff;
     box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+:deep(.route-anchor) {
+    background: transparent;
+    border: none;
+    /* Draggable and clickable, so it says so: a gesture with no pointer cue is
+       a gesture the reviewer has to discover by moving the wrong thing. */
+    cursor: grab;
+}
+
+:deep(.route-anchor:active) {
+    cursor: grabbing;
+}
+
+:deep(i[data-anchor]) {
+    display: block;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    border-radius: 9999px;
+    border: 2px dashed #7c3aed;
+    background-color: #7c3aed33;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+:deep(.route-anchor b) {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    color: #ffffff;
+    text-shadow: 0 1px 2px rgb(0 0 0 / 0.8);
 }
 
 :deep(i[data-endpoint='start']) {

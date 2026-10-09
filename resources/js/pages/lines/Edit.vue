@@ -53,12 +53,22 @@ import {
     canRedo,
     canUndo,
     emptyHistory,
+    isTextEntryTarget,
     record,
     redoStep,
     undoStep,
 } from '@/lib/undoStack';
 import lines from '@/routes/lines';
 import type { DirectionOperation, Line, LineNav } from '@/types/line';
+
+/**
+ * The map, for the two things this page cannot know on its own.
+ *
+ * A template ref rather than a shared store because both are questions with a
+ * single owner: whether a pending batch of anchors can be undone, and being
+ * asked to undo it. Everything the map owns it answers for itself.
+ */
+const mapRef = ref<InstanceType<typeof LineMap> | null>(null);
 
 /**
  * How many geometry states to keep. Deep enough to walk back through a whole
@@ -309,6 +319,12 @@ const history = ref(emptyHistory<GuidedState>());
 const preserveViewToken = ref(0);
 
 function undo(): void {
+    // A pending batch of anchors is the most recent edit while one exists, and
+    // undo means the most recent edit. The map owns it, so it is asked first.
+    if (mapRef.value?.undoPendingAnchors() === true) {
+        return;
+    }
+
     const step = undoStep(history.value, {
         geometry: geoJsonText.value,
         waypoints: waypoints.value,
@@ -326,6 +342,10 @@ function undo(): void {
 }
 
 function redo(): void {
+    if (mapRef.value?.redoPendingAnchors() === true) {
+        return;
+    }
+
     const step = redoStep(history.value, {
         geometry: geoJsonText.value,
         waypoints: waypoints.value,
@@ -342,8 +362,37 @@ function redo(): void {
     markDirty();
 }
 
-const canUndoGeometry = computed(() => canUndo(history.value));
-const canRedoGeometry = computed(() => canRedo(history.value));
+/**
+ * What a pending-batch step would do, as the map reports it.
+ *
+ * Held here only so the undo button can answer, and OR'd into the disabled
+ * state: a greyed Undo sitting next to three placed anchors is what made the
+ * reviewer conclude that undo did not work.
+ */
+const pendingUndo = ref({ canUndo: false, canRedo: false });
+
+function onPendingUndo(state: { canUndo: boolean; canRedo: boolean }): void {
+    pendingUndo.value = state;
+}
+
+const canUndoGeometry = computed(
+    () => canUndo(history.value) || pendingUndo.value.canUndo,
+);
+const canRedoGeometry = computed(
+    () => canRedo(history.value) || pendingUndo.value.canRedo,
+);
+
+/**
+ * What Undo is about to take back, said where the button is.
+ *
+ * Two destinations behind one button, and a tooltip that named only the older
+ * one would be wrong every time the newer was what a press would undo.
+ */
+const undoTooltip = computed(() =>
+    pendingUndo.value.canUndo
+        ? 'Takes back the last anchor you placed (Ctrl+Z). Press it again to go further back.'
+        : 'Undo the last geometry edit (Ctrl+Z). The map keeps its framing, so you stay where you were looking.',
+);
 
 const { snapPreset, updateSnapPreset } = useSnapPreset();
 const { propagationEnabled, updatePropagation } = usePropagation();
@@ -380,15 +429,19 @@ const propagationTooltip = computed(() => {
  * A global handler that also fired inside the textarea would fight the native
  * behaviour, and the two together are worse than either alone: the field would
  * undo text while the map looked frozen.
+ *
+ * `defaultPrevented` is the other deferral: the map claims the same keys while a
+ * batch of anchors is half placed, because undo means "take that back" there and
+ * this handler would otherwise undo the last edit the reviewer ACCEPTED. Whichever
+ * listener runs first wins and the other stands down, so neither depends on
+ * which of them registered its listener first.
  */
 function handleKeydown(e: KeyboardEvent): void {
-    if (!e.metaKey && !e.ctrlKey) {
+    if (e.defaultPrevented || (!e.metaKey && !e.ctrlKey)) {
         return;
     }
 
-    const target = e.target as HTMLElement | null;
-
-    if (target && ['INPUT', 'TEXTAREA'].includes(target.tagName)) {
+    if (isTextEntryTarget(e.target)) {
         return;
     }
 
@@ -1029,11 +1082,7 @@ const waypointsField = computed<string | null>(() => {
                                 </span>
                             </TooltipTrigger>
                             <TooltipContent class="max-w-xs">
-                                <p>
-                                    Undo the last geometry edit (Ctrl+Z). The
-                                    map keeps its framing, so you stay where you
-                                    were looking.
-                                </p>
+                                <p>{{ undoTooltip }}</p>
                             </TooltipContent>
                         </Tooltip>
 
@@ -1053,7 +1102,10 @@ const waypointsField = computed<string | null>(() => {
                                 </span>
                             </TooltipTrigger>
                             <TooltipContent class="max-w-xs">
-                                <p>Redo (Ctrl+Shift+Z)</p>
+                                <p v-if="pendingUndo.canRedo">
+                                    Puts the anchors back (Ctrl+Shift+Z).
+                                </p>
+                                <p v-else>Redo (Ctrl+Shift+Z)</p>
                             </TooltipContent>
                         </Tooltip>
                     </TooltipProvider>
@@ -1077,6 +1129,7 @@ const waypointsField = computed<string | null>(() => {
                 </div>
             </div>
             <LineMap
+                ref="mapRef"
                 :geo-json="parsedGeoJson"
                 :editable="isEditingMap"
                 :mode="mode"
@@ -1088,6 +1141,7 @@ const waypointsField = computed<string | null>(() => {
                 :preserve-view-token="preserveViewToken"
                 @update:geo-json="onMapUpdate"
                 @update:guided="onGuidedUpdate"
+                @update:pending-undo="onPendingUndo"
                 @update:resample-spacing="updateResampleSpacing"
             >
                 <!--

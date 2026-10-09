@@ -120,3 +120,22 @@ export function canUndo(history: History<unknown>): boolean {
 export function canRedo(history: History<unknown>): boolean {
     return history.redo.length > 0;
 }
+
+/**
+ * Whether a keystroke belongs to a text field rather than to the editor.
+ *
+ * Shared rather than written twice because two handlers now answer the same
+ * key — the page's history of a line and the map's history of a pending batch —
+ * and they must agree. If they disagreed, a Ctrl+Z with the caret in the line's
+ * GeoJSON textarea would take back an anchor instead of undoing text, which is
+ * the failure the guard exists to prevent, arriving through a rule that drifted.
+ *
+ * An element that is not one of those is not a text entry, whatever it is: the
+ * question is only ever "is this keystroke ours", and a contenteditable or a
+ * custom input that is not a textarea is a thing this module cannot recognise.
+ */
+export function isTextEntryTarget(target: EventTarget | null): boolean {
+    const tagName = (target as HTMLElement | null)?.tagName;
+
+    return tagName === 'INPUT' || tagName === 'TEXTAREA';
+}

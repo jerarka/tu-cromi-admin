@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'vitest';
+import type { Position } from './routeEditing';
 import {
     canRedo,
     canUndo,
     emptyHistory,
+    isTextEntryTarget,
     record,
     redoStep,
     undoStep,
@@ -195,6 +197,64 @@ describe('canUndo and canRedo', () => {
     test('a fresh history can do neither', () => {
         expect(canUndo(emptyHistory())).toBe(false);
         expect(canRedo(emptyHistory())).toBe(false);
+    });
+});
+
+describe('the batch of anchor clicks', () => {
+    // The pending batch is a History<Position[]> over the raw clicks, so the
+    // generic's own tests already cover the stepping. What is worth asserting
+    // here is the shape the guided mode hands it — a list of click positions,
+    // not the anchors derived from them — because the derivation is what makes
+    // the payload small enough to keep fifty of.
+    const clicks = (...lngs: number[]): Position[] =>
+        lngs.map((lng) => [lng, 2.0] as Position);
+
+    test('an anchor placed and then taken back leaves nothing pending', () => {
+        const first = clicks(1.0);
+        const history = record(emptyHistory<Position[]>(), first, 50);
+
+        expect(canUndo(history)).toBe(true);
+
+        const step = undoStep(history, clicks(1.0001));
+
+        expect(step.value).toEqual(first);
+        expect(canUndo(step.history)).toBe(false);
+    });
+
+    test('a discarded batch is taken back whole, and the empty state is kept', () => {
+        // Escape drops three anchors: the entry is the batch, and the state on
+        // screen when Ctrl+Z arrives is an empty list — which is what has to be
+        // recorded as the redo side, or taking the batch back would not be
+        // reversible.
+        const batch = clicks(1.0, 1.0001, 1.0002);
+        const history = record(emptyHistory<Position[]>(), batch, 50);
+
+        const step = undoStep(history, []);
+
+        expect(step.value).toEqual(batch);
+        expect(step.history.redo).toEqual([[]]);
+    });
+});
+
+describe('isTextEntryTarget', () => {
+    const element = (tagName: string): EventTarget =>
+        ({ tagName }) as unknown as EventTarget;
+
+    test("a field is somebody else's keystroke", () => {
+        expect(isTextEntryTarget(element('INPUT'))).toBe(true);
+        expect(isTextEntryTarget(element('TEXTAREA'))).toBe(true);
+    });
+
+    test('anything else is ours', () => {
+        expect(isTextEntryTarget(element('DIV'))).toBe(false);
+        expect(isTextEntryTarget(null)).toBe(false);
+    });
+
+    test('the tag is compared as it arrives, not lowercased first', () => {
+        // If this ever fails the two handlers that share the rule would differ
+        // on a browser that reports the name differently, which is exactly the
+        // drift the shared helper exists to prevent.
+        expect(isTextEntryTarget(element('input'))).toBe(false);
     });
 });
 

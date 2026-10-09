@@ -1,10 +1,20 @@
 import { describe, expect, test } from 'vitest';
 import {
+    anchorSnaps,
+    anchorsIntoRecipe,
+    controlsInsideRegion,
+    cutRouteAt,
+    describeAnchorsNeeded,
+    describeBlockedControls,
     describeDetached,
+    describeRectifyRefusal,
+    describeRemoveControlBlock,
+    describeRemoveWithoutReroute,
     describeRoute,
     describeRouteRefusal,
     describeRouteWarnings,
     describeRoutedPending,
+    describeSimplification,
     detachedWaypoints,
     extensionEndpoints,
     finalHeading,
@@ -13,17 +23,24 @@ import {
     headingAtVertex,
     headingBetween,
     insertWaypointAt,
+    orderAnchorsByRoute,
     prependTramo,
     prependWaypoint,
+    projectOnRoute,
+    rebuildRegion,
     removeWaypoint,
     replaceTramoSpan,
+    ROUTED_MAX_SPAN_METERS,
+    simplifyRoutedChain,
     spliceTramo,
+    stitchedChain,
     tramoInterior,
     waypointsFromRecord,
     WAYPOINT_LIMIT,
 } from './guidedRouting';
-import type { Waypoint } from './guidedRouting';
+import type { RegionAnchor, Waypoint } from './guidedRouting';
 import type { Position } from './routeEditing';
+import { distanceMeters } from './routeEditing';
 
 /**
  * Hand-computed, like every geometry test in this project: the fixtures below
@@ -210,7 +227,7 @@ describe('tramoInterior', () => {
 });
 
 describe('describeRoute', () => {
-    test('names every street it used, with the metres each covered', () => {
+    test('names the street it entered, and counts the rest', () => {
         expect(
             describeRoute(
                 [
@@ -219,13 +236,40 @@ describe('describeRoute', () => {
                 ],
                 1441.0,
             ),
-        ).toBe('Traced Calle 1 —240 m, Avenida Cristo Redentor —1201 m');
+        ).toBe('Traced 1441 m, starting on Calle 1 + 1 more street');
     });
 
-    test('an unnamed street is named as such rather than skipped', () => {
-        expect(describeRoute([{ name: null, meters: 55.5 }], 55.5)).toBe(
-            'Traced unnamed street —56 m',
+    test('a single named street is named without a count', () => {
+        expect(describeRoute([{ name: 'Calle 1', meters: 240.4 }], 240.4)).toBe(
+            'Traced 240 m, starting on Calle 1',
         );
+    });
+
+    test('unnamed streets drop out once anything is named', () => {
+        // 71% of the imported network carries no name, so a list that keeps
+        // them is mostly the words "unnamed street", repeated.
+        expect(
+            describeRoute(
+                [
+                    { name: 'Calle 1', meters: 240.4 },
+                    { name: null, meters: 95.2 },
+                    { name: null, meters: 60.1 },
+                ],
+                395.7,
+            ),
+        ).toBe('Traced 396 m, starting on Calle 1');
+    });
+
+    test('a stretch of nothing named still reports the distance', () => {
+        expect(
+            describeRoute(
+                [
+                    { name: null, meters: 95.2 },
+                    { name: null, meters: 60.1 },
+                ],
+                155.3,
+            ),
+        ).toBe('Traced 155 m');
     });
 
     test('two snapped-together points say so instead of tracing nothing', () => {
@@ -246,9 +290,9 @@ describe('describeRouteRefusal', () => {
         ['no-path', 'No legal connection was found'],
         ['budget', 'gave up before finding'],
         ['graph-not-built', 'road graph is not built'],
-        [null, 'draw this part by hand'],
-        ['anything-else', 'draw this part by hand'],
-    ])('%s → a message a reviewer can act on', (reason, fragment) => {
+        [null, 'place a vertex in Add mode'],
+        ['anything-else', 'place a vertex in Add mode'],
+    ])('%s a message a reviewer can act on', (reason, fragment) => {
         expect(describeRouteRefusal(reason)).toContain(fragment);
     });
 });
@@ -469,6 +513,19 @@ describe('describeDetached', () => {
         expect(describeDetached(1)).toContain('One control point');
         expect(describeDetached(2)).toContain('2 control points');
     });
+
+    test('every fix it names is a gesture that exists', () => {
+        // It used to offer "redraw its tramo", which is not a gesture in this
+        // editor — a warning pointing at an action the reviewer cannot take is
+        // a refusal with extra words in it.
+        for (const count of [1, 2]) {
+            const sentence = describeDetached(count);
+
+            expect(sentence).toContain('Drag');
+            expect(sentence).toContain('remove');
+            expect(sentence).not.toContain('edraw');
+        }
+    });
 });
 
 describe('replaceTramoSpan', () => {
@@ -557,6 +614,41 @@ describe('extensionEndpoints', () => {
     });
 });
 
+describe('describeRemoveControlBlock', () => {
+    test('nothing selected says how to select something', () => {
+        expect(describeRemoveControlBlock(null, 4)).toContain(
+            'Click a control on the map',
+        );
+    });
+
+    test('a route of one control is both ends, and says so', () => {
+        expect(describeRemoveControlBlock(0, 1)).toContain('not removable');
+    });
+
+    test('a route of two controls has no removable one either', () => {
+        expect(describeRemoveControlBlock(0, 2)).toContain('not removable');
+        expect(describeRemoveControlBlock(1, 2)).toContain('not removable');
+    });
+
+    test('the refusal names the correction', () => {
+        expect(describeRemoveControlBlock(0, 4)).toContain('Drag it instead');
+    });
+
+    test('an interior control is removable and gets no sentence', () => {
+        expect(describeRemoveControlBlock(1, 4)).toBe('');
+        expect(describeRemoveControlBlock(2, 4)).toBe('');
+    });
+
+    test('a removal with no re-route says what it did not do', () => {
+        // Said, because the alternative is the control quietly dropped with the
+        // stretch it used to pin left as whatever the geometry happened to be.
+        const sentence = describeRemoveWithoutReroute();
+
+        expect(sentence).toContain('without re-routing');
+        expect(sentence).toContain('left exactly as it is');
+    });
+});
+
 describe('insertWaypointAt', () => {
     test('the new control takes the clicked index and roles re-derive', () => {
         const waypoints: Waypoint[] = [
@@ -581,6 +673,427 @@ describe('insertWaypointAt', () => {
 
         expect(insertWaypointAt(waypoints, 0, [1.0, 2.0])).toBe(waypoints);
         expect(insertWaypointAt(waypoints, 2, [1.0, 2.0])).toBe(waypoints);
+    });
+});
+
+describe('the region helpers', () => {
+    // Two anchors on the five-vertex straight route: the first projects into
+    // segment 0 at t = 0.5 (boundary 1), the second into segment 3 at t = 0.5
+    // (boundary 4). Both need a vertex cut, so the region is bounded by two
+    // vertices that did not exist and the answer is checked position by
+    // position.
+    const firstClick: Position = [1.00005, 2.0];
+    const lastClick: Position = [1.00035, 2.0];
+
+    function region(clicks: Position[] = [firstClick, lastClick]) {
+        return orderAnchorsByRoute(clicks, route) ?? [];
+    }
+
+    // The chain runs along the anchors' own streets, a fraction north of the
+    // route's centreline — which is the real shape of the answer: the router
+    // snaps the anchors onto roads, and the connector between a projection and
+    // a snapped anchor is the stretch the reviewer asked for, not a rounding.
+    const chain: Position[] = [
+        [1.00006, 2.0001],
+        [1.0002, 2.0002],
+        [1.00034, 2.0001],
+    ];
+
+    test('anchors order by their place on the route, not by click order', () => {
+        const ordered = region([lastClick, firstClick]);
+
+        expect(ordered).toHaveLength(2);
+        expect(ordered[0]?.clicked).toEqual(firstClick);
+        expect(ordered[1]?.clicked).toEqual(lastClick);
+    });
+
+    test('two anchors on one segment still order by where they landed', () => {
+        const ordered = region([
+            [1.00025, 2.0],
+            [1.00015, 2.0],
+        ]);
+
+        expect(ordered.map((anchor) => anchor.clicked)).toEqual([
+            [1.00015, 2.0],
+            [1.00025, 2.0],
+        ]);
+    });
+
+    test('an anchor with no route to land on has no order', () => {
+        expect(orderAnchorsByRoute([[1.0, 2.0]], [])).toBeNull();
+    });
+
+    test('the rebuild keeps the vertices outside the region as the same objects', () => {
+        const result = rebuildRegion(route, region(), chain);
+
+        expect(result.rebuilt).toBe(true);
+        expect(result.reason).toBeNull();
+        // v0, the first cut, the chain, the last cut, v4 — hand-computed.
+        expect(result.coordinates[0]).toEqual([
+            [1.0, 2.0],
+            [1.00005, 2.0],
+            [1.00006, 2.0001],
+            [1.0002, 2.0002],
+            [1.00034, 2.0001],
+            [1.00035, 2.0],
+            [1.0004, 2.0],
+        ]);
+
+        const before = route[0] ?? [];
+
+        expect(result.coordinates[0]?.[0]).toBe(before[0]);
+        expect(result.coordinates[0]?.[6]).toBe(before[4]);
+    });
+
+    test('a boundary landing on an existing vertex cuts nothing', () => {
+        // [1.0002, 2.0] is vertex 2 itself: no cut vertex may be written,
+        // because a duplicate of a vertex the route already has is noise the
+        // reviewer would have to see through.
+        const result = rebuildRegion(
+            route,
+            region([firstClick, [1.0002, 2.0]]),
+            chain,
+        );
+
+        expect(result.rebuilt).toBe(true);
+        expect(new Set(result.coordinates[0]).size).toBe(
+            result.coordinates[0]?.length,
+        );
+    });
+
+    test('two anchors on the same spot are refused, and the route is untouched', () => {
+        const result = rebuildRegion(
+            route,
+            region([firstClick, firstClick]),
+            chain,
+        );
+
+        expect(result.rebuilt).toBe(false);
+        expect(result.reason).toBe('degenerate-region');
+        expect(result.coordinates).toBe(route);
+    });
+
+    test('a chain of one point is not a rebuild', () => {
+        const result = rebuildRegion(route, region(), [[1.00005, 2.0]]);
+
+        expect(result.rebuilt).toBe(false);
+        expect(result.reason).toBe('empty-chain');
+    });
+
+    test('a control standing inside the region is named, not dropped', () => {
+        const recipe: Waypoint[] = [
+            { position: [1.0, 2.0], role: 'start' },
+            { position: [1.0002, 2.0], role: 'via' },
+            { position: [1.0004, 2.0], role: 'end' },
+        ];
+
+        expect(controlsInsideRegion(recipe, route, region())).toEqual([1]);
+        expect(
+            controlsInsideRegion(
+                recipe,
+                route,
+                region([firstClick, [1.00015, 2.0]]),
+            ),
+        ).toEqual([]);
+    });
+
+    test('the recipe takes the anchors between the controls they bound', () => {
+        const recipe: Waypoint[] = [
+            { position: [1.0, 2.0], role: 'start' },
+            { position: [1.0004, 2.0], role: 'end' },
+        ];
+
+        const anchors: RegionAnchor[] = region().map((anchor, index) => ({
+            ...anchor,
+            snapped:
+                index === 0 ? [1.00005, 2.00001] : ([1.00035, 2.0] as Position),
+        }));
+
+        const next = anchorsIntoRecipe(recipe, route, anchors);
+
+        expect(next.map((waypoint) => waypoint.position)).toEqual([
+            [1.0, 2.0],
+            [1.00005, 2.00001],
+            [1.00035, 2.0],
+            [1.0004, 2.0],
+        ]);
+        expect(next.map((waypoint) => waypoint.role)).toEqual([
+            'start',
+            'via',
+            'via',
+            'end',
+        ]);
+    });
+
+    test('an unsnapped anchor is committed where it was clicked, until the router answers', () => {
+        const recipe: Waypoint[] = [
+            { position: [1.0, 2.0], role: 'start' },
+            { position: [1.0004, 2.0], role: 'end' },
+        ];
+
+        const next = anchorsIntoRecipe(recipe, route, region());
+
+        expect(next[1]?.position).toEqual(firstClick);
+    });
+});
+
+describe('the batch chain', () => {
+    const legs: Position[][] = [
+        [
+            [1.0, 2.0],
+            [1.1, 2.0],
+        ],
+        [
+            [1.1, 2.0],
+            [1.2, 2.0],
+        ],
+        [
+            [1.2, 2.0],
+            [1.3, 2.0],
+        ],
+    ];
+
+    test('the chain drops every join but the first head', () => {
+        expect(stitchedChain(legs)).toEqual([
+            [1.0, 2.0],
+            [1.1, 2.0],
+            [1.2, 2.0],
+            [1.3, 2.0],
+        ]);
+    });
+
+    test('a batch of one leg is that leg', () => {
+        expect(stitchedChain([legs[0] as Position[]])).toEqual(legs[0]);
+    });
+
+    test('the snaps are one more than the legs, head to tail', () => {
+        expect(anchorSnaps(legs)).toEqual([
+            [1.0, 2.0],
+            [1.1, 2.0],
+            [1.2, 2.0],
+            [1.3, 2.0],
+        ]);
+    });
+
+    test('no legs means no snaps to read', () => {
+        expect(anchorSnaps([])).toEqual([]);
+    });
+});
+
+describe('the rectify messages', () => {
+    test('a refusal names the correction', () => {
+        expect(describeRectifyRefusal('degenerate-region')).toBe(
+            'Those anchors bound no stretch. Move them further apart.',
+        );
+        expect(describeRectifyRefusal('something-new')).toBe(
+            'That stretch cannot be rebuilt.',
+        );
+    });
+
+    test('the anchor count says how many are missing', () => {
+        expect(describeAnchorsNeeded(0)).toContain('Click the map');
+        expect(describeAnchorsNeeded(1)).toContain('One more anchor');
+    });
+
+    test('blocked controls are named by the order the reviewer sees', () => {
+        expect(describeBlockedControls([0, 2])).toBe(
+            'The stretch holds control 1, control 3, which the rebuild would remove. Remove it first, or bound the anchors tighter.',
+        );
+    });
+});
+
+describe('simplifyRoutedChain', () => {
+    // Five vertices eleven metres apart on one straight line: what a router
+    // answer looks like where an avenue crosses four side streets.
+    const straight: Position[] = [
+        [1.0, 2.0],
+        [1.0001, 2.0],
+        [1.0002, 2.0],
+        [1.0003, 2.0],
+        [1.0004, 2.0],
+    ];
+
+    test('a straight run keeps its two ends and reports the rest', () => {
+        const result = simplifyRoutedChain(straight);
+
+        expect(result.positions).toEqual([
+            [1.0, 2.0],
+            [1.0004, 2.0],
+        ]);
+        expect(result.dropped).toBe(3);
+        expect(result.maxDeviation).toBeLessThan(0.001);
+    });
+
+    test('a straight run that wobbles by centimetres still collapses', () => {
+        // The shape of the real thing: an OSM centreline along a straight avenue
+        // is never exactly collinear, and a search that stops collapsing on a
+        // centimetre of wobble would keep every junction on every avenue in the
+        // city — which is the whole population this exists to remove.
+        const wobble: Position[] = [
+            [1.0, 2.0],
+            [1.0001, 2.000001],
+            [1.0002, 2.0],
+            [1.0003, 1.999999],
+            [1.0004, 2.0],
+        ];
+
+        const result = simplifyRoutedChain(wobble);
+
+        expect(result.positions).toEqual([
+            [1.0, 2.0],
+            [1.0004, 2.0],
+        ]);
+        expect(result.dropped).toBe(3);
+    });
+
+    test('a long straight run is split anyway, because it deviates by nothing', () => {
+        // Forty vertices eleven metres apart: a 440 m avenue whose centreline
+        // carries no shape at all. A tolerance of any size authorises collapsing
+        // it to two vertices 440 m apart — the line keeps its shape perfectly
+        // and ends up with a gap nobody drew. The span rule has to be what
+        // prevents that, and the vertices it keeps have to be few: a rule that
+        // splits at the first interior vertex spends all forty of them.
+        const long: Position[] = Array.from(
+            { length: 40 },
+            (_, i) => [1.0 + i * 0.0001, 2.0] as Position,
+        );
+
+        const result = simplifyRoutedChain(long);
+
+        expect(result.positions.length).toBeLessThan(12);
+
+        const gaps = result.positions
+            .slice(1)
+            .map((position, index) =>
+                distanceMeters(result.positions[index] as Position, position),
+            );
+
+        expect(Math.max(...gaps)).toBeLessThanOrEqual(
+            ROUTED_MAX_SPAN_METERS + 1,
+        );
+    });
+
+    test('a bend beyond the tolerance survives on distance alone', () => {
+        // 5.5 m off the chord with turn angles under 45°, so only the distance
+        // rule can be holding this vertex up.
+        const bend: Position[] = [
+            [1.0, 2.0],
+            [1.0002, 2.0],
+            [1.0004, 2.001],
+        ];
+
+        expect(simplifyRoutedChain(bend, [], 5).positions).toHaveLength(3);
+        expect(simplifyRoutedChain(bend, [], 5).dropped).toBe(0);
+    });
+
+    test('a corner survives a tolerance that would otherwise flatten it', () => {
+        // Eleven-metre legs at a right angle: about 4.5 m of deviation from the
+        // chord, which a twenty-metre budget calls free — and a bus route that
+        // cuts the corner is wrong whatever it saves. The tolerance is raised
+        // past the deviation on purpose, so only the angle rule can keep this.
+        const corner: Position[] = [
+            [1.0, 2.0],
+            [1.0001, 2.0],
+            [1.0001, 2.0001],
+        ];
+
+        const result = simplifyRoutedChain(corner, [], 1000);
+
+        expect(result.positions).toEqual(corner);
+        expect(result.dropped).toBe(0);
+    });
+
+    test('a pinned vertex survives a stretch that would otherwise collapse', () => {
+        const result = simplifyRoutedChain(straight, [2]);
+
+        expect(result.positions).toEqual([
+            straight[0],
+            straight[2],
+            straight[4],
+        ]);
+        expect(result.dropped).toBe(2);
+    });
+
+    test('a chain of two is already the answer', () => {
+        const pair: Position[] = [
+            [1.0, 2.0],
+            [1.0001, 2.0],
+        ];
+
+        expect(simplifyRoutedChain(pair)).toEqual({
+            positions: pair,
+            dropped: 0,
+            maxDeviation: 0,
+        });
+    });
+});
+
+describe('describeSimplification', () => {
+    test('says nothing when nothing went', () => {
+        expect(describeSimplification(0, 0)).toBe('');
+    });
+
+    test('counts the vertices and bounds the movement', () => {
+        expect(describeSimplification(312, 4.4)).toBe(
+            ' 312 vertices dropped, max 4 m off the line',
+        );
+        expect(describeSimplification(1, 12.6)).toBe(
+            ' 1 vertex dropped, max 13 m off the line',
+        );
+    });
+});
+
+describe('projectOnRoute', () => {
+    test('a point beside the route lands where it is nearest', () => {
+        // Five vertices eleven metres apart on the straight fixture; a click
+        // halfway along the second leg.
+        const result = projectOnRoute(route, [1.00005, 2.0002]);
+
+        expect(result?.index).toBe(0);
+        expect(result?.t).toBeCloseTo(0.5, 5);
+        expect(result?.point[0]).toBeCloseTo(1.00005, 6);
+    });
+
+    test('a point far off the route still projects onto it', () => {
+        // Twenty metres north of a straight run: the projection is where the
+        // route is, NOT where the point is. That difference is the connector a
+        // reviewer's pin asks for.
+        const result = projectOnRoute(route, [1.0001, 2.0002]);
+
+        expect(result?.point[1]).toBeCloseTo(2.0, 6);
+    });
+
+    test('no route to project onto is null', () => {
+        expect(projectOnRoute([], [1.0, 2.0])).toBeNull();
+        expect(projectOnRoute([[[1.0, 2.0]]], [1.0, 2.0])).toBeNull();
+    });
+});
+
+describe('cutRouteAt', () => {
+    test('a projection between two vertices gains one', () => {
+        const cut = cutRouteAt(route, {
+            index: 1,
+            t: 0.5,
+            point: [1.00015, 2.0],
+        });
+
+        expect(cut?.inserted).toBe(true);
+        expect(cut?.index).toBe(2);
+        expect(cut?.coordinates[0]?.[2]).toEqual([1.00015, 2.0]);
+    });
+
+    test('a projection onto an existing vertex writes nothing', () => {
+        // Duplicating a vertex the route already has is what every downstream
+        // "span degenerate" check would trip over.
+        const cut = cutRouteAt(route, {
+            index: 2,
+            t: 0,
+            point: [1.0002, 2.0],
+        });
+
+        expect(cut?.inserted).toBe(false);
+        expect(cut?.index).toBe(2);
+        expect(cut?.coordinates).toBe(route);
     });
 });
 

@@ -2758,13 +2758,17 @@ export function describeModeHelp(
 ): string {
     if (mode === 'guide') {
         return (
-            'Click to place control points along the streets the route should ' +
-            'take. The tramo between two points is traced along the road network ' +
-            'and shown dashed: press Accept to keep it, Reject to dismiss it, or ' +
-            'click "Draw by hand" to place vertices without routing. A click away ' +
-            'from the route extends the end chosen in "Extend at" — pick Start to ' +
-            "grow it backwards, which also makes the new point the route's first. " +
-            'Escape cancels the pending preview.'
+            'Trace lays tramos along the road network between control points, and ' +
+            'shows each one dashed for you to accept or reject. A click near the ' +
+            'route splits the span it lands in; a click away from the route grows ' +
+            'the end chosen in "Extend at". Anchors re-lays part of a route that ' +
+            'already exists: pin two or more points around the stretch that is ' +
+            'wrong, then Preview rebuild re-routes only the stretch between the ' +
+            'outermost ones, and dragging a pinned point re-traces the batch in ' +
+            'place. The dots on the map are your control points: drag one ' +
+            'to move it, click one to select it, then Remove control takes it away. ' +
+            'Where the router cannot find a way, place the vertex in Add mode. ' +
+            'Escape cancels a pending proposal and discards anchors.'
         );
     }
 
