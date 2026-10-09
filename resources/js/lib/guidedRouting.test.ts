@@ -23,11 +23,13 @@ import {
     headingAtVertex,
     headingBetween,
     insertWaypointAt,
+    insertionTarget,
     orderAnchorsByRoute,
     prependTramo,
     prependWaypoint,
     projectOnRoute,
     rebuildRegion,
+    removalJoin,
     removeWaypoint,
     replaceTramoSpan,
     ROUTED_MAX_SPAN_METERS,
@@ -37,6 +39,7 @@ import {
     tramoInterior,
     waypointsFromRecord,
     WAYPOINT_LIMIT,
+    waypointRoleAt,
 } from './guidedRouting';
 import type { RegionAnchor, Waypoint } from './guidedRouting';
 import type { Position } from './routeEditing';
@@ -507,6 +510,46 @@ describe('detachedWaypoints', () => {
     });
 });
 
+describe('waypointRoleAt', () => {
+    const at = (count: number): Waypoint[] =>
+        Array.from({ length: count }, (_, index) => ({
+            position: [1.0 + index * 0.0001, 2.0] as Position,
+            role: 'via' as const,
+        }));
+
+    test('a role is decided by position in the list and nothing else', () => {
+        // The ordinal and the role the server stores come from the array order,
+        // so this is the rule the whole persisted recipe rests on: the first
+        // control is the start, the last is the end, and everything between is a
+        // via whatever it used to say about itself.
+        expect(at(4).map((_, index) => waypointRoleAt(at(4), index))).toEqual([
+            'start',
+            'via',
+            'via',
+            'end',
+        ]);
+    });
+
+    test('one control is the start and the end at once', () => {
+        expect(waypointRoleAt(at(1), 0)).toBe('start');
+    });
+
+    test('two controls are the route and nothing else', () => {
+        expect(at(2).map((_, index) => waypointRoleAt(at(2), index))).toEqual([
+            'start',
+            'end',
+        ]);
+    });
+
+    test('three controls put exactly one via between them', () => {
+        expect(at(3).map((_, index) => waypointRoleAt(at(3), index))).toEqual([
+            'start',
+            'via',
+            'end',
+        ]);
+    });
+});
+
 describe('describeDetached', () => {
     test('one and several get their own sentences, zero gets none', () => {
         expect(describeDetached(0)).toBe('');
@@ -611,6 +654,134 @@ describe('extensionEndpoints', () => {
             origin: clicked,
             destination: start,
         });
+    });
+});
+
+describe('insertionTarget', () => {
+    // The five-vertex straight route, ~11 m per leg. Its recipe starts and ends
+    // at its own ends, so one control splits it into one span.
+    const two: Waypoint[] = [
+        { position: [1.0, 2.0], role: 'start' },
+        { position: [1.0004, 2.0], role: 'end' },
+    ];
+
+    const four: Waypoint[] = [
+        { position: [1.0, 2.0], role: 'start' },
+        { position: [1.0001, 2.0], role: 'via' },
+        { position: [1.0003, 2.0], role: 'via' },
+        { position: [1.0004, 2.0], role: 'end' },
+    ];
+
+    test('a click inside the only span splits it, and names the slot after it', () => {
+        // Vertices 0..4 with a control at each end: the span is the whole route
+        // and the new control would take index 1, after the start.
+        const target = insertionTarget(route, two, [1.0002, 2.0]);
+
+        expect(target?.from.index).toBe(0);
+        expect(target?.to.index).toBe(4);
+        expect(target?.insertIndex).toBe(1);
+    });
+
+    test('with four controls a click lands in the span that contains it', () => {
+        // Bounds at vertices 0, 1, 3 and 4, so the spans are 0..1 and 1..3. A
+        // click at 1.00005 is inside the first, and one at 1.0002 inside the
+        // second — which is not the same span just because it is nearer.
+        const first = insertionTarget(route, four, [1.00005, 2.0]);
+        const second = insertionTarget(route, four, [1.0002, 2.0]);
+
+        expect(first?.from.index).toBe(0);
+        expect(first?.to.index).toBe(1);
+        expect(first?.insertIndex).toBe(1);
+
+        expect(second?.from.index).toBe(1);
+        expect(second?.to.index).toBe(3);
+        expect(second?.insertIndex).toBe(2);
+    });
+
+    test('a click on a boundary vertex belongs to the span before it', () => {
+        // Inserting exactly where a split already is would put a control on top
+        // of another one, so the tie goes backwards.
+        const target = insertionTarget(route, four, [1.0001, 2.0]);
+
+        expect(target?.from.index).toBe(0);
+        expect(target?.to.index).toBe(1);
+    });
+
+    test('a recipe with fewer than two controls has no span to split', () => {
+        expect(
+            insertionTarget(route, two.slice(0, 1), [1.0002, 2.0]),
+        ).toBeNull();
+    });
+
+    test('a detached bound cannot delimit anything', () => {
+        const drifted: Waypoint[] = [
+            { position: [1.0, 2.0], role: 'start' },
+            { position: [1.0002, 2.0006], role: 'end' },
+        ];
+
+        expect(insertionTarget(route, drifted, [1.0001, 2.0])).toBeNull();
+    });
+
+    test('a click far from the route is not a split but an extension', () => {
+        // Sixty metres north: over the tolerance, so there is nothing to split
+        // and the caller's honest answer is to grow the route instead.
+        expect(insertionTarget(route, two, [1.0002, 2.0006])).toBeNull();
+    });
+
+    test('an empty route has nothing to split', () => {
+        expect(insertionTarget([], two, [1.0, 2.0])).toBeNull();
+    });
+});
+
+describe('removalJoin', () => {
+    const recipe: Waypoint[] = [
+        { position: [1.0, 2.0], role: 'start' },
+        { position: [1.0002, 2.0], role: 'via' },
+        { position: [1.0004, 2.0], role: 'end' },
+    ];
+
+    test('an interior control between two on-route ones can be joined', () => {
+        expect(removalJoin(route, recipe, 1)).toEqual({
+            from: { segment: 0, index: 0, distance: expect.any(Number) },
+            to: { segment: 0, index: 4, distance: expect.any(Number) },
+        });
+    });
+
+    test('a neighbour off the route cannot delimit a span', () => {
+        // The join is across the control's NEIGHBOURS, so it is a neighbour that
+        // has to be off the route — the control under test can be perfectly
+        // placed and still have nothing to join to.
+        const drifted: Waypoint[] = [
+            { position: [1.0, 2.0], role: 'start' },
+            { position: [1.0001, 2.0], role: 'via' },
+            { position: [1.0002, 2.0006], role: 'via' },
+            { position: [1.0004, 2.0], role: 'end' },
+        ];
+
+        expect(removalJoin(route, drifted, 1)).toBeNull();
+    });
+
+    test('the two ends have no neighbours to join across', () => {
+        expect(removalJoin(route, recipe, 0)).toBeNull();
+        expect(removalJoin(route, recipe, 2)).toBeNull();
+    });
+
+    test('a recipe of two has no interior control at all', () => {
+        expect(removalJoin(route, recipe.slice(0, 2), 1)).toBeNull();
+    });
+
+    test('neighbours in the wrong order along the route are not a span', () => {
+        // A recipe that runs backwards along its own route: the list order and
+        // the geometry order disagreeing is a state the editor refuses rather
+        // than guesses at, and the refusal has to be the one the button's label
+        // promised.
+        const backwards: Waypoint[] = [
+            { position: [1.0004, 2.0], role: 'start' },
+            { position: [1.0002, 2.0], role: 'via' },
+            { position: [1.0, 2.0], role: 'end' },
+        ];
+
+        expect(removalJoin(route, backwards, 1)).toBeNull();
     });
 });
 

@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import {
     Check,
     HelpCircle,
@@ -44,18 +44,19 @@ import {
     describeRoutedPending,
     describeSimplification,
     detachedWaypoints,
-    DETACHED_TOLERANCE_METERS,
     extensionEndpoints,
     finalHeading,
     findVertexForWaypoint,
     headingAtVertex,
     headingBetween,
     insertWaypointAt,
+    insertionTarget,
     orderAnchorsByRoute,
     prependTramo,
     prependWaypoint,
     projectOnRoute,
     rebuildRegion,
+    removalJoin,
     removeWaypoint,
     replaceTramoSpan,
     simplifyRoutedChain,
@@ -151,8 +152,8 @@ const props = defineProps<{
     /**
      * The control points accepted so far, owned by the parent.
      *
-     * The parent is the source of truth — they are the state that gets
-     * persisted with the route — and the map only renders them and asks for
+     * The parent is the source of truth â€” they are the state that gets
+     * persisted with the route â€” and the map only renders them and asks for
      * changes through the update:guided event. Holding a local copy would
      * make undo restoration a second synchronization problem, and undo is
      * exactly the thing that must restore geometry and controls together.
@@ -225,7 +226,7 @@ const emit = defineEmits<{
      * step on its own. `propagated` counts vertices that moved and the reviewer did
      * not drag, which makes it one. `laid` says a whole dragged stretch was laid
      * along a street, which is one even though every vertex it moved was the
-     * reviewer's own — and which may have removed some of them.
+     * reviewer's own â€” and which may have removed some of them.
      */
     (
         e: 'update:geoJson',
@@ -248,8 +249,8 @@ const emit = defineEmits<{
      * One event rather than two because accepting a tramo is one edit: the
      * geometry splice and the control point that anchors it. The parent
      * records its composite undo entry from the state it held BEFORE this
-     * event, so splitting the emit would record a half-state — new geometry
-     * with old controls — between the two.
+     * event, so splitting the emit would record a half-state â€” new geometry
+     * with old controls â€” between the two.
      *
      * `coordinates` is null when only the control list changed (a first
      * control placed on an empty route, which has no tramo yet).
@@ -277,7 +278,7 @@ const emit = defineEmits<{
 /**
  * The two methods the page's undo and redo buttons need.
  *
- * Exposed rather than emitted because a button has to ASK — it cannot take the
+ * Exposed rather than emitted because a button has to ASK â€” it cannot take the
  * batch back by wishing, and a boolean told it whether to press would be a
  * second source of truth about what undo will do.
  */
@@ -346,7 +347,7 @@ let guidedMarkers: L.CircleMarker[] = [];
 
 /**
  * The look of a control point: the same dot-and-ring language as a vertex,
- * in amber — the colour of a proposal rather than an edit — and one size up,
+ * in amber â€” the colour of a proposal rather than an edit â€” and one size up,
  * because a control is the only thing on the map in this mode and has to read
  * as something you can act on.
  *
@@ -395,8 +396,8 @@ function refreshWaypointSelection(): void {
  * relocation is the fix for a bug this function's own guard used to hide: the
  * watcher does not fire on mount, so a line opened WITH a saved recipe had its
  * controls cleared by renderMap and never painted again, and any edit that
- * changed the geometry without changing the recipe — an undo, a re-space, a
- * drag — wiped them for the rest of the visit. The map's render owns what is
+ * changed the geometry without changing the recipe â€” an undo, a re-space, a
+ * drag â€” wiped them for the rest of the visit. The map's render owns what is
  * drawn on the map, and a control that disappears when you press Ctrl+Z is a
  * control the reviewer cannot find to delete.
  *
@@ -425,8 +426,8 @@ function renderGuidedMarkers(): void {
         );
 
         // Clicking a control selects it: the row's Remove control is what
-        // acts on the selection, per §4.5. A click during a pending offer
-        // would move state under the thing being judged — refused.
+        // acts on the selection, per Â§4.5. A click during a pending offer
+        // would move state under the thing being judged â€” refused.
         marker.on('click', (e: L.LeafletMouseEvent) => {
             L.DomEvent.stopPropagation(e.originalEvent);
 
@@ -453,7 +454,7 @@ function renderGuidedMarkers(): void {
  * The live marker moves under the cursor; nothing is emitted until the mouse
  * comes up, because the recalculation is two chained route searches and a
  * change of mind mid-drag must not leave half of it behind. A press that
- * never moved is a click — selection's gesture — and the drag is abandoned
+ * never moved is a click â€” selection's gesture â€” and the drag is abandoned
  * without touching anything.
  */
 function beginWaypointDrag(
@@ -586,7 +587,7 @@ function startMarquee(e: L.LeafletMouseEvent): void {
 
     // Plain drag on the background pans. Without this guard the marquee
     // swallowed every drag and the map became impossible to move while
-    // editing — the marquee is the rarer action, so it takes the modifier.
+    // editing â€” the marquee is the rarer action, so it takes the modifier.
     if (!e.originalEvent.shiftKey) {
         return;
     }
@@ -702,7 +703,7 @@ function moveMarkers(active: VertexRef[], delta: Position): void {
  *
  * The counterpart to moveMarkers for the vertices a walk placed on a street
  * centreline one at a time. A propagated vertex has no single offset to be moved
- * by — each one lands at its own place along the street — so the positions are
+ * by â€” each one lands at its own place along the street â€” so the positions are
  * absolute, and this is the one place they can be applied without rebuilding
  * every marker and throwing away the layers a drag may still be bound to.
  */
@@ -964,7 +965,7 @@ function renderMap(): void {
         }
 
         // clearLayers() above still took the controls away, and a route with a
-        // recipe and no geometry is not a state the page can be in for long —
+        // recipe and no geometry is not a state the page can be in for long â€”
         // but "the marker layer is repainted on every render" has to be true of
         // every render, not the ones that happen to reach the bottom.
         renderGuidedMarkers();
@@ -1045,7 +1046,7 @@ function vertexStyle(
          * Green is what "selected" means everywhere else in this editor, and
          * using it here would put two meanings on one colour. Filling the dot
          * keeps the destructive mode reading as destructive while still showing
-         * the selection — which it has to, or a box gesture in delete mode looks
+         * the selection â€” which it has to, or a box gesture in delete mode looks
          * like it did nothing and the next click removes an unchosen vertex.
          */
         return {
@@ -1101,8 +1102,8 @@ function refreshMarkerStyles(): void {
 /**
  * One marker per route vertex, for the modes that edit them.
  *
- * Nothing in guide mode. A vertex there is inert — the drag and the selection
- * handlers are bound only in move and delete — and it sits on top of the exact
+ * Nothing in guide mode. A vertex there is inert â€” the drag and the selection
+ * handlers are bound only in move and delete â€” and it sits on top of the exact
  * pixel a control point sits on, so an imported line with nine hundred vertices
  * buries the recipe under nine hundred dots that do nothing. With them gone the
  * dots in this mode ARE the controls, which is the answer to "which of these
@@ -1146,7 +1147,7 @@ function addVertexMarkers(
                         // vertex, so the gesture a reviewer reaches for is click
                         // the first one then Shift-click the last one. Anchoring
                         // used to be the shift-click's alone, which meant the
-                        // range could only be started by holding the modifier —
+                        // range could only be started by holding the modifier â€”
                         // the first Shift was pure ceremony, and the reviewer who
                         // forgot it got a single-vertex selection with no way to
                         // tell which of the two they had done.
@@ -1208,8 +1209,8 @@ function addVertexMarkers(
  * next to the click and delete handlers rather than next to the drop handling
  * it exists to feed.
  *
- * It stays in this file. It reads a dozen pieces of the map's state — the drag
- * coordinates, the selection, the marker styling, the polyline — and lifting it
+ * It stays in this file. It reads a dozen pieces of the map's state â€” the drag
+ * coordinates, the selection, the marker styling, the polyline â€” and lifting it
  * out would mean handing all of those across as arguments or wrapping them in a
  * context object, which moves the code without clarifying it.
  *
@@ -1241,7 +1242,7 @@ function beginVertexDrag(
         // one: where the selection ended up is where a Shift-click extends it
         // from. Anchoring only on click would have made "drag this vertex, then
         // Shift-click that one" reach back to whatever was clicked before the
-        // drag — an invisible earlier vertex deciding the range.
+        // drag â€” an invisible earlier vertex deciding the range.
         if (!isSelected(ref)) {
             clearSelection();
             selection.value = [ref];
@@ -1340,7 +1341,7 @@ function commitDrop(coordinates: Coordinates): number {
     skipNextFitBounds = true;
 
     // Cleared here rather than in the refinement, because a drop that ends up
-    // unsnapped still has to take the last drop's message down with it — and
+    // unsnapped still has to take the last drop's message down with it â€” and
     // the refinement is precisely the path that does not run in that case.
     announceSnap(null);
     emit('update:geoJson', {
@@ -1357,14 +1358,14 @@ function commitDrop(coordinates: Coordinates): number {
  *
  * The edit is already written by the time this runs, so everything here is
  * optional: a failed, slow or stale lookup costs the refinement and nothing
- * else. That is the whole reason the commit happens first — a drop the reviewer
+ * else. That is the whole reason the commit happens first â€” a drop the reviewer
  * made deliberately is never traded away for a network result.
  *
  * The whole selection is sampled, but the result is applied as a rigid offset.
  * The reference vertex decides where the route should sit; the rest of the
  * selection follows it without reshaping, because a stretch of route being
  * dragged across a block is one edit, not N. Sampling all of it is what makes
- * that offset trustworthy — it is how the street is chosen, and the choice is
+ * that offset trustworthy â€” it is how the street is chosen, and the choice is
  * made before the offset is computed.
  *
  * The offset only reaches the vertices that were dragged, and that is the gap
@@ -1372,7 +1373,7 @@ function commitDrop(coordinates: Coordinates): number {
  * over leaves its neighbours on the street it came from, so the route crosses
  * the block diagonally and the kink is the reviewer's first sign that the tool
  * did half a job. So once the street is settled, the vertices on either side of
- * the drop are walked onto it — forwards and backwards, because a route has a
+ * the drop are walked onto it â€” forwards and backwards, because a route has a
  * direction of travel and the kink behind a moved vertex is the same defect as
  * the one in front of it.
  *
@@ -1399,7 +1400,7 @@ async function refineDropAfterSnap(
 
     // One deadline for every lookup this drop makes, not one per request. A group
     // move can ask for the street, run out of it and ask what continues, and the
-    // timeout is per fetch — so two chained lookups would leave the reviewer
+    // timeout is per fetch â€” so two chained lookups would leave the reviewer
     // looking at a committed drop for twice the budget, the second of which has
     // not even started when the first has used it up.
     const deadline = AbortSignal.timeout(SNAP_LOOKUP_TIMEOUT_MS);
@@ -1408,7 +1409,7 @@ async function refineDropAfterSnap(
         // The reference alone once the drop is a whole stretch. The other sampled
         // points exist to break a tie between streets at a crossing, and for a
         // group move that tie is between streets the reviewer has just displaced by
-        // hand — voting with them is asking the drop to agree with itself. It also
+        // hand â€” voting with them is asking the drop to agree with itself. It also
         // cannot change the answer: the reference's own distance is what decides
         // whether any street counts.
         active.length > 1
@@ -1421,7 +1422,7 @@ async function refineDropAfterSnap(
 
     // A newer edit landed while this was in flight. Applying the offset now
     // would drag geometry the reviewer has since moved again, by an amount
-    // derived from where it used to be — so the refinement is dropped and the
+    // derived from where it used to be â€” so the refinement is dropped and the
     // route stays exactly where they last put it. Checked again after the lay,
     // which awaits its own lookups and can be outlasted the same way.
     if (geometryRevision !== revision || !found) {
@@ -1450,7 +1451,7 @@ async function refineDropAfterSnap(
     // than a preference.
     //
     // One vertex: the drag moved a point, and what the reviewer wants is for the
-    // route to stop kinking around it. That is the propagation's job — the
+    // route to stop kinking around it. That is the propagation's job â€” the
     // neighbours get pulled onto the street and the dragged vertex keeps the
     // position it was dropped at.
     //
@@ -1464,7 +1465,7 @@ async function refineDropAfterSnap(
     // "snap the nearby points to this street" and a lay is that decision taken for
     // a whole selection instead of for four neighbours. A reviewer who turned it
     // off and then drags a stretch gets a rigid offset and nothing else, which is
-    // exactly what they asked for — and without the gate they would get thirty
+    // exactly what they asked for â€” and without the gate they would get thirty
     // vertices moved onto a street they had opted out of.
     if (active.length > 1 && propagationEnabled.value) {
         await laySelection(
@@ -1488,8 +1489,8 @@ async function refineDropAfterSnap(
     // centreline at its own distance rather than moving them all by one amount.
     //
     // The order matters and is not interchangeable. A walked vertex can also be
-    // in the dragged selection — grab the middle of a stretch and the walk
-    // reaches the ones either side of it — so the two sets overlap. The absolute
+    // in the dragged selection â€” grab the middle of a stretch and the walk
+    // reaches the ones either side of it â€” so the two sets overlap. The absolute
     // set has to come second, since it is the one that wins: the geometry below
     // is the snap with the walk applied on top of it, and the markers have to end
     // up matching that rather than the other way round.
@@ -1515,7 +1516,7 @@ async function refineDropAfterSnap(
  * is the walk's only network call, and the walk is a pure function: it is handed a
  * callback and a test hands it a fake. This is the only place in the editor where
  * two road lookups are chained, and the revision guard around it is the same one a
- * single drop has — a second drag while the lay is in flight makes the answer
+ * single drop has â€” a second drag while the lay is in flight makes the answer
  * describe geometry the reviewer has since moved, and applying it would move the
  * stretch to a place nobody dropped it.
  *
@@ -1574,7 +1575,7 @@ async function laySelection(
     // `laid` rather than a count, because what the parent needs to know is which
     // kind of move this was and not how big it was. Every vertex a lay places was
     // one the reviewer dragged, so counting them as "propagated" would describe a
-    // set of vertices the reviewer never touched — and it is dropping one that
+    // set of vertices the reviewer never touched â€” and it is dropping one that
     // makes this a second move at all, which is what the history rule turns on.
     emit(
         'update:geoJson',
@@ -1602,7 +1603,7 @@ async function laySelection(
  *
  * Returns the positions as well as the references because the map has to move
  * the markers itself. Leaving that to a re-render would work, and would also
- * clear the selection — the same thing it already does after a plain snap, but
+ * clear the selection â€” the same thing it already does after a plain snap, but
  * with three more vertices moved it stops looking like a rounding error.
  */
 function spreadAlongStreet(
@@ -1681,7 +1682,7 @@ function updatePolylinePath(): void {
  *
  * Not undoable in a special way. It is an explicit button rather than a
  * refinement of something the reviewer just did, so it is written like any other
- * map edit and the parent's history records it as one step — which is the whole
+ * map edit and the parent's history records it as one step â€” which is the whole
  * safety net, and the reason there is no preview: a hundred vertices moving is
  * large, and one Ctrl+Z is a smaller thing to reason about than a ghost on the
  * map that has to be confirmed.
@@ -1811,7 +1812,7 @@ const guidedOffer = ref<GuidedOffer | null>(null);
 /**
  * Which end a plain away-from-the-route click extends.
  *
- * The tail is the default — routes are drawn in their travel order — and the
+ * The tail is the default â€” routes are drawn in their travel order â€” and the
  * toggle flips the frontier so the same gesture can build the route the
  * other way around. Retained only for the visit; the extended route itself
  * does not care which end built it.
@@ -1834,7 +1835,7 @@ const guideGesture = ref<GuideGesture>('trace');
  * until the reviewer accepts the rebuild, so Escape can discard them and a
  * guided mode opened and closed leaves the saved line's recipe untouched.
  * Re-derived from the clicks whenever one is added, because the route itself
- * can move under a batch — an undo between two clicks must not leave an anchor
+ * can move under a batch â€” an undo between two clicks must not leave an anchor
  * ordered by a geometry that no longer exists.
  */
 const pendingAnchors = ref<RegionAnchor[]>([]);
@@ -1842,7 +1843,7 @@ const pendingAnchors = ref<RegionAnchor[]>([]);
 /**
  * The batch's own undo stack, over the anchor clicks.
  *
- * The anchors are map-local by design — they are not in the recipe until the
+ * The anchors are map-local by design â€” they are not in the recipe until the
  * rebuild is accepted, so Escape can drop them and a guided mode opened and
  * closed leaves the saved line untouched. That is also why they need a stack of
  * their own: without one, Ctrl+Z while a batch was half placed fell through to
@@ -1880,7 +1881,7 @@ function anchorIcon(order: number): L.DivIcon {
  * batch: the router snaps an anchor to the road it finds, so an anchor aimed at
  * a side street can come back sitting on a different one, and the dashed stretch
  * is then not the one that was asked for. Offering "Accept or Reject" alone
- * meant the correction cost the whole batch — four anchors to re-place because
+ * meant the correction cost the whole batch â€” four anchors to re-place because
  * one snapped badly. Dragging the one that is wrong re-traces the batch in
  * place, and the proposal is still one judgement of Accept or Reject.
  */
@@ -1918,8 +1919,8 @@ function renderPendingAnchors(): void {
 /**
  * One anchor moved; the batch is re-traced in place.
  *
- * The same shape as a control's drag — the marker follows the cursor and
- * nothing is emitted until the mouse is up — because the recalculation is a
+ * The same shape as a control's drag â€” the marker follows the cursor and
+ * nothing is emitted until the mouse is up â€” because the recalculation is a
  * router search per leg and a change of mind mid-drag must not leave half of
  * them behind. The drop hands the new click back to the same code that placed
  * it, so the anchor is re-ordered, re-snapped and the preview replaced by one
@@ -2005,8 +2006,8 @@ function beginAnchorDrag(
 /**
  * The batch as the route orders it.
  *
- * Every path that changes the clicks goes through here — a new anchor, an anchor
- * dragged somewhere else, one taken away — so there is one implementation of
+ * Every path that changes the clicks goes through here â€” a new anchor, an anchor
+ * dragged somewhere else, one taken away â€” so there is one implementation of
  * "where does this anchor belong" and no second way to place one that could
  * disagree with the first. False means the route is not there to order them
  * against.
@@ -2063,7 +2064,7 @@ function recordPendingClicks(before: Position[]): void {
  * The pending offer goes with it: it is derived from the anchors, and a dashed
  * proposal over anchors that no longer exist is worse than no proposal. The
  * trace is NOT re-run, because that is a router search per leg and an undo is
- * not a request to re-trace — the reviewer presses Preview when they want the
+ * not a request to re-trace â€” the reviewer presses Preview when they want the
  * route back.
  */
 function undoPendingAnchors(): boolean {
@@ -2270,7 +2271,7 @@ function reorderPendingAnchors(): void {
  * The legs are chained on the router's own snap rather than on the raw clicks:
  * the second leg starts where the first ended, so two answers cannot disagree
  * about which carriageway of a divided road an anchor belongs to and no kink
- * appears at the join. A leg that comes back refused ends the batch — accepting
+ * appears at the join. A leg that comes back refused ends the batch â€” accepting
  * the legs that worked would leave the stretch the reviewer came to fix in
  * place, looking as though it had been fixed.
  */
@@ -2390,7 +2391,7 @@ async function previewRectify(): Promise<void> {
 /**
  * The control point selected by clicking its marker, if any.
  *
- * Selection is what makes an interior control removable (§4.5): the row
+ * Selection is what makes an interior control removable (Â§4.5): the row
  * gains a "Remove control" while a selection lives, and the preview of the
  * joined tramo is what the reviewer confirms.
  */
@@ -2452,7 +2453,7 @@ function lastGuidedPosition(waypoints: Waypoint[]): Position | null {
     return last ? [last.position[0], last.position[1]] : null;
 }
 
-/** The first control's position — the end a head extension grows from. */
+/** The first control's position â€” the end a head extension grows from. */
 function firstGuidedPosition(waypoints: Waypoint[]): Position | null {
     const first = waypoints[0];
 
@@ -2460,107 +2461,13 @@ function firstGuidedPosition(waypoints: Waypoint[]): Position | null {
 }
 
 /**
- * The insertion this click offers, when it lands on a span the recipe owns.
- *
- * The recipe's spans are delimited by its waypoints' vertices — re-derived,
- * never stored — and a click lands within one of them when the closest
- * segment of the route sits between two consecutive bounds. Outside the
- * bounds (behind the start, past the end) there is no tramo to split, and
- * extension is the honest answer.
- */
-function insertionTarget(
-    clicked: Position,
-): { from: VertexAddress; to: VertexAddress; insertIndex: number } | null {
-    const coordinates = props.geoJson?.coordinates;
-
-    if (!coordinates?.length) {
-        return null;
-    }
-
-    const waypoints = props.guidedWaypoints ?? [];
-    const waypointsCount = waypoints.length;
-
-    if (waypointsCount < 2) {
-        return null;
-    }
-
-    // The bounds, in vertex-index order. A detached bound (no vertex within
-    // tolerance) cannot delimit anything — the route stopped agreeing with
-    // that end, which is the detached warning's business, not a split's.
-    const bounds: (VertexAddress | null)[] = waypoints.map((waypoint) =>
-        findVertexForWaypoint(coordinates, waypoint),
-    );
-
-    if (bounds.some((bound) => bound === null)) {
-        return null;
-    }
-
-    const ordered = bounds.map((bound, index) => ({
-        waypointIndex: index,
-        address: bound as VertexAddress,
-    }));
-
-    // Climb: the clicked vertex must sit inside exactly one consecutive pair.
-    const hit = findClosestSegment(clicked, coordinates);
-
-    if (hit === null || hit.segIdx !== 0) {
-        return null;
-    }
-
-    const a = coordinates[0][hit.pointIdx];
-    const b = coordinates[0][hit.pointIdx + 1];
-
-    if (!a || !b) {
-        return null;
-    }
-
-    const projection = projectOnSegment(clicked, a as Position, b as Position);
-
-    if (distanceMeters(clicked, projection.point) > DETACHED_TOLERANCE_METERS) {
-        return null;
-    }
-
-    // The span whose first bound's vertex index is <= the clicked segment's
-    // start and whose second bound follows it. Ties (a bound exactly on the
-    // clicked segment's start) belong to the span BEFORE it — insertion on a
-    // boundary vertex makes no sense anyway, since that is where splits
-    // already exist.
-    let anchor = -1;
-
-    for (let i = 0; i < ordered.length - 1; i += 1) {
-        const from = ordered[i].address;
-        const to = ordered[i + 1].address;
-
-        if (from.segment !== 0) {
-            continue;
-        }
-
-        if (from.index <= hit.pointIdx && to.index >= hit.pointIdx + 1) {
-            anchor = i;
-
-            break;
-        }
-    }
-
-    if (anchor === -1) {
-        return null;
-    }
-
-    return {
-        from: ordered[anchor].address,
-        to: ordered[anchor + 1].address,
-        insertIndex: ordered[anchor + 1].waypointIndex,
-    };
-}
-
-/**
  * A click in guided mode: place a control point, then route to it.
  *
  * Three questions answer in order. Nothing behind the click starts the list.
  * A hand-drawing session places the vertex straight out. And a click that
- * lands on a span the recipe owns is an insertion — split that span — while
- * everything else extends the route from the active frontier. Spec §2: the
- * system proposes, the user decides; §4: the existing recipe is editable at
+ * lands on a span the recipe owns is an insertion â€” split that span â€” while
+ * everything else extends the route from the active frontier. Spec Â§2: the
+ * system proposes, the user decides; Â§4: the existing recipe is editable at
  * its own points.
  *
  * The revision guard is the same one a drop's refinement uses: a click
@@ -2605,7 +2512,11 @@ async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
     }
 
     if (guideFrontier.value === 'tail') {
-        const target = insertionTarget(clicked);
+        const target = insertionTarget(
+            props.geoJson?.coordinates ?? [],
+            props.guidedWaypoints ?? [],
+            clicked,
+        );
 
         if (target !== null) {
             await offerInsertion(clicked, waypoints, target);
@@ -2622,7 +2533,7 @@ async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
  *
  * The first tramo runs from the span's start bound to the click, leaving
  * with the heading the route arrives at that bound with; the second runs
- * from the click to the end bound with the FIRST answer's arrival heading —
+ * from the click to the end bound with the FIRST answer's arrival heading â€”
  * chained, so a detour's second half leaves pointing where the detour
  * came back from. Both or neither: an offer that splits a span but cannot
  * join the other side would leave the recipe describing a route it does
@@ -2721,7 +2632,7 @@ async function offerExtension(
 
     // The tail extends with the heading the route arrives with; the head
     // extends from empty air, and the nearest thing to an intent the click
-    // carries is the straight line it aims at the route with — which is also
+    // carries is the straight line it aims at the route with â€” which is also
     // the approach the snap should be looking for, now that the head's origin
     // IS the click.
     const bearing = atHead
@@ -2881,7 +2792,7 @@ function acceptPreview(): void {
                 return;
             }
 
-            // Spec §4.5's confirmation is this acceptance: the joined tramo
+            // Spec Â§4.5's confirmation is this acceptance: the joined tramo
             // was shown dashed and the reviewer pressed Accept on it.
             emitGuided(
                 replaceTramoSpan(
@@ -2994,7 +2905,7 @@ function setGuideGesture(gesture: GuideGesture): void {
  * The two gestures, as the row offers them.
  *
  * Declared here rather than written out twice so the buttons, their order and
- * the state they set cannot drift apart — and rendered through `component :is`,
+ * the state they set cannot drift apart â€” and rendered through `component :is`,
  * because the icon is the only thing that differs and two fixed buttons are one
  * thing to remember.
  */
@@ -3019,9 +2930,13 @@ const removeControlBlock = computed(() =>
  * Whether removing the selected control can re-route the tramo it joined.
  *
  * The label follows this, because "Remove control" followed by no preview at
- * all reads as the editor losing the offer — and the reviewer has no way to
+ * all reads as the editor losing the offer â€” and the reviewer has no way to
  * tell that apart from a button that is broken. Saying "Remove only" states the
  * outcome before the press, which is the only moment at which it is useful.
+ *
+ * The rule is removalJoin()'s, not this computed's: the press answers the same
+ * question from the same function, and a label computed any other way is a
+ * promise waiting to be broken.
  */
 const removeReroutes = computed(() => {
     const index = selectedWaypoint.value;
@@ -3030,22 +2945,12 @@ const removeReroutes = computed(() => {
         return false;
     }
 
-    const waypoints = waypointsForGuide.value;
-    const coordinates = props.geoJson?.coordinates ?? [];
-    const from = waypoints[index - 1];
-    const to = waypoints[index + 1];
-
-    if (from === undefined || to === undefined) {
-        return false;
-    }
-
-    const fromVertex = findVertexForWaypoint(coordinates, from);
-    const toVertex = findVertexForWaypoint(coordinates, to);
-
     return (
-        fromVertex !== null &&
-        toVertex !== null &&
-        toVertex.index > fromVertex.index
+        removalJoin(
+            props.geoJson?.coordinates ?? [],
+            waypointsForGuide.value,
+            index,
+        ) !== null
     );
 });
 
@@ -3104,7 +3009,7 @@ const waypointsForGuide = computed<Waypoint[]>(
 );
 
 /**
- * How many accepted controls no longer sit on their route, for the §3 pill.
+ * How many accepted controls no longer sit on their route, for the Â§3 pill.
  *
  * Computed rather than announced-once because the state it describes is
  * derived: it changes under hand edits of the geometry and returns when the
@@ -3119,18 +3024,18 @@ const detachedCount = computed(
         ).length,
 );
 
-/** The §3 sentence for the detached count, or '' when there is nothing to say. */
+/** The Â§3 sentence for the detached count, or '' when there is nothing to say. */
 const detachedText = computed(() => describeDetached(detachedCount.value));
 
 // ---------------------------------------------------------------------------
-// Spec §4.3: moving a control recalculates its two adjacent tramos.
+// Spec Â§4.3: moving a control recalculates its two adjacent tramos.
 // ---------------------------------------------------------------------------
 
 /**
  * Where a control meets the route, and the geometry that meeting needs.
  *
  * Its own vertex when it still has one, and the point it PROJECTS onto when it
- * has drifted off — which is the whole answer to a control that cannot be
+ * has drifted off â€” which is the whole answer to a control that cannot be
  * moved. The drag used to look for the vertex alone, so a control thirty metres
  * off its route had no span to replace, the drag refused, and the row's tooltip
  * was telling the reviewer to drag it. A route where the geometry was hand
@@ -3174,15 +3079,15 @@ function waypointBound(
 /**
  * A dropped control, recalculated.
  *
- * The two adjacent tramos are the only ones allowed to change (spec §4.3),
+ * The two adjacent tramos are the only ones allowed to change (spec Â§4.3),
  * and they are recalculated CHAINED on purpose: the arriving tramo runs to
  * where the control was dropped and the waypoint takes that answer's on-road
- * end, then the departing tramo leaves from THAT position — so both halves
+ * end, then the departing tramo leaves from THAT position â€” so both halves
  * agree on where the control is, instead of two searches snapping it to two
  * different nodes and the route splitting at its own control.
  *
- * Either side may refuse (§3): it keeps its old geometry and the warning is
- * the honest outcome — the state emitted is whatever actually happened,
+ * Either side may refuse (Â§3): it keeps its old geometry and the warning is
+ * the honest outcome â€” the state emitted is whatever actually happened,
  * partial included, because undo restores it all the same.
  */
 async function recalculateMovedWaypoint(
@@ -3328,7 +3233,7 @@ async function recalculateMovedWaypoint(
                 // Re-derived on the CUT geometry, not on the one it was looked
                 // up against: a projection may have written a vertex, and the
                 // far bound read before that write points one vertex too far
-                // along — which replaces somebody else's span and leaves this
+                // along â€” which replaces somebody else's span and leaves this
                 // one untouched, with nothing on screen saying so.
                 const nextVertex = findVertexForWaypoint(
                     originBound.coordinates,
@@ -3388,7 +3293,7 @@ async function recalculateMovedWaypoint(
 }
 
 // ---------------------------------------------------------------------------
-// Spec §4.5: removing an interior control, offered and confirmed.
+// Spec Â§4.5: removing an interior control, offered and confirmed.
 // ---------------------------------------------------------------------------
 
 /** The removal offer: the joined tramo, dashed, awaiting the confirm. */
@@ -3401,32 +3306,17 @@ function startRemovePreview(): void {
 
     const waypoints = waypointsForGuide.value;
     const coordinates = props.geoJson?.coordinates ?? [];
-    const from = waypoints[index - 1];
-    const to = waypoints[index + 1];
+    const join = removalJoin(coordinates, waypoints, index);
 
-    if (from === undefined || to === undefined) {
-        // Unreachable through the row, which disables this for a route's two
-        // ends, and kept only so a stale selection cannot fall through.
-        announceGuided(
-            'A route’s start and end are what the route is. Drag one instead.',
-        );
-
-        return;
-    }
-
-    const fromVertex = findVertexForWaypoint(coordinates, from);
-    const toVertex = findVertexForWaypoint(coordinates, to);
-
-    if (
-        fromVertex === null ||
-        toVertex === null ||
-        toVertex.index <= fromVertex.index
-    ) {
+    if (join === null) {
         // Re-routing the joined tramo is the rich half of this removal, and it
         // needs both neighbours on the route to delimit a span. That is not a
         // reason to refuse the whole edit: a control whose neighbours have
         // drifted off is precisely the control a reviewer wants gone, so it goes
         // and says what it did NOT do.
+        //
+        // The label and this branch ask removalJoin() the same question, so the
+        // button that said "Remove only" cannot arrive here promising a preview.
         const without = removeWaypoint(waypoints, index);
 
         if (without === null) {
@@ -3443,7 +3333,10 @@ function startRemovePreview(): void {
         return;
     }
 
-    void offerRemoval(index, from, to, fromVertex, toVertex);
+    const from = waypoints[index - 1] as Waypoint;
+    const to = waypoints[index + 1] as Waypoint;
+
+    void offerRemoval(index, from, to, join.from, join.to);
 }
 
 async function offerRemoval(
@@ -3551,7 +3444,7 @@ const resampleHint = computed(() =>
  * The interval a re-space will use, with the default applied in one place.
  *
  * The picker next to the button and the press of the button have to agree, and
- * they read from this rather than each carrying their own fallback — two
+ * they read from this rather than each carrying their own fallback â€” two
  * defaults that drift apart produce a control showing 200 m and a re-space at
  * the prop it was not given.
  */
@@ -3564,8 +3457,8 @@ const resampleInterval = computed<ResampleSpacing>(
 /**
  * Why the re-lay is unavailable, or what it will do.
  *
- * The re-lay has no segment rule of its own — a selection of two vertices on
- * different segments is still two vertices it can look up streets for — so the
+ * The re-lay has no segment rule of its own â€” a selection of two vertices on
+ * different segments is still two vertices it can look up streets for â€” so the
  * only thing standing in the way is not having two yet.
  */
 const relayHint = computed(() =>
@@ -3715,7 +3608,7 @@ function clearLayers(): void {
  *
  * Ctrl/Cmd+Z is claimed here for the same reason it is claimed by the page for
  * the line: while a batch is half placed, undo means taking the batch back.
- * Letting it through would undo the last edit the reviewer ACCEPTED — the worst
+ * Letting it through would undo the last edit the reviewer ACCEPTED â€” the worst
  * possible answer to "take that point back". `stopImmediatePropagation` because
  * the page's own handler is on the same node, and it stands down anyway on the
  * `defaultPrevented` it leaves behind: whichever of the two runs first wins, so
@@ -3775,7 +3668,7 @@ onMounted(() => {
 // A selection addresses vertices by index, so it only means something against
 // the geometry it was picked from. New geometry means a new route to select on.
 // A preview offered against geometry that has since changed is stale by the
-// same token — dismissed, not applied.
+// same token â€” dismissed, not applied.
 watch(() => props.geoJson, renderMap, { deep: true });
 watch(() => props.geoJson, clearSelection, { deep: true });
 watch(() => props.geoJson, dismissPendingPreview, { deep: true });
@@ -3794,7 +3687,7 @@ watch(
         // Guided mode owns a state the other modes do not: entering it
         // starts a fresh proposal session (nothing pending, hand drawing
         // off), leaving it takes both down. The control list itself is the
-        // parent's — it survives the mode switch and the undo stack with it.
+        // parent's â€” it survives the mode switch and the undo stack with it.
         if (newMode === 'guide') {
             cancelPendingPreview();
             announceGuided('Click to place the first control point.');
@@ -3910,7 +3803,7 @@ onUnmounted(() => {
             only what happened lives below. It used to be the other way round: the
             modes and the settings sat above, the three action buttons sat below,
             and every instruction was on the far side of the map from the control
-            it explained — so reaching Re-lay meant scrolling past four hundred
+            it explained â€” so reaching Re-lay meant scrolling past four hundred
             pixels of tile to get to it, and the sentence about Shift-click was a
             screen away from the mode picker that decides it.
 
@@ -3993,7 +3886,7 @@ onUnmounted(() => {
                     for a readout that is not there.
 
                     It is zero-height and carries no text, so it cannot make
-                    this row change size — it exists only to hold the action
+                    this row change size â€” it exists only to hold the action
                     buttons against the right edge, which is what the readout's
                     `flex-1` used to do before the count moved over the map.
                 -->
@@ -4006,7 +3899,7 @@ onUnmounted(() => {
                             the button, which is the whole reason these tooltips
                             can do their job. A disabled button fires no pointer
                             events, so a title or a trigger placed on it stays
-                            silent — and the disabled state is exactly when the
+                            silent â€” and the disabled state is exactly when the
                             explanation is wanted, because it is the reason the
                             button cannot be pressed.
                         -->
@@ -4192,8 +4085,8 @@ onUnmounted(() => {
                                                 The trigger wraps the button rather
                                                 than being the button: a disabled
                                                 one fires no pointer events, so the
-                                                explanation — which is wanted most
-                                                exactly when it is disabled — would
+                                                explanation â€” which is wanted most
+                                                exactly when it is disabled â€” would
                                                 never show.
                                             -->
                                             <span class="inline-flex">
@@ -4229,7 +4122,7 @@ onUnmounted(() => {
                         <div class="flex-1" />
 
                         <!--
-                            The removal, always on screen and never hidden — a
+                            The removal, always on screen and never hidden â€” a
                             button that is not there is a button nobody learns
                             exists, and the tooltip that explains a disabled state
                             is only useful to someone who can already see it.
@@ -4311,7 +4204,7 @@ onUnmounted(() => {
                         one thing colour alone cannot carry. Destructive stands
                         apart from safe by shade; what keeps a re-space from
                         becoming a mass delete is the distance between the two
-                        buttons when both are live. Never hidden — a button that
+                        buttons when both are live. Never hidden â€” a button that
                         is not on screen is a button nobody learns exists, and the
                         tooltip that explains a disabled state is only useful to
                         someone who can already see it.
@@ -4388,7 +4281,7 @@ onUnmounted(() => {
                 in two places: the count sat in the toolbar, the messages sat
                 below the map. Both were wrong, for the same underlying reason.
                 The map is up to seven hundred pixels tall, so a paragraph under
-                it is a long way from the click that caused it — and the
+                it is a long way from the click that caused it â€” and the
                 messages were worse than far, because they also pushed the
                 endpoint legend under the map down and pulled it back on every
                 snap, the same lurch this overlay exists to end.
@@ -4396,7 +4289,7 @@ onUnmounted(() => {
                 One column in the top right, because these co-occur: you select,
                 you drag, it snaps, and the count is what tells you the next
                 press will act on the set you can see highlighted. Top right
-                rather than top left is Leaflet's doing — the zoom control is
+                rather than top left is Leaflet's doing â€” the zoom control is
                 enabled and sits there by default. This map has the attribution
                 control off and no layer control, which leaves this corner free.
 
@@ -4408,7 +4301,7 @@ onUnmounted(() => {
                 `role="status"` on the wrapper rather than `aria-live` on each
                 child, for the same reason it is one region and not four. These
                 appear in response to something done elsewhere on the screen, so
-                without a live region a screen reader announces nothing at all —
+                without a live region a screen reader announces nothing at all â€”
                 and four independent regions announce over each other when two
                 messages land together.
 
@@ -4425,8 +4318,8 @@ onUnmounted(() => {
 
                 The width cap is doing two jobs. `85%` keeps a long message
                 inside a narrow map and lets it wrap; the `sm:` ceiling stops a
-                re-lay report — which covers a hundred vertices across several
-                streets — from running the full width of a wide screen.
+                re-lay report â€” which covers a hundred vertices across several
+                streets â€” from running the full width of a wide screen.
             -->
             <div
                 v-if="editable"
@@ -4524,7 +4417,7 @@ onUnmounted(() => {
 
    Not cosmetic: a visible horizontal scrollbar is about fifteen pixels tall and
    this row sits directly above a map of fixed height, so letting it appear is
-   the same lurch the nowrap was there to end — it just happens on the window's
+   the same lurch the nowrap was there to end â€” it just happens on the window's
    first resize instead of on every click. The row can still be scrolled by
    trackpad or keyboard, which is what a mouse-only reviewer would not have.
 */

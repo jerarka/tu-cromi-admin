@@ -171,8 +171,8 @@ class RoadsSelfTest extends Command
     {
         $anchor = $this->isolatedAnchor();
 
-        $east = fn (float $metres): float => $metres / ($this->metresPerDegreeLon($anchor['lat']));
-        $north = fn (float $metres): float => $metres / 110574.0;
+        $east = fn (float $metres): float => $metres / (GreatCircle::metresPerDegreeLongitude($anchor['lat']));
+        $north = fn (float $metres): float => $metres / GreatCircle::METRES_PER_DEGREE_LATITUDE;
 
         $lng = fn (float $metres): string => $this->coord($anchor['lng'] + $east($metres));
         $lat = fn (float $metres): string => $this->coord($anchor['lat'] + $north($metres));
@@ -257,11 +257,6 @@ class RoadsSelfTest extends Command
         }
 
         return $best;
-    }
-
-    private function metresPerDegreeLon(float $lat): float
-    {
-        return 111320 * cos(deg2rad($lat));
     }
 
     private function coord(float $value): string
@@ -552,7 +547,7 @@ class RoadsSelfTest extends Command
     private function westEnd(array $geometry): float
     {
         return (float) number_format(
-            $geometry['anchor']['lng'] - 400.0 / $this->metresPerDegreeLon($geometry['anchor']['lat']),
+            $geometry['anchor']['lng'] - 400.0 / GreatCircle::metresPerDegreeLongitude($geometry['anchor']['lat']),
             8,
             '.',
             '',
@@ -955,8 +950,8 @@ class RoadsSelfTest extends Command
         $anchor = $geometry['anchor'];
 
         $position = fn (float $east, float $north): array => [
-            'lat' => (float) $this->coord($anchor['lat'] - 1_600.0 / 110574.0 + $north / 110574.0),
-            'lng' => (float) $this->coord($anchor['lng'] + $east / $this->metresPerDegreeLon($anchor['lat'])),
+            'lat' => (float) $this->coord($anchor['lat'] - 1_600.0 / GreatCircle::METRES_PER_DEGREE_LATITUDE + $north / GreatCircle::METRES_PER_DEGREE_LATITUDE),
+            'lng' => (float) $this->coord($anchor['lng'] + $east / GreatCircle::metresPerDegreeLongitude($anchor['lat'])),
         ];
 
         $positions = [
@@ -1194,11 +1189,11 @@ class RoadsSelfTest extends Command
      */
     private function offset(array $geometry, float $east, float $north): array
     {
-        $lat = $geometry['anchor']['lat'] + $north / 110574.0;
+        $lat = $geometry['anchor']['lat'] + $north / GreatCircle::METRES_PER_DEGREE_LATITUDE;
 
         return [
             'lat' => $lat,
-            'lng' => $geometry['anchor']['lng'] + $east / $this->metresPerDegreeLon($lat),
+            'lng' => $geometry['anchor']['lng'] + $east / GreatCircle::metresPerDegreeLongitude($lat),
         ];
     }
 

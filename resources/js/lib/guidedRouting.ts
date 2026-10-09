@@ -185,26 +185,6 @@ export function headingBetween(from: Position, to: Position): number | null {
     return ((degrees % 360) + 360) % 360;
 }
 
-/**
- * A vertex appended at the tail by hand — the guided mode's manual fallback.
- *
- * The mirror of spliceTramo for a tramo the router never proposed: the click
- * itself is the vertex, and the route keeps being one continuous member.
- * Where the route is fresh, this is also how its first vertex arrives.
- */
-export function appendVertexToTail(
-    coordinates: number[][][],
-    position: Position,
-): number[][][] {
-    const next = (coordinates.length > 0 ? coordinates : [[]]).map(
-        (segment) => [...segment],
-    );
-
-    next[0] = [...next[0], position];
-
-    return next;
-}
-
 /** Whose route end an extension grows at, said in one place. */
 export type GuideEnd = 'tail' | 'head';
 
@@ -441,16 +421,6 @@ export interface VertexAddress {
     distance: number;
 }
 
-/** Metres between two positions, the editor's own metric. */
-function waypointDistance(a: Position, b: Position): number {
-    // The latitude-scaled frame routeEditing walks in, reduced to the one
-    // operation a nearest-vertex test needs. Exact enough at these scales:
-    // the tolerance is 25 m and the ways' own vertices sit metres apart.
-    const scale = Math.cos((a[1] * Math.PI) / 180);
-
-    return Math.hypot((b[0] - a[0]) * scale, b[1] - a[1]) * 111320;
-}
-
 /**
  * The heading a route arrives at one of its vertices with.
  *
@@ -539,7 +509,7 @@ export function findVertexForWaypoint(
 
     coordinates.forEach((segment, segIdx) => {
         segment.forEach((position, index) => {
-            const distance = waypointDistance(waypoint.position, [
+            const distance = distanceMeters(waypoint.position, [
                 position[0],
                 position[1],
             ]);
@@ -696,6 +666,145 @@ export function removeWaypoint(
         position: waypoint.position,
         role: waypointRoleAt(next, i),
     }));
+}
+
+/**
+ * The two addresses a removal would join across, or null when it cannot.
+ *
+ * One function because the question gets asked twice — once to decide what the
+ * button PROMISES and once to decide what it DOES — and two answers to one
+ * question is how a label ends up announcing a preview that never arrives. That
+ * is the same defect as the mislabelled frontier button and the undo tooltip,
+ * and the fix in each case was the same: one owner for the rule.
+ *
+ * Both neighbours have to be ON the route. A control whose neighbours have
+ * drifted off cannot delimit a span between them, which is why null means "take
+ * the control away without re-routing" rather than "refuse" — see
+ * describeRemoveWithoutReroute().
+ */
+export function removalJoin(
+    coordinates: Coordinates,
+    waypoints: Waypoint[],
+    index: number,
+): { from: VertexAddress; to: VertexAddress } | null {
+    const from = waypoints[index - 1];
+    const to = waypoints[index + 1];
+
+    if (from === undefined || to === undefined) {
+        return null;
+    }
+
+    const fromVertex = findVertexForWaypoint(coordinates, from);
+    const toVertex = findVertexForWaypoint(coordinates, to);
+
+    if (
+        fromVertex === null ||
+        toVertex === null ||
+        fromVertex.segment !== 0 ||
+        toVertex.segment !== 0 ||
+        toVertex.index <= fromVertex.index
+    ) {
+        return null;
+    }
+
+    return { from: fromVertex, to: toVertex };
+}
+
+/**
+ * Where an insertion would land, when the click offers one.
+ *
+ * The recipe's spans are delimited by its waypoints' vertices — re-derived,
+ * never stored — and a click lands within one of them when the closest segment
+ * of the route sits between two consecutive bounds. Outside the bounds (behind
+ * the start, past the end) there is no tramo to split, and extension is the
+ * honest answer.
+ *
+ * Lives here rather than in the map because it is the decision behind the
+ * primary gesture of the mode and it is pure: the only thing it needs is the
+ * route, the recipe and where the click landed. In the component it was a
+ * hundred lines that no test could reach.
+ */
+export function insertionTarget(
+    coordinates: Coordinates,
+    waypoints: Waypoint[],
+    clicked: Position,
+): InsertionTarget | null {
+    if (!coordinates.length) {
+        return null;
+    }
+
+    if (waypoints.length < 2) {
+        return null;
+    }
+
+    // The bounds, in vertex-index order. A detached bound (no vertex within
+    // tolerance) cannot delimit anything — the route stopped agreeing with that
+    // end, which is the detached warning's business, not a split's.
+    const bounds: (VertexAddress | null)[] = waypoints.map((waypoint) =>
+        findVertexForWaypoint(coordinates, waypoint),
+    );
+
+    if (bounds.some((bound) => bound === null)) {
+        return null;
+    }
+
+    const ordered = bounds.map((bound, index) => ({
+        waypointIndex: index,
+        address: bound as VertexAddress,
+    }));
+
+    // Climb: the clicked vertex must sit inside exactly one consecutive pair.
+    const hit = findClosestSegment(clicked, coordinates);
+
+    if (hit === null || hit.segIdx !== 0) {
+        return null;
+    }
+
+    const a = coordinates[0][hit.pointIdx] as Position | undefined;
+    const b = coordinates[0][hit.pointIdx + 1] as Position | undefined;
+
+    if (!a || !b) {
+        return null;
+    }
+
+    const projection = projectOnSegment(clicked, a, b);
+
+    if (distanceMeters(clicked, projection.point) > DETACHED_TOLERANCE_METERS) {
+        return null;
+    }
+
+    // The span whose first bound's vertex index is <= the clicked segment's
+    // start and whose second bound follows it. Ties (a bound exactly on the
+    // clicked segment's start) belong to the span BEFORE it — insertion on a
+    // boundary vertex makes no sense anyway, since that is where splits already
+    // exist.
+    for (let i = 0; i < ordered.length - 1; i += 1) {
+        const from = ordered[i].address;
+        const to = ordered[i + 1].address;
+
+        if (from.segment !== 0) {
+            continue;
+        }
+
+        if (from.index <= hit.pointIdx && to.index >= hit.pointIdx + 1) {
+            return {
+                from,
+                to,
+                insertIndex: (ordered[i + 1] as { waypointIndex: number })
+                    .waypointIndex,
+            };
+        }
+    }
+
+    return null;
+}
+
+/** Where an insertion would land, with the span it would split. */
+export interface InsertionTarget {
+    from: VertexAddress;
+    to: VertexAddress;
+    /** The waypoint index the new control would take. */
+    insertIndex: number;
 }
 
 /**

@@ -235,4 +235,47 @@ class GreatCircleTest extends TestCase
             $this->assertSame(round($exact, 1), $walk);
         }
     }
+
+    /**
+     * The degree-to-metre vocabulary, one owner.
+     *
+     * These two numbers were literals in three files before this, and one of the
+     * copies of the longitude one had no clamp while another did. A test that
+     * pins the pole is therefore pinning the difference, not the arithmetic: at
+     * the latitude this project's data lives at, the clamp never fires and the
+     * value is the plain cosine.
+     */
+    public function test_the_degree_scales_are_the_one_place_that_knows_them(): void
+    {
+        $this->assertSame(110574.0, GreatCircle::METRES_PER_DEGREE_LATITUDE);
+
+        // Santa Cruz de la Sierra, where every route in the app lives: the
+        // longitude degree is about half the equator's, and the clamp is nowhere
+        // near firing.
+        $this->assertEqualsWithDelta(
+            111320.0 * cos(deg2rad(-63.18)),
+            GreatCircle::metresPerDegreeLongitude(-63.18),
+            0.001,
+        );
+
+        // At the equator there is no correction at all.
+        $this->assertEqualsWithDelta(
+            111320.0,
+            GreatCircle::metresPerDegreeLongitude(0.0),
+            0.001,
+        );
+    }
+
+    public function test_the_longitude_scale_never_reaches_zero(): void
+    {
+        // cos(90°) is zero, and a zero here is a division by zero somewhere
+        // downstream that nobody would trace back to here. The floor is 1% of
+        // the equatorial value.
+        $this->assertGreaterThan(0.0, GreatCircle::metresPerDegreeLongitude(90.0));
+        $this->assertEqualsWithDelta(
+            1113.2,
+            GreatCircle::metresPerDegreeLongitude(90.0),
+            0.001,
+        );
+    }
 }

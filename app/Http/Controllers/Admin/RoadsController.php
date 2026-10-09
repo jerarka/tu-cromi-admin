@@ -569,8 +569,8 @@ class RoadsController extends Controller
 
         $pad = max(300.0, $distance * 0.25);
         $midLat = ($origin['lat'] + $destination['lat']) / 2;
-        $latPad = $pad / 110574.0;
-        $lngPad = $pad / (111320.0 * max(cos(deg2rad($midLat)), 0.01));
+        $latPad = $pad / GreatCircle::METRES_PER_DEGREE_LATITUDE;
+        $lngPad = $pad / GreatCircle::metresPerDegreeLongitude($midLat);
 
         $west = min($origin['lng'], $destination['lng']) - $lngPad;
         $east = max($origin['lng'], $destination['lng']) + $lngPad;

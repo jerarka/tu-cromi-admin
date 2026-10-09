@@ -51,6 +51,16 @@ final class GreatCircle
     public const EARTH_RADIUS_M = 6371000.0;
 
     /**
+     * Metres in one degree of latitude.
+     *
+     * The constant the corridors, the self-test's fixtures and the router's snap
+     * all have to agree on. It lived as a literal in three files before this, and
+     * a copy that drifts by 0,1% moves a corridor edge by a tenth of a degree of
+     * nothing in particular: no error, a slightly different answer.
+     */
+    public const METRES_PER_DEGREE_LATITUDE = 110574.0;
+
+    /**
      * Decimal places a published walk distance carries.
      *
      * Ten centimetres is two orders of magnitude finer than the ~0,3 m bias
@@ -62,6 +72,20 @@ final class GreatCircle
      * they are added to.
      */
     private const WALK_DECIMALS = 1;
+
+    /**
+     * Metres in one degree of longitude at a given latitude.
+     *
+     * Falls with the cosine of the latitude, and clamped short of the pole where
+     * it would reach zero and take a division by it somewhere downstream. The
+     * floor is the one the routing corridor already applied and the self-test
+     * did not — which is exactly the kind of half-shared rule that ends up
+     * meaning two different things.
+     */
+    public static function metresPerDegreeLongitude(float $latitude): float
+    {
+        return 111320.0 * max(cos(deg2rad($latitude)), 0.01);
+    }
 
     /**
      * Cumulative distances for a GeoJSON MultiLineString, flattened.
