@@ -7,6 +7,7 @@ import {
     describeAnchorsNeeded,
     describeBlockedControls,
     describeDetached,
+    describeFailedSpan,
     describeRectifyRefusal,
     describeRemoveControlBlock,
     describeRemoveWithoutReroute,
@@ -787,27 +788,23 @@ describe('removalJoin', () => {
 
 describe('describeRemoveControlBlock', () => {
     test('nothing selected says how to select something', () => {
-        expect(describeRemoveControlBlock(null, 4)).toContain(
+        expect(describeRemoveControlBlock(null)).toContain(
             'Click a control on the map',
         );
     });
 
-    test('a route of one control is both ends, and says so', () => {
-        expect(describeRemoveControlBlock(0, 1)).toContain('not removable');
-    });
-
-    test('a route of two controls has no removable one either', () => {
-        expect(describeRemoveControlBlock(0, 2)).toContain('not removable');
-        expect(describeRemoveControlBlock(1, 2)).toContain('not removable');
-    });
-
-    test('the refusal names the correction', () => {
-        expect(describeRemoveControlBlock(0, 4)).toContain('Drag it instead');
+    test('an end is removable, because a route is its geometry and not its recipe', () => {
+        // Refuted by what the code actually reads: no role is read outside this
+        // editor, the bundle never carries waypoints, and `lines` has no start
+        // or end column. An end control holds a tramo, not the route.
+        // The total is gone from the signature with the rule: there is no count
+        // at which a selected control cannot be taken away.
+        expect(describeRemoveControlBlock(0)).toBe('');
     });
 
     test('an interior control is removable and gets no sentence', () => {
-        expect(describeRemoveControlBlock(1, 4)).toBe('');
-        expect(describeRemoveControlBlock(2, 4)).toBe('');
+        expect(describeRemoveControlBlock(1)).toBe('');
+        expect(describeRemoveControlBlock(2)).toBe('');
     });
 
     test('a removal with no re-route says what it did not do', () => {
@@ -1268,6 +1265,65 @@ describe('cutRouteAt', () => {
     });
 });
 
+describe('describeFailedSpan', () => {
+    test('the stretch names the two anchors that bound it', () => {
+        // Leg 0 is the stretch between anchors 1 and 2: the badges are numbered
+        // by route order and the legs follow, which is what lets a reviewer act
+        // on "between 2 and 3" without counting anything.
+        const failure = describeFailedSpan('no-path', 0);
+
+        expect(failure.message).toContain('anchor 1');
+        expect(failure.message).toContain('anchor 2');
+        expect(failure.anchors).toEqual([1, 2]);
+    });
+
+    test('a leg further along the batch names its own pair', () => {
+        expect(describeFailedSpan('no-path', 2).anchors).toEqual([3, 4]);
+    });
+
+    test('the advice is the anchors gesture one, not the trace gesture one', () => {
+        expect(describeFailedSpan('no-path', 0).message).toContain(
+            'Move one of them',
+        );
+        expect(describeFailedSpan('no-path', 0).message).not.toContain(
+            'Add a control point',
+        );
+    });
+
+    test('an anchor off the network is blamed alone', () => {
+        // Only the origin is at fault, and only moving it fixes it: the leg has
+        // to REACH that anchor, so another one in between still has to arrive at
+        // the same unreachable place.
+        const failure = describeFailedSpan('origin-too-far', 1);
+
+        expect(failure.message).toContain('Anchor 2 is too far');
+        expect(failure.anchors).toEqual([2]);
+    });
+
+    test('a destination off the network blames the far anchor', () => {
+        // Leg 1 runs from anchor 2 to anchor 3, so the far one is the 3.
+        const failure = describeFailedSpan('destination-too-far', 1);
+
+        expect(failure.message).toContain('Anchor 3 is too far');
+        expect(failure.anchors).toEqual([3]);
+    });
+
+    test('a stretch that is not the anchors fault paints nothing', () => {
+        // A lookup that did not answer says nothing about where the reviewer put
+        // anything, and painting two anchors for it would send them moving points
+        // that were fine.
+        for (const reason of ['graph-not-built', null, 'anything-else']) {
+            expect(describeFailedSpan(reason, 0).anchors).toEqual([]);
+        }
+    });
+
+    test('a missing graph is named as not their fault', () => {
+        expect(describeFailedSpan('graph-not-built', 0).message).toContain(
+            'can be fixed from here',
+        );
+    });
+});
+
 describe('removeWaypoint', () => {
     test('removing a via joins the list and re-derives roles', () => {
         const waypoints: Waypoint[] = [
@@ -1287,19 +1343,49 @@ describe('removeWaypoint', () => {
         expect(next?.length).toBe(3);
     });
 
-    test('the route ends and a two-waypoint route are not removable', () => {
+    test('an end goes, and the survivor takes the role it lost', () => {
         const pair: Waypoint[] = [
             { position: [1.0, 2.0], role: 'start' },
             { position: [1.0004, 2.0], role: 'end' },
         ];
+
+        // Dropping the start promotes the end, which is the only control left and
+        // so is both ends of what remains.
+        expect(removeWaypoint(pair, 0)?.map((w) => w.role)).toEqual(['start']);
+        expect(removeWaypoint(pair, 1)?.map((w) => w.role)).toEqual(['start']);
+
         const triple: Waypoint[] = [
-            ...pair,
+            { position: [1.0, 2.0], role: 'start' },
             { position: [1.0002, 2.0], role: 'via' },
+            { position: [1.0004, 2.0], role: 'end' },
         ];
 
-        expect(removeWaypoint(pair, 0)).toBeNull();
-        expect(removeWaypoint(pair, 1)).toBeNull();
-        expect(removeWaypoint(triple, 0)).toBeNull();
-        expect(removeWaypoint(triple, 2)).toBeNull();
+        // Dropping the start promotes the via, which is now the first control.
+        expect(removeWaypoint(triple, 0)?.map((w) => w.role)).toEqual([
+            'start',
+            'end',
+        ]);
+        // Dropping the end promotes the via, which is now the last one.
+        expect(removeWaypoint(triple, 2)?.map((w) => w.role)).toEqual([
+            'start',
+            'end',
+        ]);
+    });
+
+    test('the last control leaves an empty recipe rather than a refusal', () => {
+        const single: Waypoint[] = [{ position: [1.0, 2.0], role: 'start' }];
+
+        expect(removeWaypoint(single, 0)).toEqual([]);
+    });
+
+    test('only an index naming no control is refused', () => {
+        const pair: Waypoint[] = [
+            { position: [1.0, 2.0], role: 'start' },
+            { position: [1.0004, 2.0], role: 'end' },
+        ];
+
+        expect(removeWaypoint(pair, -1)).toBeNull();
+        expect(removeWaypoint(pair, 2)).toBeNull();
+        expect(removeWaypoint([], 0)).toBeNull();
     });
 });

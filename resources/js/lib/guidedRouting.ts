@@ -648,15 +648,21 @@ export function insertWaypointAt(
 /**
  * A control point removed, roles re-derived.
  *
- * Only an interior waypoint may go: removing a route's start or end changes
- * what the route is rather than how it was traced, and that is the reviewer's
- * move, not this helper's. Null says so.
+ * Any control may go, including an end and including the last one standing. The
+ * refusal that used to sit here said an end "is what the route is rather than how
+ * it was traced" — but the route is its geometry, and this returns a list that
+ * leaves the geometry untouched. What an end control holds is a tramo, and the
+ * reviewer who wants that stretch no longer delimited can have it said plainly.
+ *
+ * Removing the last control leaves an empty list, which is a recipe of zero and
+ * not a broken one: WaypointsPayload accepts [] and syncWaypoints([]) deletes the
+ * rows. Null is reserved for an index that names no control.
  */
 export function removeWaypoint(
     waypoints: Waypoint[],
     index: number,
 ): Waypoint[] | null {
-    if (waypoints.length < 3 || index <= 0 || index >= waypoints.length - 1) {
+    if (index < 0 || index >= waypoints.length) {
         return null;
     }
 
@@ -810,31 +816,25 @@ export interface InsertionTarget {
 /**
  * Why the removal control cannot be pressed, or '' when it can.
  *
- * The refusal has to be said out loud. removeWaypoint() returns null for a
- * route's two ends, and the caller had nowhere to say so: a reviewer who
- * selected the start control, pressed Remove control, and watched nothing happen
- * had been told the truth by omission. A button that cannot act explains itself
+ * The refusal has to be said out loud. A button that cannot act explains itself
  * in its own tooltip, which is also why it is never hidden.
  *
- * An empty string is the answer for an interior control rather than a third
+ * The only answer left is having nothing selected. There used to be a second
+ * one — "a route's start and end are what the route is" — and it was false:
+ * nothing reads a control's role but this editor, the offline bundle never
+ * carries them, and `lines` has no start or end column, so a route's ends ARE
+ * the first and last vertex of its polyline. Dropping an end control changes no
+ * geometry, no endpoint and no bundle output; all it does is stop delimiting
+ * that stretch as a traced tramo. That is the reviewer's call, not this
+ * editor's.
+ *
+ * An empty string is the answer for a selected control rather than a second
  * sentence, because the caller uses it to decide whether the button is disabled
  * and there is nothing left to say when the answer is no.
  */
-export function describeRemoveControlBlock(
-    selected: number | null,
-    total: number,
-): string {
+export function describeRemoveControlBlock(selected: number | null): string {
     if (selected === null) {
         return 'Click a control on the map to select it, then this takes it away.';
-    }
-
-    // A one-control recipe is both ends at once, so this needs no special case
-    // for it: index 0 is the start by the same test either way.
-    if (selected <= 0 || selected >= total - 1) {
-        return (
-            'The start and end of a route are not removable — they are what ' +
-            'the route is, not how it was traced. Drag it instead.'
-        );
     }
 
     return '';
@@ -1490,6 +1490,96 @@ export function describeSimplification(
  * row that has to fit without wrapping.
  */
 export type GuideGesture = 'trace' | 'anchors';
+
+/**
+ * A stretch the router could not draw, and which anchors are why.
+ *
+ * Both halves in one answer because they name the same two points: the sentence
+ * says which anchors to move and the map paints them, and two places deciding
+ * that independently is how a marker ends up calling a problem the message never
+ * mentioned. The message and the `anchors` list are therefore derived together.
+ *
+ * `leg` is zero-based, so leg 0 is the stretch between anchors 1 and 2 — the
+ * badges are numbered by route order and the legs follow that same order.
+ */
+export interface SpanFailure {
+    /** The sentence the reviewer reads. */
+    message: string;
+    /**
+     * The badge numbers to paint as the problem.
+     *
+     * Empty when the stretch is not the anchors' fault: a lookup that did not
+     * answer, or a graph that is not built, says nothing about where the
+     * reviewer put anything, and painting two anchors for it would send them
+     * moving points that were fine.
+     */
+    anchors: number[];
+}
+
+/**
+ * What a failed stretch says, aimed at the anchors that bound it.
+ *
+ * The correction is the one the ANCHORS gesture can act on, which is not the one
+ * the trace gesture would use: "add a control point between them" is advice about
+ * a gesture the reviewer is not in, and the refusal they need is "move one of
+ * these two, or put another one between them".
+ */
+export function describeFailedSpan(
+    reason: string | null,
+    leg: number,
+): SpanFailure {
+    const from = leg + 1;
+    const to = leg + 2;
+
+    switch (reason) {
+        case 'origin-too-far':
+            // Only the origin is at fault, and only moving it fixes it: the leg
+            // has to REACH this anchor, so an extra one in between still has to
+            // arrive at the same unreachable place.
+            return {
+                message: `Anchor ${from} is too far from any street. Move it closer to one.`,
+                anchors: [from],
+            };
+
+        case 'destination-too-far':
+            return {
+                message: `Anchor ${to} is too far from any street. Move it closer to one.`,
+                anchors: [to],
+            };
+
+        case 'no-path':
+            return {
+                message:
+                    `No legal connection between anchor ${from} and anchor ${to}. ` +
+                    'Move one of them, or place another between them.',
+                anchors: [from, to],
+            };
+
+        case 'budget':
+            return {
+                message:
+                    `The search gave up between anchor ${from} and anchor ${to}. ` +
+                    'Move them closer together.',
+                anchors: [from, to],
+            };
+
+        case 'graph-not-built':
+            return {
+                message:
+                    'The road graph is not built on this server. Nothing about ' +
+                    'the anchors can be fixed from here.',
+                anchors: [],
+            };
+
+        default:
+            return {
+                message:
+                    `The route lookup did not answer for the stretch between ` +
+                    `anchor ${from} and anchor ${to}. Try again.`,
+                anchors: [],
+            };
+    }
+}
 
 /**
  * The batch's router answers as one chain.

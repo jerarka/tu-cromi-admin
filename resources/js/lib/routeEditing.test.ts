@@ -3767,6 +3767,16 @@ describe('describeModeHelp', () => {
         );
     });
 
+    test('guided mode leads with the gesture it starts on', () => {
+        // A visit to a route with geometry opens on Anchors, so the sentence a
+        // reviewer reads first should be that one's.
+        const help = describeModeHelp('guide');
+
+        expect(help.indexOf('Anchors re-lays')).toBeLessThan(
+            help.indexOf('Trace lays'),
+        );
+    });
+
     test('starts a move range with a plain click, since one is free there', () => {
         // The order is the instruction, so it is asserted. A plain click in move
         // mode only picks a vertex — there is nothing else it could be doing —

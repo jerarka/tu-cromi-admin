@@ -617,7 +617,13 @@ const editToggleIcon = computed(() =>
  * deliberately do not travel.
  */
 const waypointsField = computed<string | null>(() => {
-    if (!waypointsTouched.value || waypoints.value.length === 0) {
+    // An empty list posts as '[]' and that is not the same as an absent field:
+    // WaypointsPayload validates [] and syncWaypoints([]) deletes the rows, which
+    // is how a recipe whose last control was just removed actually reaches the
+    // database instead of coming back on the next load. Returning null for an
+    // empty list here would read as "this save touched no controls" and leave the
+    // stored rows alone.
+    if (!waypointsTouched.value) {
         return null;
     }
 

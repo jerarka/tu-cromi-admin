@@ -2758,17 +2758,18 @@ export function describeModeHelp(
 ): string {
     if (mode === 'guide') {
         return (
-            'Trace lays tramos along the road network between control points, and ' +
-            'shows each one dashed for you to accept or reject. A click near the ' +
-            'route splits the span it lands in; a click away from the route grows ' +
-            'the end chosen in "Extend at". Anchors re-lays part of a route that ' +
-            'already exists: pin two or more points around the stretch that is ' +
-            'wrong, then Preview rebuild re-routes only the stretch between the ' +
-            'outermost ones, and dragging a pinned point re-traces the batch in ' +
-            'place. The dots on the map are your control points: drag one ' +
-            'to move it, click one to select it, then Remove control takes it away. ' +
-            'Where the router cannot find a way, place the vertex in Add mode. ' +
-            'Escape cancels a pending proposal and discards anchors.'
+            'Anchors re-lays part of a route that already exists: pin two or ' +
+            'more points around the stretch that is wrong, then Preview rebuild ' +
+            're-routes only the stretch between the outermost ones, and dragging ' +
+            'a pinned point re-traces the batch in place. It is where a visit ' +
+            'starts on a route with geometry. Trace lays tramos between control ' +
+            'points instead, and shows each one dashed for you to accept or ' +
+            'reject. A click near the route splits the span it lands in; a click ' +
+            'away from it grows the end chosen in "Extend at". The dots on the ' +
+            'map are your control points: drag one to move it, click one to ' +
+            'select it, then Remove control takes it away. Where the router ' +
+            'cannot find a way, place the vertex in Add mode. Escape cancels a ' +
+            'pending proposal and discards anchors.'
         );
     }
 

@@ -35,6 +35,7 @@ import {
     describeAnchorsNeeded,
     describeBlockedControls,
     describeDetached,
+    describeFailedSpan,
     describeRectifyRefusal,
     describeRemoveControlBlock,
     describeRemoveWithoutReroute,
@@ -1820,13 +1821,29 @@ const guidedOffer = ref<GuidedOffer | null>(null);
 const guideFrontier = ref<GuideEnd>('tail');
 
 /**
- * Which of the three things a click here can do.
+ * Which gesture a visit to guided mode starts on.
+ *
+ * Anchors where there is a route to rectify, tracing where there is not: one
+ * control can delimit a stretch and zero controls cannot, so a fresh line would
+ * answer its first click with "there is no route to rebuild yet" and a reviewer
+ * would conclude the mode was broken.
+ *
+ * A function rather than a constant because the two resets that reach for it —
+ * leaving the mode and entering it — have to agree, and a route can be empty on
+ * one side of that pair and not the other.
+ */
+function defaultGuideGesture(): GuideGesture {
+    return props.geoJson?.coordinates?.length ? 'anchors' : 'trace';
+}
+
+/**
+ * Which of the two things a click here can do.
  *
  * The re-lay gesture lives in this field rather than in a pair of toggles: two
- * of them could be on at once, and the row would then name one while the click
+ * of them could be live at once, and the row would then name one while the click
  * handler did the other. One field cannot hold a state the row contradicts.
  */
-const guideGesture = ref<GuideGesture>('trace');
+const guideGesture = ref<GuideGesture>(defaultGuideGesture());
 
 /**
  * The anchors placed and not yet accepted, in route order.
@@ -1839,6 +1856,16 @@ const guideGesture = ref<GuideGesture>('trace');
  * ordered by a geometry that no longer exists.
  */
 const pendingAnchors = ref<RegionAnchor[]>([]);
+
+/**
+ * The badge numbers the last preview could not route between.
+ *
+ * A report of the LAST preview, not state: it is cleared by any change to the
+ * batch (orderPendingClicks) and by a preview that succeeds, because a mark left
+ * behind after the reviewer moved an anchor would assert a problem that may no
+ * longer exist — and the reviewer would go moving the wrong points.
+ */
+const failedAnchors = ref<number[]>([]);
 
 /**
  * The batch's own undo stack, over the anchor clicks.
@@ -1865,10 +1892,10 @@ function clearAnchorMarkers(): void {
 }
 
 /** An anchor's badge, numbered by its place on the route rather than by click. */
-function anchorIcon(order: number): L.DivIcon {
+function anchorIcon(order: number, failed = false): L.DivIcon {
     return L.divIcon({
         className: 'route-anchor',
-        html: `<i data-anchor="${order}"></i><b>${order}</b>`,
+        html: `<i data-anchor="${order}"${failed ? ' data-failed' : ''}></i><b>${order}</b>`,
         iconSize: [22, 22],
         iconAnchor: [11, 11],
     });
@@ -1894,8 +1921,9 @@ function renderPendingAnchors(): void {
 
     pendingAnchors.value.forEach((anchor, index) => {
         const position = anchor.snapped ?? anchor.clicked;
+        const order = index + 1;
         const marker = L.marker([position[1], position[0]], {
-            icon: anchorIcon(index + 1),
+            icon: anchorIcon(order, failedAnchors.value.includes(order)),
             // Interactive for the drag, and for nothing else: a click that
             // reaches the map underneath would place another anchor under the
             // reviewer who is trying to move this one.
@@ -2023,6 +2051,9 @@ function orderPendingClicks(clicks: Position[]): boolean {
     }
 
     pendingAnchors.value = next;
+    // The clicks moved, so whatever the last preview said about these anchors
+    // is no longer a statement about them.
+    failedAnchors.value = [];
     renderPendingAnchors();
 
     return true;
@@ -2147,6 +2178,13 @@ function removePendingAnchor(index: number): void {
  * position in the recipe decides the ordinal the server stores and the role of
  * every control after it, and a reviewer rectifying a route clicks wherever
  * the wrong turn is rather than in travel order.
+ *
+ * A proposal already on screen does not make this gesture refuse. The batch is
+ * the reviewer's, the proposal is derived from it, and a batch that can only be
+ * corrected by rejecting and rebuilding from scratch is what made a mis-snapped
+ * anchor cost four placements. So a click here re-traces and REPLACES the
+ * proposal; never two on screen, because previewRectify() overwrites guidedOffer
+ * and the stale layer goes with it.
  */
 function addPendingAnchor(clicked: Position): void {
     if (
@@ -2160,6 +2198,24 @@ function addPendingAnchor(clicked: Position): void {
 
     const before = pendingClicks();
 
+    // Captured before anything moves, and dismissed before the re-order rather
+    // than after it: orderPendingClicks() returns early when the route cannot
+    // order them, and a proposal left alive on that path would be drawn over
+    // anchors that no longer exist.
+    //
+    // The dismissal is also what keeps the offer honest. previewRectify() is
+    // async — a router call per leg — so a click followed by an Accept inside
+    // that window would run against the PREVIOUS batch's anchorClicks and apply
+    // a proposal nobody is looking at, with no error to show for it. Every
+    // other path that changes the batch does the same (beginAnchorDrag,
+    // removePendingAnchor, undoPendingAnchors); this one used to be the
+    // exception.
+    const hadOffer = guidedOffer.value !== null;
+
+    if (hadOffer) {
+        dismissPendingPreview();
+    }
+
     if (!orderPendingClicks([...before, clicked])) {
         announceGuided(describeRectifyRefusal('no-route'));
 
@@ -2167,6 +2223,16 @@ function addPendingAnchor(clicked: Position): void {
     }
 
     recordPendingClicks(before);
+
+    if (hadOffer) {
+        // The batch changed under the proposal, so the proposal is re-derived
+        // from the batch as it now stands. Returns rather than announcing: the
+        // re-trace reports its own outcome, and two overlays answering the same
+        // click is how a refusal gets buried under a count.
+        void previewRectify();
+
+        return;
+    }
 
     const placed = pendingAnchors.value.length;
 
@@ -2193,6 +2259,7 @@ function addPendingAnchor(clicked: Position): void {
  */
 function clearPendingAnchors(): void {
     pendingAnchors.value = [];
+    failedAnchors.value = [];
     anchorHistory.value = emptyHistory<Position[]>();
     clearAnchorMarkers();
     announcePendingUndo();
@@ -2338,10 +2405,14 @@ async function previewRectify(): Promise<void> {
             found.coordinates === null ||
             found.coordinates.length < 2
         ) {
-            announceGuided(
-                `Stretch ${leg + 1} of ${anchors.length - 1} failed: ` +
-                    describeRouteRefusal(found?.reason ?? null),
-            );
+            // Which anchors bound the stretch that failed, named and painted.
+            // The reviewer can already move either badge and the drop re-traces
+            // on its own, so all this has to do is point at the right two.
+            const failure = describeFailedSpan(found?.reason ?? null, leg);
+
+            failedAnchors.value = failure.anchors;
+            renderPendingAnchors();
+            announceGuided(failure.message);
 
             return;
         }
@@ -2370,6 +2441,12 @@ async function previewRectify(): Promise<void> {
         ...anchor,
         snapped: snaps[index] ?? anchor.snapped,
     }));
+    // Every leg routed, so whatever the previous preview said about these
+    // anchors is now out of date in the other direction too. Cleared BEFORE the
+    // repaint, which is the whole reason this is a separate line rather than
+    // something orderPendingClicks already did.
+    failedAnchors.value = [];
+
     renderPendingAnchors();
 
     guidedOffer.value = {
@@ -2475,7 +2552,7 @@ function firstGuidedPosition(waypoints: Waypoint[]): Position | null {
  * stale answer would draw a tramo for a control point nobody kept.
  */
 async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
-    if (props.mode !== 'guide' || !map || guidedOffer.value !== null) {
+    if (props.mode !== 'guide' || !map) {
         return;
     }
 
@@ -2484,6 +2561,15 @@ async function handleGuidedClick(e: L.LeafletMouseEvent): Promise<void> {
     if (guideGesture.value === 'anchors') {
         addPendingAnchor(clicked);
 
+        return;
+    }
+
+    // Past the anchors branch on purpose: a batch is editable while its proposal
+    // is up, and addPendingAnchor() re-traces it, so a click there adds a point
+    // rather than replacing the thing being judged. In trace the click IS the
+    // next tramo, and letting it through would put a second proposal on screen
+    // over the first one.
+    if (guidedOffer.value !== null) {
         return;
     }
 
@@ -2857,7 +2943,7 @@ function acceptPreview(): void {
             );
 
             clearPendingAnchors();
-            guideGesture.value = 'trace';
+            guideGesture.value = defaultGuideGesture();
 
             break;
         }
@@ -2914,16 +3000,16 @@ const GUIDE_GESTURES: Array<{
     label: string;
     icon: typeof Route;
 }> = [
-    { id: 'trace', label: 'Trace', icon: Route },
+    // The order is the order of the answer, not alphabetical: the first entry is
+    // the one a visit starts on for a route with geometry, and a row that lists
+    // its default second is making the reviewer hunt for where it left off.
     { id: 'anchors', label: 'Anchors', icon: MapPin },
+    { id: 'trace', label: 'Trace', icon: Route },
 ];
 
 /** Why the removal control is disabled right now, or '' when it is live. */
 const removeControlBlock = computed(() =>
-    describeRemoveControlBlock(
-        selectedWaypoint.value,
-        waypointsForGuide.value.length,
-    ),
+    describeRemoveControlBlock(selectedWaypoint.value),
 );
 
 /**
@@ -2998,7 +3084,7 @@ function cancelPendingPreview(): void {
     dismissPendingPreview();
     clearPendingAnchors();
     clearGuidedMarkers();
-    guideGesture.value = 'trace';
+    guideGesture.value = defaultGuideGesture();
     guideFrontier.value = 'tail';
     selectedWaypoint.value = null;
 }
@@ -3321,7 +3407,8 @@ function startRemovePreview(): void {
 
         if (without === null) {
             announceGuided(
-                'This control cannot be removed while it is one of only two.',
+                'This control cannot be removed: it is no longer part of the ' +
+                    'recipe.',
             );
 
             return;
@@ -4473,6 +4560,20 @@ onUnmounted(() => {
     border: 2px dashed #7c3aed;
     background-color: #7c3aed33;
     box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+/*
+   The anchors the last preview could not route between.
+
+   Red is what "cannot" already means in this editor — the delete mode's
+   vertices and a route's end pin — so it is not a new colour for a new idea.
+   The dash becoming a solid is the second signal, because a hue on its own is
+   the one thing a reviewer with a colour-blind screen cannot act on.
+*/
+:deep(i[data-anchor][data-failed]) {
+    border-color: #dc2626;
+    border-style: solid;
+    background-color: #dc262633;
 }
 
 :deep(.route-anchor b) {

@@ -59,7 +59,10 @@ const preserveViewToken = ref(0);
  * The recipe as the form posts it — only when this visit touched it.
  */
 const waypointsField = computed<string | null>(() => {
-    if (!waypointsTouched.value || waypoints.value.length === 0) {
+    // An empty list posts as '[]', which WaypointsPayload validates and
+    // syncWaypoints([]) consumes by deleting the rows — see Edit.vue's
+    // waypointsField for why an empty list is not the same as no field.
+    if (!waypointsTouched.value) {
         return null;
     }
 

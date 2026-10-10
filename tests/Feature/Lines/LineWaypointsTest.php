@@ -109,6 +109,26 @@ class LineWaypointsTest extends TestCase
         $this->assertSame(3, $line->waypoints()->count());
     }
 
+    public function test_an_empty_list_clears_the_recipe(): void
+    {
+        // The other side of the asymmetry above: a field that IS present and
+        // holds no control points means the reviewer removed them, so the rows go.
+        // This is what makes deleting the last control stick — returning no field
+        // for an empty list would leave the stored rows alone and the control
+        // would reappear on the next load.
+        $line = Line::factory()->create(['code' => '999', 'sense' => 'OUTBOUND']);
+        $line->syncWaypoints($this->payload());
+
+        $this->actingAs($this->user())
+            ->put(route('lines.update', $line->id), [
+                'name' => 'Renamed',
+                'waypoints' => '[]',
+            ])
+            ->assertSessionHasNoErrors();
+
+        $this->assertSame(0, $line->waypoints()->count());
+    }
+
     public function test_a_malformed_payload_is_refused(): void
     {
         $line = Line::factory()->create(['code' => '999', 'sense' => 'OUTBOUND']);
