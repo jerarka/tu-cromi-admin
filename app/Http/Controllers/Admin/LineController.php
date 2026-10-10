@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Admin;
 
 use App\Enums\DirectionOperation;
+use App\Enums\LineSense;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Line\DirectionOperationRequest;
 use App\Http\Requests\Line\StoreLineRequest;
@@ -210,6 +211,80 @@ class LineController extends Controller
         ]);
 
         return to_route('lines.edit', $line);
+    }
+
+    /**
+     * Delete this line's direction.
+     *
+     * One row, not one route: a row IS a direction, and the index lists rows.
+     * Deleting "Línea 1" would have to delete both and then the reviewer has
+     * no way back to the one they did not mean, so this is deliberately
+     * partial and the counterpart survives. It also cannot be left in a broken
+     * state — parent_line_id goes NULL and Line::counterpart() resolves by
+     * code and sense instead, which is exactly why that column is only ever a
+     * cache.
+     *
+     * Nothing is cleaned up by hand: the database already cascades to
+     * line_waypoints, favorites, reviews and line_transfers (whose *both* ends
+     * are foreign keys, so transfers involving this direction in either
+     * position go with it), and nulls issue_reports.line_id. Re-implementing
+     * any of that here would be a second copy to keep in step with the
+     * migrations, and a forgotten delete() in a controller is exactly the kind
+     * of orphan no test notices.
+     *
+     * The redirect carries the index's own filters back, because deleting from
+     * a table the reviewer is filtering by is a list operation and landing them
+     * on an unfiltered page 1 throws away where they were.
+     */
+    public function destroy(Line $line): RedirectResponse
+    {
+        // Read before the delete: after it, the model still holds these in
+        // memory but a fresh() would be gone, and the toast has to name the
+        // row the reviewer just removed.
+        $code = $line->code;
+        $sense = $line->sense;
+
+        $line->delete();
+
+        Inertia::flash('toast', [
+            'type' => 'success',
+            // Both the code and the sense, because the code alone is ambiguous
+            // on this table: two rows carry it, and the one that survives is
+            // the one the reviewer did not press delete on. The wording is
+            // split out rather than concatenated so a translator never has to
+            // re-order a half-built sentence.
+            'message' => __('Deleted :code (:sense).', [
+                'code' => $code,
+                'sense' => $sense === LineSense::Return ? __('vuelta') : __('ida'),
+            ]),
+        ]);
+
+        return to_route('lines.index', $this->indexFilters());
+    }
+
+    /**
+     * The index's own query string, minus what is not set.
+     *
+     * Read from the QUERY bag on purpose. That is where the filters actually
+     * are: the delete dialog posts a form, and a form's action URL is the only
+     * place it can carry them. Laravel's input() would answer the same thing by
+     * merging the query over the body, which is a kindness that stops being one
+     * the moment a request carries a field called `page` in its body — then a
+     * hidden input would decide which page of the table the reviewer lands on.
+     *
+     * The explicit key list is also what keeps the redirect honest: an absent
+     * filter stays absent rather than arriving as an empty one that reads as
+     * "search for nothing" to whatever looks at it next, and `_method` never
+     * leaks into the URL.
+     *
+     * @return array<string, mixed>
+     */
+    private function indexFilters(): array
+    {
+        return array_intersect_key(
+            request()->query->all(),
+            array_flip(['search', 'sense', 'page']),
+        );
     }
 
     /**

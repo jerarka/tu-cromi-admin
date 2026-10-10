@@ -170,3 +170,33 @@
         @apply bg-background text-foreground;
     }
 }
+
+/*
+  Every dialog has to clear Leaflet.
+
+  The map's stacking scale is not small: its panes run 200 (tiles) through 700
+  (popups), its controls sit at 800 and its control corners at 1000 — and none
+  of it is contained, because neither `.leaflet-container` nor a `relative`
+  wrapper declares a z-index, so the map and the page share one context.
+  shadcn's dialog mounts through a portal at `z-50`, which is below all of it.
+  That is not a cosmetic gap: the delete confirmation on the route editor
+  painted UNDER the map, so opening it looked like nothing happened at all.
+
+  1001 rather than 1000 so it cannot tie with `.leaflet-top` and fall back to
+  DOM order. Both the overlay and the panel carry it, and the overlay is not
+  optional: raising only the panel would leave the map bright and clickable
+  underneath a dialog that is supposed to be modal.
+
+  One stacking context is enough for everything inside. The panel's own
+  z-index creates it, so a select or a dropdown opened inside the dialog rides
+  along above the map at whatever z-index of its own it cares to declare.
+
+  Scoped by data-slot so it touches dialogs and nothing else, and deliberately
+  unlayered: Tailwind v4 keeps its utilities inside `@layer utilities`, and an
+  unlayered rule beats a layered one regardless of source order — which is
+  what lets this override the `z-50` already on the same element.
+*/
+[data-slot='dialog-overlay'],
+[data-slot='dialog-content'] {
+    z-index: 1001;
+}

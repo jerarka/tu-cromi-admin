@@ -16,6 +16,7 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::patch('/lines/{line}/directions', [LineController::class, 'directions'])->name('lines.directions');
     Route::post('/lines/{line}/refresh-geometry', [LineController::class, 'refreshGeometry'])->name('lines.refresh-geometry');
     Route::put('/lines/{line}', [LineController::class, 'update'])->name('lines.update');
+    Route::delete('/lines/{line}', [LineController::class, 'destroy'])->name('lines.destroy');
 
     Route::post('/roads/snap', [RoadsController::class, 'snap'])->name('roads.snap');
     Route::post('/roads/relay', [RoadsController::class, 'relay'])->name('roads.relay');

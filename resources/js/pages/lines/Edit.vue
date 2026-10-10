@@ -18,6 +18,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import LineController from '@/actions/App/Http/Controllers/Admin/LineController';
 import Heading from '@/components/Heading.vue';
 import InputError from '@/components/InputError.vue';
+import DeleteLineDialog from '@/components/lines/DeleteLineDialog.vue';
 import LineMap from '@/components/lines/LineMap.vue';
 import RouteModePicker from '@/components/lines/RouteModePicker.vue';
 import RouteStats from '@/components/lines/RouteStats.vue';
@@ -1044,6 +1045,23 @@ const waypointsField = computed<string | null>(() => {
                                 </TooltipContent>
                             </Tooltip>
                         </TooltipProvider>
+
+                        <!--
+                            Pushed to the far end of the row, because this is
+                            the one button on the page that cannot be taken
+                            back and it should not sit shoulder to shoulder
+                            with two that can. It lives in this card for the
+                            same reason Reset to source does: it is an
+                            operation on the record rather than on the form,
+                            and this is the card that holds those.
+                        -->
+                        <div class="sm:ml-auto">
+                            <DeleteLineDialog
+                                :line="line"
+                                :has-counterpart="Boolean(props.counterpart)"
+                                :has-unsaved-edits="isDirty"
+                            />
+                        </div>
                     </div>
                     <p
                         v-if="!canChangeDirection"

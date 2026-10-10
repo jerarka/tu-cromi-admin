@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { Head, Link, router } from '@inertiajs/vue3';
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import Heading from '@/components/Heading.vue';
+import DeleteLineDialog from '@/components/lines/DeleteLineDialog.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -60,6 +61,30 @@ function visitPage(url: string | null): void {
         },
     );
 }
+
+/**
+ * The table's own query string, to hand to the delete request.
+ *
+ * Empty filters are left out rather than sent blank: `?search=` is not the same
+ * as no search, and a redirect built from it would carry a filter the reviewer
+ * never set. The page always travels, because "which page was I on" still
+ * answers that after deleting the last row of page 3.
+ */
+const deleteQuery = computed<Record<string, string>>(() => {
+    const query: Record<string, string> = {
+        page: String(props.lines.current_page),
+    };
+
+    if (props.filters.search) {
+        query.search = props.filters.search;
+    }
+
+    if (props.filters.sense) {
+        query.sense = props.filters.sense;
+    }
+
+    return query;
+});
 
 const senseBadge = (sense: string): string => {
     return sense === 'OUTBOUND'
@@ -177,13 +202,31 @@ const senseLabel = (sense: string): string => {
                         {{ line.total_reviews }}
                     </td>
                     <td class="px-4 py-3 text-right">
-                        <Button variant="outline" size="sm" as-child>
-                            <Link
-                                :href="lineRoutes.edit.url({ line: line.id })"
-                            >
-                                Edit
-                            </Link>
-                        </Button>
+                        <div class="flex justify-end gap-2">
+                            <Button variant="outline" size="sm" as-child>
+                                <Link
+                                    :href="
+                                        lineRoutes.edit.url({ line: line.id })
+                                    "
+                                >
+                                    Edit
+                                </Link>
+                            </Button>
+
+                            <!--
+                                Deleting from the table is the list operation:
+                                a reviewer working down a list removes rows
+                                without opening each one. The controller
+                                carries the table's own filters back on the
+                                redirect, so this lands on the same page of the
+                                same filtered list rather than at an unfiltered
+                                page 1.
+                            -->
+                            <DeleteLineDialog
+                                :line="line"
+                                :query="deleteQuery"
+                            />
+                        </div>
                     </td>
                 </tr>
                 <tr v-if="lines.data.length === 0">

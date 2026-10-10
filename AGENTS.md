@@ -42,6 +42,14 @@ Two workflows, both on push/PR to `develop`/`main`/`master`/`workos`:
 - **`geometry_adjusted` is a dirty flag, not state**: it marks a line whose geometry a human corrected after import (`applyDirectionOperation()`). When set, previously computed transfer point indices point at different coordinates, so `transfers:compute` must be re-run.
 - `LineSense` enum: `Outbound = 'OUTBOUND'` (ida), `Return = 'RETURN'` (vuelta).
 
+## Deleting a line (`DELETE /lines/{line}`)
+
+- **A delete removes one DIRECTION, never the route.** The row IS the direction and the index lists rows, so `destroy()` is deliberately partial: the counterpart survives with `parent_line_id` NULL, and it stays correct because `counterpart()` resolves by code + sense — that column is only ever a cache.
+- **No cleanup code.** The database cascades to `line_waypoints`, `favorites`, `reviews` and `line_transfers` (whose *both* ends are foreign keys, so a transfer goes whichever way round it was stored) and nulls `issue_reports.line_id`. A hand-written `delete()` per child table would be a second copy to drift from the migrations.
+- **The dialog's copy lives in `resources/js/lib/lineDeletion.ts`, not in the component**, because the dialog is mounted from two surfaces (index row, edit page) and a delete is irreversible. It says a numbered line comes back on `lines:import` and a slug-coded one does not — that warning would be a lie for the second.
+- **The table's filters ride on the delete request's query string**, which is the only place a form's action URL can carry them; the controller reads `request()->query->all()` and intersects, rather than `request()->only()`, so a form field named `page` cannot decide which page the reviewer lands on. `_method` never leaks into the redirect.
+- **Deleting in the admin does not reach riders**: the published bundle keeps the line until `lines:export-offline --data-version=N` is re-run and uploaded.
+
 ## Offline bundle (`lines:export-offline`)
 
 The command writes three files into the bundle's directory and publishes the last two:
