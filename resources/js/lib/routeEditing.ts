@@ -2188,8 +2188,13 @@ export function relaySelectionOntoNetwork(
  * vertices ten metres apart would contradict the separation the re-lay
  * enforces, and a reviewer could build a route that the re-lay then reported as
  * too crowded and asked them to fix.
+ *
+ * Ascending, and that ordering carries meaning: the simplifier's span rule
+ * borrows the finest entry (see `ROUTED_MAX_SPAN_METERS`), which is derived with
+ * `Math.min` rather than read by index — but a list kept out of order would
+ * still read as sorted to the next person.
  */
-export const RESAMPLE_SPACING_METERS = [100, 200, 300] as const;
+export const RESAMPLE_SPACING_METERS = [100, 150, 200, 300] as const;
 
 /** How far apart a resample is asked to leave two vertices, in metres. */
 export type ResampleSpacing = (typeof RESAMPLE_SPACING_METERS)[number];

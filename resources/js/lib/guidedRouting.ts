@@ -1275,8 +1275,22 @@ export const ROUTED_SIMPLIFY_TOLERANCE_METERS = 5;
  * it is a number this project already uses to describe how far apart the
  * vertices of a line are meant to sit, and a rebuilt stretch denser than its
  * surroundings is harmless while one sparser is not.
+ *
+ * Derived with `Math.min` and not by indexing. `RESAMPLE_SPACING_METERS[0]` said
+ * the same thing for as long as the list was written in ascending order, and
+ * then said it wrongly the moment somebody added a preset below the old first
+ * one — the span rule would have halved with no edit here, no mention in review,
+ * and no failing test, because every assertion on this constant compares against
+ * the constant. `Math.min` cannot drift out of step with the list.
+ *
+ * It still MOVES when the list moves, and that is the remaining hazard: adding a
+ * 50 m preset would tighten this to 50 without anyone editing this file. So the
+ * value is pinned by `simplifyRoutedChain`'s own test, which is the only place
+ * that can notice — raise the presets' low end and that test fails until someone
+ * decides whether the span rule should follow. That is the decision being
+ * forced, rather than absorbed.
  */
-export const ROUTED_MAX_SPAN_METERS = RESAMPLE_SPACING_METERS[0];
+export const ROUTED_MAX_SPAN_METERS = Math.min(...RESAMPLE_SPACING_METERS);
 
 /**
  * A turn this sharp survives on its own, whatever the distance says.

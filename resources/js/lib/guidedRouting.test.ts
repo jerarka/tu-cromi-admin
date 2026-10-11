@@ -44,7 +44,7 @@ import {
 } from './guidedRouting';
 import type { RegionAnchor, Waypoint } from './guidedRouting';
 import type { Position } from './routeEditing';
-import { distanceMeters } from './routeEditing';
+import { distanceMeters, RESAMPLE_SPACING_METERS } from './routeEditing';
 
 /**
  * Hand-computed, like every geometry test in this project: the fixtures below
@@ -1138,6 +1138,25 @@ describe('simplifyRoutedChain', () => {
 
         expect(Math.max(...gaps)).toBeLessThanOrEqual(
             ROUTED_MAX_SPAN_METERS + 1,
+        );
+    });
+
+    test('the span rule is pinned to 100 m, and is the finest preset', () => {
+        // The assertion every other check on this constant is structurally
+        // unable to make. Each of them compares a result against
+        // ROUTED_MAX_SPAN_METERS itself, so a constant that moved would take its
+        // own proof with it and the suite would stay green — which is exactly
+        // what happened when the presets grew a 150 m entry and this value had to
+        // be re-derived rather than indexed. Written as a literal on purpose:
+        // `Math.min` is the derivation, and this is the check that the
+        // derivation still means what it meant.
+        expect(ROUTED_MAX_SPAN_METERS).toBe(100);
+
+        // And the relationship it claims to have, asserted rather than assumed.
+        // If the preset list gains a finer entry the span rule follows it down,
+        // and this is where that stops being silent.
+        expect(ROUTED_MAX_SPAN_METERS).toBe(
+            Math.min(...RESAMPLE_SPACING_METERS),
         );
     });
 
