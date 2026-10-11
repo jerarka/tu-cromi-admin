@@ -42,6 +42,18 @@ Two workflows, both on push/PR to `develop`/`main`/`master`/`workos`:
 - **`geometry_adjusted` is a dirty flag, not state**: it marks a line whose geometry a human corrected after import (`applyDirectionOperation()`). When set, previously computed transfer point indices point at different coordinates, so `transfers:compute` must be re-run.
 - `LineSense` enum: `Outbound = 'OUTBOUND'` (ida), `Return = 'RETURN'` (vuelta).
 
+## Pasting a route from the Cruzero API
+
+The edit page reads a route out of a pasted `app.cruzero.net` response. The parsing and every refusal is `resources/js/lib/cruzeroRoute.ts`; the file name names the vendor because the direction is **their** convention, not GeoJSON's.
+
+- **The payload is a GeoJSON `LineString`; a `lines` row stores a `MultiLineString`.** The wrap is one part, and it happens in the converter — never by loosening `GeoJsonMultiLineString`. `GreatCircle::forGeometry()` walks two levels of nesting, so a LineString that reaches it ships a wrong ride length in the offline bundle instead of an obvious failure.
+- **The direction arrives as an `_i_` / `_v_` token inside `trip_id`**, and the converter picks the shape matching the row's own sense. `CLOCKWISE` / `COUNTERCLOCKWISE` is deliberately NOT read: it describes the shape's handedness, and the two shapes in a real pair are **not** reversals — measured on route 38, 579 vs 551 vertices sharing only 101, same endpoints. They were traced separately, which is why this feed makes `applyDirectionOperation()` unnecessary for imported data instead of reproducing its problem.
+- **The paste box is a separate field from the GeoJSON textarea** because that textarea is what the form posts. Their payload is valid JSON with no top-level `.coordinates`, so pasted there the route vanishes from the map and the badge with nothing reporting an error.
+- **It never guesses.** A transposed pair is undetectable by range check — -17.76 and -63.20 are both legal longitudes and both legal latitudes — so it is drawn correctly-shaped in the wrong hemisphere and saves cleanly. The reported **bounding box** is the only cheap guard, and `intermediate[]` (stops) hold the same coordinates as separate scalars in the **opposite** order, which is exactly how that mistake happens. The stops case is refused by name, not generically.
+- **Converting is never a bare click and never asks permission.** It writes nothing: it stages text, marks the form dirty and lets the map redraw, which is the point — the reviewer pastes, reads the route, and only then saves. The consequences worth warning about all belong to **Save**, not to the convert: stale `line_transfers` point indexes, and a recipe that no longer matches, are properties of a database that has not been written yet.
+- **A convert is recorded on the undo stack before it overwrites the field**, which is what replaces a confirmation. It is the only edit on the page that replaces the whole geometry, and it used to be the only one with no way back; one `Ctrl+Z` returns the route that was in the field. Recorded before the assignment, like every other geometry edit there.
+- Saving a converted geometry still stamps `geometry_adjusted` — see the flag's entry above.
+
 ## Deleting a line (`DELETE /lines/{line}`)
 
 - **A delete removes one DIRECTION, never the route.** The row IS the direction and the index lists rows, so `destroy()` is deliberately partial: the counterpart survives with `parent_line_id` NULL, and it stays correct because `counterpart()` resolves by code + sense — that column is only ever a cache.

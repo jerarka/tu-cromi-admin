@@ -8,6 +8,7 @@ import {
     ChevronDown,
     ChevronLeft,
     ChevronRight,
+    ClipboardPaste,
     PencilLine,
     Redo2,
     RotateCcw,
@@ -40,6 +41,8 @@ import { usePropagation } from '@/composables/usePropagation';
 import { useResampleSpacing } from '@/composables/useResampleSpacing';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import { useSnapPreset } from '@/composables/useSnapPreset';
+import { describeConversion, parseCruzeroRoute } from '@/lib/cruzeroRoute';
+import type { ConversionReport } from '@/lib/cruzeroRoute';
 import { guidesFromGeometry, waypointsFromRecord } from '@/lib/guidedRouting';
 import type { Waypoint } from '@/lib/guidedRouting';
 import {
@@ -194,32 +197,130 @@ function confirmNavigation(message: string): boolean {
 }
 
 /**
+ * A route pasted from the Cruzero API, waiting to be read.
+ *
+ * A field of its own rather than a button over the GeoJSON textarea, and that
+ * separation is the whole point: the textarea is the field the form posts, and
+ * their payload parses as valid JSON while exposing no top-level `.coordinates`
+ * — so pasted there, the map and the stats badge would go blank with nothing
+ * reporting an error. Foreign data never enters the form this way.
+ */
+const pastedRoute = ref('');
+const conversionError = ref<string | null>(null);
+const conversionReport = ref<ConversionReport | null>(null);
+
+/**
+ * What was read, in one sentence, and where it lies.
+ *
+ * The extent is not decoration. A paste whose coordinates arrive transposed is
+ * drawn perfectly, in the wrong hemisphere, and saves perfectly — nothing
+ * downstream would ever catch it. -17.76 and -63.20 are both legal longitudes
+ * and both legal latitudes, so no range check sees the swap; the numbers do, and
+ * they are readable without leaving the field.
+ */
+const conversionSummary = computed<string>(() =>
+    conversionReport.value ? describeConversion(conversionReport.value) : '',
+);
+
+const conversionExtent = computed<string>(() => {
+    const bbox = conversionReport.value?.bbox;
+
+    if (!bbox) {
+        return '';
+    }
+
+    return `lng ${bbox.minLng} … ${bbox.maxLng}, lat ${bbox.minLat} … ${bbox.maxLat}`;
+});
+
+/**
+ * Read the pasted route into the geometry field, to be looked at before it is
+ * saved.
+ *
+ * Nothing is written here. A convert stages text, marks the form dirty and lets
+ * the map redraw — which is the whole point of it: the reviewer pastes, reads
+ * the route on the map, and only then decides whether to press Save. That is why
+ * there is no confirmation. The consequences that are worth warning about all
+ * belong to Save, not to this: stale `line_transfers` point indexes and a recipe
+ * that no longer matches are properties of the database, and the database has
+ * not changed yet. Putting them here would have the reviewer reading about a
+ * damage that had not happened, before seeing the route.
+ *
+ * What a convert does do is overwrite the field, and that used to be the one
+ * unrecoverable thing on this page — the only edit with no way back. So it is
+ * recorded on the undo stack first, which is this codebase's own answer to an
+ * edit that cannot be taken back (see the note on `isSecondMove`). One Ctrl+Z
+ * takes back the route that was in the field, so a convert needs no prompt to be
+ * safe: it needs to be undoable.
+ *
+ * Recorded before the assignment, like every other geometry edit here, or the
+ * entry would be the state being replaced rather than the state being kept.
+ */
+function convertPastedRoute(): void {
+    const result = parseCruzeroRoute(pastedRoute.value, props.line.sense);
+
+    if (!result.ok) {
+        conversionReport.value = null;
+        conversionError.value = result.reason;
+
+        return;
+    }
+
+    conversionError.value = null;
+
+    history.value = record(
+        history.value,
+        { geometry: geoJsonText.value, waypoints: waypoints.value },
+        UNDO_LIMIT,
+    );
+
+    // setGeometry() sets the text, clears any parse error and marks the form
+    // dirty, which is exactly what a replace is. Hand-rolling those three here
+    // would be a second way to become dirty.
+    setGeometry(result.geoJson);
+
+    conversionReport.value = result.report;
+
+    // Cleared on success: the coordinates now live in the field above, and a
+    // stale 25 KB blob left in the box is one Convert away from being applied to
+    // a different line.
+    pastedRoute.value = '';
+}
+
+/**
  * Re-sync the editor when the server hands us a different line.
  *
  * Inertia reuses this component instance when navigating between two lines, so
  * setup does not run again and the textarea would keep the previous line's
  * geometry while the form action already pointed at the new line's id. Saving
  * would then write one line's geometry onto another.
+ *
+ * Watched on the id as well as the geometry because the paste box and the
+ * conversion report describe ONE line, and two rows can carry the same
+ * geometry — two lines swapped, or a service created from a copy. Keyed on the
+ * geometry alone, that paste would survive into the next line with nothing
+ * saying whose route it was.
  */
-watch(
-    () => props.line.geo_json,
-    (geoJson) => {
-        replaceGeometry(geoJson);
+watch([() => props.line.geo_json, () => props.line.id], ([geoJson]) => {
+    replaceGeometry(geoJson);
 
-        // New geometry means a new route to undo edits on. Keeping the old
-        // stack would offer a step that restores a shape that is no longer the
-        // one being edited.
-        history.value = emptyHistory();
+    // New geometry means a new route to undo edits on. Keeping the old
+    // stack would offer a step that restores a shape that is no longer the
+    // one being edited.
+    history.value = emptyHistory();
 
-        // And a new recipe to edit from — re-derived, never carried over from
-        // the previous line, for the same reason the stack resets.
-        waypoints.value =
-            waypointsFromRecord(props.waypoints ?? []).length > 0
-                ? waypointsFromRecord(props.waypoints ?? [])
-                : (guidesFromGeometry(geoJson?.coordinates) ?? []);
-        waypointsTouched.value = false;
-    },
-);
+    // And a new recipe to edit from — re-derived, never carried over from
+    // the previous line, for the same reason the stack resets.
+    waypoints.value =
+        waypointsFromRecord(props.waypoints ?? []).length > 0
+            ? waypointsFromRecord(props.waypoints ?? [])
+            : (guidesFromGeometry(geoJson?.coordinates) ?? []);
+    waypointsTouched.value = false;
+
+    // And the paste box with it, for the reason the id is being watched.
+    pastedRoute.value = '';
+    conversionError.value = null;
+    conversionReport.value = null;
+});
 
 const canChangeDirection = computed(() => Boolean(props.counterpart));
 
@@ -866,6 +967,63 @@ const waypointsField = computed<string | null>(() => {
                     >
                         {{ geoJsonError }}
                     </p>
+                </div>
+
+                <!--
+                    A route pasted from the Cruzero API, in a field of its own.
+
+                    The field is separate from the textarea above on purpose:
+                    that one is what the form posts, and their payload is valid
+                    JSON with no top-level `.coordinates`, so pasted into it the
+                    route would simply vanish from the map and the stats badge
+                    with nothing reporting an error. Here it can be anything —
+                    the whole response, one line, or a bare shape_geom — and the
+                    converter reads it, names the direction it took, and leaves
+                    the result in the field the reviewer can see.
+
+                    The button is never disabled. An empty box already says
+                    itself, and a control that is greyed out with no reason
+                    printed is the pattern this codebase stopped using.
+                -->
+                <div
+                    class="col-span-2 grid gap-2 rounded-md border border-dashed p-3"
+                >
+                    <Label for="pasted_route">
+                        Paste a route from the API
+                    </Label>
+                    <textarea
+                        id="pasted_route"
+                        v-model="pastedRoute"
+                        rows="3"
+                        class="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs"
+                        placeholder="Paste a response from app.cruzero.net/api/city/transport/one/…"
+                    ></textarea>
+
+                    <div class="flex flex-wrap items-center gap-3">
+                        <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            @click="convertPastedRoute"
+                        >
+                            <ClipboardPaste class="size-4" />
+                            Convert to this line
+                        </Button>
+
+                        <span
+                            v-if="conversionError"
+                            class="text-sm text-red-600 dark:text-red-500"
+                        >
+                            {{ conversionError }}
+                        </span>
+
+                        <span
+                            v-else-if="conversionSummary"
+                            class="text-sm text-muted-foreground"
+                        >
+                            {{ conversionSummary }} · {{ conversionExtent }}
+                        </span>
+                    </div>
                 </div>
 
                 <!--
