@@ -106,6 +106,7 @@ Use npm, not pnpm. `pnpm-workspace.yaml` is leftover; the lockfile and CI are np
 | `lines:import` | Imports `database/data/rutas_scz.geojson`; `sentido=1` -> OUTBOUND, else RETURN with reversed coordinates; links pairs by code. `--force` requires `--discard-everything` and destroys user data/manual corrections. |
 | `lines:refresh-geometry` | `{code}` restores that line's geometry from the source GeoJSON, discarding manual corrections and clearing `geometry_adjusted`. Import never overwrites geometry on its own. |
 | `lines:backfill-sort-keys` | Recomputes `code_number`; supports `--dry-run`. |
+| `lines:map-bounds` | Mobile map windows in EPSG:3857: the exact minimum-area window containing `--coverage`% of routes (directions unioned per `code`), plus the full extent. Both are expanded by `--margin` (default 1000). `--exclude=CODE` (repeatable), `--decimals=1`. PostGIS only; emits the mobile config's pair order `minX,maxX,minY,maxY [EPSG:3857]`. |
 | `roads:import-overpass` | Drivable ways including `*_link`, plus turn restrictions. `--bbox=`, `--pad=0.02`, `--tile=0.1`, `--truncate`, `--dry-run`. Upserts by `osm_id`; rebuild the graph afterwards. |
 | `roads:build-graph` | Truncate-and-rebuild `road_nodes`/`road_edges`, ~20 s. |
 | `roads:self-test` | Exercises PostGIS snap/relay/continue paths against a real instance and rolls back; needs `--force` outside development. |
