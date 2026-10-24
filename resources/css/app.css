@@ -90,6 +90,29 @@
 }
 
 :root {
+    /*
+      Native form controls are drawn by the browser and the OS, not by us.
+
+      A `<select>` styles its CLOSED face with CSS like any other element, but
+      the list of options that drops over it belongs to the platform, and the
+      platform asks one question before painting it: what colour scheme is this
+      document? Unasked, it assumes light and paints a white panel — while the
+      `<option>` elements inside it still inherit `color` from the page, which in
+      dark mode is white. The result is white text on a white list, on every
+      dropdown at once, and no class in the tree that could have prevented it.
+
+      So the answer is declared here, once, beside the tokens it belongs to: the
+      `.dark` class that drives every colour in this file also drives what the
+      browser paints for us, and it cannot drift out of step with itself the way
+      a class repeated on each control could.
+
+      The dropdowns here are shadcn's now, which portal-mount and colour
+      themselves — this is why they cannot show the bug. Everything the platform
+      still paints for us is left: scrollbars today, and whatever native control
+      gets added tomorrow.
+    */
+    color-scheme: light;
+
     --background: hsl(0 0% 100%);
     --foreground: hsl(0 0% 3.9%);
     --card: hsl(0 0% 100%);
@@ -127,6 +150,8 @@
 }
 
 .dark {
+    color-scheme: dark;
+
     --background: hsl(0 0% 3.9%);
     --foreground: hsl(0 0% 98%);
     --card: hsl(0 0% 3.9%);
@@ -172,7 +197,7 @@
 }
 
 /*
-  Every dialog has to clear Leaflet.
+  Every portaled overlay has to clear Leaflet.
 
   The map's stacking scale is not small: its panes run 200 (tiles) through 700
   (popups), its controls sit at 800 and its control corners at 1000 — and none
@@ -191,12 +216,21 @@
   z-index creates it, so a select or a dropdown opened inside the dialog rides
   along above the map at whatever z-index of its own it cares to declare.
 
-  Scoped by data-slot so it touches dialogs and nothing else, and deliberately
-  unlayered: Tailwind v4 keeps its utilities inside `@layer utilities`, and an
-  unlayered rule beats a layered one regardless of source order — which is
-  what lets this override the `z-50` already on the same element.
+  The dropdowns are here for the same reason, not decoration. Every shadcn
+  overlay portal-mounts into `<body>` at `z-50`, and the route editor's toolbar
+  sits directly above the map — so its Re-space interval picker opens onto the
+  top of the map and would have been swallowed by the tiles. A control whose
+  list of choices is invisible is not a control.
+
+  Scoped by data-slot so it touches these overlays and nothing else, and
+  deliberately unlayered: Tailwind v4 keeps its utilities inside
+  `@layer utilities`, and an unlayered rule beats a layered one regardless of
+  source order — which is what lets this override the `z-50` already on the
+  same element.
 */
 [data-slot='dialog-overlay'],
-[data-slot='dialog-content'] {
+[data-slot='dialog-content'],
+[data-slot='select-content'],
+[data-slot='dropdown-menu-content'] {
     z-index: 1001;
 }

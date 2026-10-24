@@ -32,6 +32,13 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
+import {
     Tooltip,
     TooltipContent,
     TooltipProvider,
@@ -53,6 +60,7 @@ import {
     snapOptionsFor,
 } from '@/lib/routeEditing';
 import type { SnapPreset } from '@/lib/routeEditing';
+import { modeForAction, resolveShortcut } from '@/lib/shortcuts';
 import {
     canRedo,
     canUndo,
@@ -537,24 +545,113 @@ const propagationTooltip = computed(() => {
  * this handler would otherwise undo the last edit the reviewer ACCEPTED. Whichever
  * listener runs first wins and the other stands down, so neither depends on
  * which of them registered its listener first.
+ *
+ * The shortcut table runs first and on the same listener, deliberately. A third
+ * `keydown` listener would be a third participant in an arbitration that works
+ * by `defaultPrevented`, and the two that already share it would each have to
+ * know about it. One handler, two questions: undo first because it is the one
+ * the map may have already claimed, then the table for keys nobody else wants.
  */
 function handleKeydown(e: KeyboardEvent): void {
-    if (e.defaultPrevented || (!e.metaKey && !e.ctrlKey)) {
-        return;
-    }
-
-    if (isTextEntryTarget(e.target)) {
+    if (e.defaultPrevented) {
         return;
     }
 
     const key = e.key.toLowerCase();
 
-    if (key === 'z' && !e.shiftKey) {
-        e.preventDefault();
-        undo();
-    } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+    if (key === 'z' && (e.metaKey || e.ctrlKey)) {
+        if (isTextEntryTarget(e.target)) {
+            return;
+        }
+
+        if (!e.shiftKey) {
+            e.preventDefault();
+            undo();
+
+            return;
+        }
+
         e.preventDefault();
         redo();
+
+        return;
+    }
+
+    if ((key === 'z' && e.shiftKey) || key === 'y') {
+        if ((e.metaKey || e.ctrlKey) && !isTextEntryTarget(e.target)) {
+            e.preventDefault();
+            redo();
+        }
+
+        return;
+    }
+
+    runShortcut(e);
+}
+
+/**
+ * Ask the shortcut table what this keystroke means, and do it.
+ *
+ * `resolveShortcut` returns null for everything it does not answer — a caret in
+ * a field, a modified key, a focused button, a key that is not bound — so this
+ * is the only place that has to know a key was pressed. The two questions the
+ * map owns are asked through the template ref rather than held here as props,
+ * because a copy could be one keystroke stale at the moment it decided whether
+ * Enter was safe to fire.
+ */
+function runShortcut(e: KeyboardEvent): void {
+    const target = e.target as HTMLElement | null;
+
+    const action = resolveShortcut(
+        {
+            key: e.key,
+            ctrl: e.ctrlKey,
+            meta: e.metaKey,
+            alt: e.altKey,
+            shift: e.shiftKey,
+            targetTag: target?.tagName ?? null,
+            targetRole: target?.getAttribute('role') ?? null,
+        },
+        {
+            editing: isEditingMap.value,
+            // The toggle that opens the editor is `v-if="parsedGeoJson"`, so a
+            // route is what decides whether "e" has a button to stand for.
+            hasGeometry: parsedGeoJson.value !== null,
+            mode: mode.value,
+            hasSelection: mapRef.value?.hasSelection() ?? false,
+            hasGuidedOffer: mapRef.value?.hasGuidedOffer() ?? false,
+        },
+    );
+
+    if (action === null) {
+        return;
+    }
+
+    // Before the press did anything: Enter and the arrow keys are also how a
+    // focused control is operated, and a shortcut that answers them without
+    // this would run twice for one keystroke.
+    e.preventDefault();
+
+    const nextMode = modeForAction(action);
+
+    if (nextMode !== null) {
+        mode.value = nextMode;
+
+        return;
+    }
+
+    switch (action) {
+        case 'toggle-edit':
+            toggleEditing();
+            break;
+
+        case 'accept-guided-offer':
+            mapRef.value?.acceptGuidedOffer();
+            break;
+
+        case 'delete-selection':
+            mapRef.value?.deleteSelection();
+            break;
     }
 }
 
@@ -1297,17 +1394,32 @@ const waypointsField = computed<string | null>(() => {
                         only way into the editor and it renames itself three
                         ways depending on state, so the glyph is a second signal
                         rather than a replacement for it.
+
+                        Its key is in the tooltip rather than on the button: the
+                        button's own text already renames itself three ways and
+                        the fourth thing it could print is one more thing to keep
+                        honest. A Tooltip costs the reviewer one hover.
                     -->
-                    <Button
-                        v-if="parsedGeoJson"
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        @click="toggleEditing"
-                    >
-                        <component :is="editToggleIcon" class="size-4" />
-                        {{ editToggleLabel }}
-                    </Button>
+                    <Tooltip>
+                        <TooltipTrigger as-child>
+                            <Button
+                                v-if="parsedGeoJson"
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                @click="toggleEditing"
+                            >
+                                <component
+                                    :is="editToggleIcon"
+                                    class="size-4"
+                                />
+                                {{ editToggleLabel }}
+                            </Button>
+                        </TooltipTrigger>
+                        <TooltipContent class="max-w-xs">
+                            <p>Open or close the map editor (E).</p>
+                        </TooltipContent>
+                    </Tooltip>
                 </div>
             </div>
             <LineMap
@@ -1354,32 +1466,67 @@ const waypointsField = computed<string | null>(() => {
                                 <TooltipProvider :delay-duration="0">
                                     <Tooltip>
                                         <TooltipTrigger as-child>
+                                            <!--
+                                                The trigger is a span, and now
+                                                that is not a workaround for a
+                                                disabled control: this one is a
+                                                button that is never disabled,
+                                                and a button inside a tooltip
+                                                trigger is what reka-ui needs to
+                                                anchor its floating panel to.
+                                            -->
                                             <span class="inline-flex">
-                                                <select
-                                                    id="snap-preset"
-                                                    :value="snapPreset"
-                                                    class="h-9 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
-                                                    @change="
+                                                <Select
+                                                    :model-value="snapPreset"
+                                                    @update:model-value="
                                                         updateSnapPreset(
-                                                            (
-                                                                $event.target as HTMLSelectElement
-                                                            )
-                                                                .value as SnapPreset,
+                                                            $event as SnapPreset,
                                                         )
                                                     "
                                                 >
-                                                    <option
-                                                        v-for="preset in SNAP_PRESET_NAMES"
-                                                        :key="preset"
-                                                        :value="preset"
+                                                    <SelectTrigger
+                                                        id="snap-preset"
                                                     >
-                                                        {{
+                                                        <!--
+                                                            The label is passed
+                                                            in rather than left
+                                                            to the component,
+                                                            and it has to be:
+                                                            SelectValue reads the
+                                                            current option's text
+                                                            from a registry that
+                                                            reka-ui fills on mount
+                                                            and EMPTIES on
+                                                            unmount — and every
+                                                            option lives inside the
+                                                            dropdown's portal,
+                                                            which unmounts the
+                                                            moment it closes. Left
+                                                            to itself the trigger
+                                                            would open blank and
+                                                            go blank again after
+                                                            every selection.
+                                                        -->
+                                                        <SelectValue>{{
                                                             describeSnapPreset(
-                                                                preset,
+                                                                snapPreset,
                                                             )
-                                                        }}
-                                                    </option>
-                                                </select>
+                                                        }}</SelectValue>
+                                                    </SelectTrigger>
+                                                    <SelectContent>
+                                                        <SelectItem
+                                                            v-for="preset in SNAP_PRESET_NAMES"
+                                                            :key="preset"
+                                                            :value="preset"
+                                                        >
+                                                            {{
+                                                                describeSnapPreset(
+                                                                    preset,
+                                                                )
+                                                            }}
+                                                        </SelectItem>
+                                                    </SelectContent>
+                                                </Select>
                                             </span>
                                         </TooltipTrigger>
                                         <TooltipContent class="max-w-xs">

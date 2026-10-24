@@ -1,196 +1,138 @@
 # tu-cromi-admin
 
-Laravel 13 + Vue 3 + Inertia.js v3 SPA (TypeScript, Tailwind CSS v4, shadcn-vue new-york-v4, PostGIS).
+Admin panel for Santa Cruz de la Sierra bus lines: Laravel 13 + Inertia v3 SPA (Vue 3, TypeScript, Tailwind v4, shadcn-vue). PostgreSQL + PostGIS in dev/prod; SQLite `:memory:` in tests.
 
 ## Commands
 
-| What | Command | Notes |
-|---|---|---|
-| Dev server | `composer dev` | Laravel Chisel (PHP + Vite + SSR concurrently) |
-| Vite only | `npm run dev` | |
-| **All PHP checks** | `composer test` | `config:clear` → `lint:check` → `types:check` → `artisan test`. Currently green end to end. |
-| PHP tests | `php artisan test --compact` | One test: `--filter=ClassNameOrTestName` |
-| PHP lint | `composer lint` | Pint (`laravel` preset) |
-| PHP lint check | `composer lint:check` | `pint --parallel --test` |
-| PHPStan | `composer types:check` | Level 7 over `app/`, `config/`, `database/`, `routes/` |
-| Frontend tests | `npm run test` | `vitest run`. One file: `npm run test -- resources/js/lib/undoStack` |
-| Frontend lint | `npm run lint` | ESLint + fix (`lint:check` without fix) |
-| Frontend format | `npm run format` | Prettier over `resources/` |
-| TypeScript check | `npm run types:check` | `vue-tsc --noEmit` |
-| Everything | `composer ci:check` | Runs **both** stacks: frontend lint → format → vue-tsc → vitest → `composer test` |
-| Build | `npm run build` | |
-| Codegen | `composer codegen` | Regenerates the gitignored `resources/js/{actions,routes,wayfinder}/`. **`--with-form` is not optional** — see below |
-Use **npm**, not pnpm. `pnpm-workspace.yaml` exists but the lockfile and CI are npm. `.npmrc` sets `ignore-scripts=true`, so no postinstall hooks run.
-
-## CI
-
-Two workflows, both on push/PR to `develop`/`main`/`master`/`workos`:
-
-- **`.github/workflows/tests.yml`** — PHP **8.3, 8.4 and 8.5** matrix, Node 22, copies `.env.example`. Runs `composer types:check` then `php artisan test`. **PHPStan errors fail CI**, so keep it at zero.
-- **`.github/workflows/lint.yml`** — `composer lint`, `npm run format`, `npm run lint` (writes, does not check).
-
-**`.env.example` ships `DB_CONNECTION=sqlite`** but dev and prod are PostgreSQL + PostGIS. Copying it verbatim gives you SQLite, and every spatial query then fails confusingly.
-
-## Domain model — Lines
-
-- **Each `lines` row = one direction** (OUTBOUND or RETURN), not a full line. Real lines ("Línea 1") are two rows sharing a `code`.
-- **UNIQUE index on `(code, sense)`** — two rows may share a `code`, never with the same `sense`. Two factory-created lines with a fixed `code` and a random `sense` collide ~50% of the time; pin `->outbound()` / `->return()`.
-- `code_number` (NOT NULL) is a **sort key**, not the number: `Line::sortNumber()` writes the numeric prefix of `code`, or `Line::SORT_LAST` (2147483647) when there is none. `lines_sort_index (code_number, code, sense)` makes `"2"` sort before `"22 rojo"`. `code_suffix` was dropped — don't reintroduce it.
-- **Not every bus has a number.** A service identified only by the route name painted on it uses a lowercase slug as its `code` (`la-guardia-nueva-terminal`) and puts the rider-facing wording in `name`. `App\Rules\LineCode` accepts either shape and still rejects the `2O rojo` typo. The sentinel keeps numberless rows last on **both** drivers — a NULL there would sort last on PostgreSQL and first on SQLite, and would break `adjacent()`'s row comparison, since a row value containing a NULL compares to NULL. `Line::numberFromCode()` returns `?int` and stays honest about what it found; do not make it return the sentinel.
-- Opposite directions link bidirectionally via `parent_line_id`. Circular lines (72, 73) have no counterpart; that is expected, not a bug.
-- `geo_json` (JSONB) is the source of truth: MultiLineString `[lng, lat]`. `geom` is derived from it via `ST_GeomFromGeoJSON` and is written **only** by `Line::syncGeometry()` through a raw statement — it does not exist on SQLite.
-- **`geometry_adjusted` is a dirty flag, not state**: it marks a line whose geometry a human corrected after import (`applyDirectionOperation()`). When set, previously computed transfer point indices point at different coordinates, so `transfers:compute` must be re-run.
-- `LineSense` enum: `Outbound = 'OUTBOUND'` (ida), `Return = 'RETURN'` (vuelta).
-
-## Pasting a route from the Cruzero API
-
-The edit page reads a route out of a pasted `app.cruzero.net` response. The parsing and every refusal is `resources/js/lib/cruzeroRoute.ts`; the file name names the vendor because the direction is **their** convention, not GeoJSON's.
-
-- **The payload is a GeoJSON `LineString`; a `lines` row stores a `MultiLineString`.** The wrap is one part, and it happens in the converter — never by loosening `GeoJsonMultiLineString`. `GreatCircle::forGeometry()` walks two levels of nesting, so a LineString that reaches it ships a wrong ride length in the offline bundle instead of an obvious failure.
-- **The direction arrives as an `_i_` / `_v_` token inside `trip_id`**, and the converter picks the shape matching the row's own sense. `CLOCKWISE` / `COUNTERCLOCKWISE` is deliberately NOT read: it describes the shape's handedness, and the two shapes in a real pair are **not** reversals — measured on route 38, 579 vs 551 vertices sharing only 101, same endpoints. They were traced separately, which is why this feed makes `applyDirectionOperation()` unnecessary for imported data instead of reproducing its problem.
-- **The paste box is a separate field from the GeoJSON textarea** because that textarea is what the form posts. Their payload is valid JSON with no top-level `.coordinates`, so pasted there the route vanishes from the map and the badge with nothing reporting an error.
-- **It never guesses.** A transposed pair is undetectable by range check — -17.76 and -63.20 are both legal longitudes and both legal latitudes — so it is drawn correctly-shaped in the wrong hemisphere and saves cleanly. The reported **bounding box** is the only cheap guard, and `intermediate[]` (stops) hold the same coordinates as separate scalars in the **opposite** order, which is exactly how that mistake happens. The stops case is refused by name, not generically.
-- **Converting is never a bare click and never asks permission.** It writes nothing: it stages text, marks the form dirty and lets the map redraw, which is the point — the reviewer pastes, reads the route, and only then saves. The consequences worth warning about all belong to **Save**, not to the convert: stale `line_transfers` point indexes, and a recipe that no longer matches, are properties of a database that has not been written yet.
-- **A convert is recorded on the undo stack before it overwrites the field**, which is what replaces a confirmation. It is the only edit on the page that replaces the whole geometry, and it used to be the only one with no way back; one `Ctrl+Z` returns the route that was in the field. Recorded before the assignment, like every other geometry edit there.
-- Saving a converted geometry still stamps `geometry_adjusted` — see the flag's entry above.
-
-## Deleting a line (`DELETE /lines/{line}`)
-
-- **A delete removes one DIRECTION, never the route.** The row IS the direction and the index lists rows, so `destroy()` is deliberately partial: the counterpart survives with `parent_line_id` NULL, and it stays correct because `counterpart()` resolves by code + sense — that column is only ever a cache.
-- **No cleanup code.** The database cascades to `line_waypoints`, `favorites`, `reviews` and `line_transfers` (whose *both* ends are foreign keys, so a transfer goes whichever way round it was stored) and nulls `issue_reports.line_id`. A hand-written `delete()` per child table would be a second copy to drift from the migrations.
-- **The dialog's copy lives in `resources/js/lib/lineDeletion.ts`, not in the component**, because the dialog is mounted from two surfaces (index row, edit page) and a delete is irreversible. It says a numbered line comes back on `lines:import` and a slug-coded one does not — that warning would be a lie for the second.
-- **The table's filters ride on the delete request's query string**, which is the only place a form's action URL can carry them; the controller reads `request()->query->all()` and intersects, rather than `request()->only()`, so a form field named `page` cannot decide which page the reviewer lands on. `_method` never leaks into the redirect.
-- **Deleting in the admin does not reach riders**: the published bundle keeps the line until `lines:export-offline --data-version=N` is re-run and uploaded.
-
-## Offline bundle (`lines:export-offline`)
-
-The command writes three files into the bundle's directory and publishes the last two:
-
-- **`data.ndjson.gz`** — the intermediate, and the **contract with the Dart CLI**: one JSON object per line, record order fixed (`meta`, then lines by `id`, then transfers by `(line_a_id, line_b_id, point_a_index, point_b_index)`). Not uploaded: the app no longer reads it.
-- **`data.db.gz`** — the gzipped SQLite database the app installs as a file copy. **Only the Flutter app's Dart CLI builds it** (`tools/build_offline_db.dart`, run from the Flutter checkout because `dart run` resolves `package:tu_cromi_app/...` from the working directory). The schema belongs to the app; a PHP-built database would make every schema change a cross-stack change. Needs Dart 3.11+ (not the Flutter SDK) and a checkout where `dart pub get` has run — `OFFLINE_FLUTTER_REPO` or `--flutter-repo=`. On Dart 3.12 the run needs `--enable-experiment=native-assets` (the app's graph reaches `objective_c` via its Apple platform plugins); the command passes it by default and `OFFLINE_DART_RUN_FLAGS` overrides it. **Older than 3.11 cannot build the bundle at all**, and the SDK's error blames the missing experiment flag even when it is present. On Windows a bare `dart` can resolve to an older SDK because PHP's executable lookup skips `.bat` wrappers; set `OFFLINE_DART_BINARY` to the real binary (e.g. Flutter's `bin/dart.bat`) and the command's version preflight will catch the rest.
-- **`meta.json`** — the published manifest, written by Laravel after the CLI. Fields: `version` (int, from `--data-version`), `updated_at`, `generated_at`, `total_lines`, `total_transfers` (counts read from the CLI's manifest), `data_bytes`, `data_sha256`. **Every size and hash is of the gzipped `data.db.gz`**, measured on the exact file about to be uploaded. The CLI's own manifest names the size `gz_bytes` and writes `version` as a string — never publish it as-is.
-
-The version has one source of truth: `--data-version` → NDJSON meta record → database `offline_metadata` (stamped by the CLI) → `meta.json`. Bump it and the app's update prompt follows.
-
-- **Ordering must be total.** Ordering transfers by the pair alone leaves ~22 tied rows per pair and the compressed output changes every run. The body is byte-reproducible; only `meta.generated_at` differs between runs, so compare content hashes, not file hashes.
-- **Every float is a JSON double, every integer a JSON integer.** `JSON_PRESERVE_ZERO_FRACTION` is what keeps a 0 m transfer emitting `0.0` instead of `0`. Encode through `LinesExportOffline::writeRecord()` — do not call `json_encode` directly for bundle records.
-- **`PDO_PGSQL` returns numerics as PHP strings.** Without explicit `(float)` casts, `walk_distance` and the coordinates ship quoted and `(map['walk_distance'] as num)` throws a `TypeError` in Dart. `line_a_id` and the indices arrive as real ints and need no cast.
-- `serialize_precision` must be `-1` or ≥ 17; with the legacy default of 6, `json_encode` silently truncates doubles to ~cm. The command corrects it with `ini_set` and only fails if that is rejected.
-- Known inconsistency: `average_rating` still ships as a **string**, because Laravel's `decimal:2` cast returns a string by design. `resources/js/types/line.ts` declares it `number | null`, so the admin's type is already wrong. The column is NULL everywhere and nothing writes it.
-
-`EARTH_RADIUS_M` is **6371000.0** (mean radius), not WGS84's 6378137. The app measures with the same value; swapping it shifts every ride by ~0.1%, enough to reorder transfer rankings with no visible failure. Same for the operand order in `GreatCircle::metersBetween()`. Both ride lengths and walk distances come from that one class — see `app/Geo/`. **The degree-to-metre scale belongs to that class too**: `GreatCircle::METRES_PER_DEGREE_LATITUDE` and `metresPerDegreeLongitude()` (cosine of the latitude, floored at 1% so it never reaches zero). They were literals in three files, and one copy of the longitude one had no floor while another did. `TransfersCompute`'s grid cell is deliberately **not** one of them — it divides both latitude and longitude by an equator-derived cell, which is a different quantity with its own behaviour.
-
-## Artisan commands
-
-| Command | Purpose |
+| What | Command |
 |---|---|
-| `lines:export-offline` | Build the offline bundle: NDJSON intermediate → `data.db.gz` via the Flutter app's Dart CLI → published `meta.json`. `--data-version=N` (required), `--path=` (relative to `storage/app`, default `offline/data.db.gz`; the other two files share its directory), `--flutter-repo=`, `--dart=`, `--skip-dart-cli` (NDJSON only), `--upload`. Needs Dart 3.x and a Flutter checkout with `dart pub get` run (`OFFLINE_FLUTTER_REPO`). |
-| `transfers:compute` | Precompute pedestrian transfers. PostGIS `ST_DWithin` 300 m + KNN lateral join, deduped on a 100 m spatial grid. **~17 min.** Logs to `command_executions`. |
-| `lines:import` | Import from `database/data/rutas_scz.geojson`. `sentido=1` → OUTBOUND, else RETURN with reversed coordinates. Links opposite directions by `code`. |
-| `lines:refresh-geometry` | Rebuild `geom` from `geo_json` after a manual geometry edit. |
-| `lines:backfill-sort-keys` | Recompute `code_number`. `--dry-run` reports first. |
-| `roads:import-overpass` | Import streets from Overpass — drivable ways **including `*_link` classes** (1.2k, for the routing graph) — and `type=restriction` relations into `turn_restrictions`. `--bbox=`, `--pad=`, `--tile=`, `--truncate`, `--dry-run`. Re-runs upsert by `osm_id` and are the repair path for skipped tiles. After any run, run `roads:build-graph`. |
-| `roads:build-graph` | Rebuild the routing graph from `roads`: `road_nodes` (a node is a junction — an exact coordinate shared by ≥2 ways, keyed at 1e-7) + `road_edges` (length via `GreatCircle`, `forward_ok`/`backward_ok` from `oneway`). Truncate-and-rebuild, idempotent, ~20s. PostGIS to build, **plain columns stored** — the graph is SQLite-migrable, which is what keeps the router testable in the suite. |
-| `roads:self-test` | Exercises the PostGIS snap/relay/continue paths against a real instance and rolls back, including three checks that a `_link` road never wins a snap/relay/continuation; then reports graph-table state (read-only). |
+| Dev (PHP + Vite + SSR) | `composer dev` |
+| Vite only | `npm run dev` |
+| All PHP checks | `composer test` — `config:clear` -> `lint:check` -> `types:check` -> `artisan test` |
+| PHP tests / one test | `php artisan test --compact` / `--filter=ClassNameOrTestName` |
+| PHP lint / check | `composer lint` / `composer lint:check` (Pint, `laravel` preset) |
+| PHPStan (level 7) | `composer types:check` |
+| Frontend tests / one file | `npm run test` / `npm run test -- resources/js/lib/undoStack` |
+| ESLint | `npm run lint` (fix) / `npm run lint:check` |
+| Prettier | `npm run format` / `npm run format:check` |
+| vue-tsc | `npm run types:check` |
+| Both stacks | `composer ci:check` |
+| Build | `npm run build` |
+| Wayfinder codegen | `composer codegen` |
 
-**Destructive by default — read before running:**
+Use npm, not pnpm. `pnpm-workspace.yaml` is leftover; the lockfile and CI are npm. `.npmrc` sets `ignore-scripts=true`, so no postinstall hooks run.
 
-- `transfers:compute` **truncates `line_transfers` unconditionally, including with `--limit`**. `--limit=20` still wipes all 1.35M rows and rebuilds from 20 lines. Dump the table first, or run against a scratch database.
-- `lines:import --force` requires `--discard-everything` to confirm, because it destroys user data and manual corrections.
-- `lines:export-offline --upload` **deletes both R2 objects before uploading either**. A failed upload therefore leaves the bucket with neither, which makes clients fall back to their cached version. That ordering is deliberate: `meta.json` is what advertises a new version, so it must go up after `data.db.gz`, never before.
+## CI and environment
+
+- `.github/workflows/tests.yml` — PHP 8.3/8.4/8.5, Node 22, copies `.env.example`, runs `composer types:check` then `php artisan test`. PHPStan errors fail CI.
+- `.github/workflows/lint.yml` — `composer lint`, `npm run format`, `npm run lint`; it writes formatting but does not verify it, so run these locally.
+- `.env.example` ships `DB_CONNECTION=sqlite`, but dev/prod are PostgreSQL + PostGIS. Copying it verbatim makes every spatial query fail confusingly. `phpunit.xml` also forces SQLite `:memory:`.
+
+## Layout and boundaries
+
+- `resources/js/lib/` — pure, framework-free, unit-tested decision logic: `routeEditing`, `guidedRouting`, `cruzeroRoute`, `lineDeletion`, `shortcuts`, `snapWire`/`snapTransport`, `undoStack`, `mapView`, `utils`.
+- `resources/js/composables/` — Vue-aware shared state: `useRouteGeometry` (shared by create + edit), `useSnapPreset`, `useResampleSpacing`, `usePropagation`, `useAppearance`.
+- `app/Geo/` — pure PHP: `GreatCircle` owns every distance, `Router` is the A*. `app/Concerns/` holds traits, not services. Domain logic lives in models, commands and `app/Geo/`; there is no service layer.
+- If logic is worth testing, it belongs in `lib/`/`composables/` or `app/Geo/`, not in a `.vue` or a Command.
+- Pages are auto-discovered under `resources/js/pages`; `app.ts` dispatches the layout by page name. `@` maps to `resources/js/` in both `tsconfig.json` and `vitest.config.ts`.
+- `issue_reports` has a migration but no model or UI — it is intentionally incomplete.
+
+## Lines domain
+
+- One `lines` row is one DIRECTION (`OUTBOUND`/`RETURN`), not a route. The two rows of "Linea 1" share `code`; UNIQUE is `(code, sense)`. A factory line with a fixed code and random sense collides ~50% of the time — pin `->outbound()` / `->return()`.
+- `code` is either a number plus optional suffix (`"22 rojo"`) or a lowercase slug for a bus with no number (`"la-guardia-nueva-terminal"`). `App\Rules\LineCode` accepts both shapes and rejects `2O rojo`.
+- `code_number` is a sort key, not the number: `Line::sortNumber()` writes the numeric prefix, or `Line::SORT_LAST` (2147483647) for numberless codes. The sentinel, not NULL, keeps numberless rows last on both drivers and keeps `adjacent()`'s row comparison valid.
+- `parent_line_id` links opposite directions bidirectionally; circular lines (72, 73) legitimately have no counterpart.
+- `geo_json` (JSONB) is the source of truth: MultiLineString `[lng, lat]`. `geom` is derived, PostGIS-only, and written only by `Line::syncGeometry()`; it does not exist on SQLite.
+- `geometry_adjusted` is a dirty flag meaning a human corrected the geometry after import — not state. When set, transfer point indices are stale: re-run `transfers:compute`. `lines:refresh-geometry` clears it.
+- `average_rating` is cast `decimal:2`, so PDO returns a string while `resources/js/types/line.ts` declares `number | null`. The column is NULL everywhere today.
+
+## Map editor
+
+- Four modes: move / add / guide / delete (`RouteModePicker`, `LineMap.vue`, `pages/lines/{Create,Edit}.vue`).
+- Geometry is a single-member `MultiLineString` everywhere. Wrap incoming `LineString` payloads in the converter — never loosen `GeoJsonMultiLineString`; `GreatCircle::forGeometry()` assumes two levels of nesting.
+- Snap/relay/continue are `POST /roads/{snap,relay,continue}`; decisions are pure in `routeEditing` (`decideSnap`, `snapSample`, `propagateAlongStreet`). Presets are off/subtle/normal/aggressive = 30/50/100 m; `snapSearchRadius` doubles the threshold and `SnapRoadRequest` caps at 200 m. Resample presets are 100/150/200/300 m.
+- Undo is a `History<T>` in `lib/undoStack`. Both the map and the page listen for `Ctrl+Z`/Escape and stand down on `defaultPrevented`; `isTextEntryTarget()` is checked first so a text field keeps its own keys.
+- Shortcuts live in `lib/shortcuts.ts` (`resolveShortcut` is pure): `1`-`4` modes, `E` toggles the editor, `Enter` accepts a guided offer, `Delete`/`Backspace` removes the selection. Bindings are bare keys only; focus (including `BUTTON` and `role=listbox|option`) disables them; `Enter`/`Delete` only exist where their button is rendered. The help text is asserted against the table by tests — add a shortcut and its help together.
 
 ## Guided mode (`guide`)
 
-- **The editor has four modes now**: move / guide / add / delete. Guide places control points; the tramo between two adjacent controls is traced by `POST /roads/route` and shown dashed for the reviewer to accept, reject or draw by hand (spec §2: the system proposes, the user decides).
-- **Geometry stays a single-member MultiLineString; tramos are an editor-side concept.** `spliceTramo()` drops only the FIRST position of a router answer (the join vertex the route already has) and keeps the destination end — dropping both ends left routes shy of their destination; the test caught it live. A fresh route arrives as the whole tramo.
-- **Waypoints are owned by the parent page, not the map**: they are the persisted recipe (spec §5) and the undo stack's composite entry `{geometry, waypoints}` restores both halves together. Generic `History<T>` made the pair one entry instead of two desyncing stacks.
-- **Waypoint positions are the on-road (snapped) ones**, not the raw clicks — that is what keeps the move gesture's "recalculate adjacent tramos" coherent, and what lets a control never disagree with its own route.
-- The routing fetch has its own deadline (`ROUTE_LOOKUP_TIMEOUT_MS`, 8 s) and the map's revision guard drops stale answers; `status: none` from the endpoint arrives with a reason that maps to a human correction (move the point, add one in between, or draw by hand — §3's warning requirement).
-- **Waypoints persist in `line_waypoints`** (recipe as rows: ordinal + server-derived role + double lat/lng; admin-only metadata — the offline bundle's NDJSON never carries them). Save rule is the same asymmetry `geo_json` rides on: **the form only posts `waypoints` when the visit actually touched the guided mode (`waypointsTouched` in both pages)** — absent field means `syncWaypoints()` never runs, so a save above the guided mode cannot overwrite the stored recipe with the §4.1 bootstrap. `WaypointsPayload` validates the JSON string as a whole; `ordinal`/`role` are derived server-side from the array order and the client's are ignored. Guarded by `LineWaypointsTest`.
-- **Spec §4's editing semantics live in the guided mode's four gestures**: click far = extend from the active frontier (tail by default, "Extend at start" flips it); click near the route (≤ 25 m, not on a control) = **insert** — two chained router calls offered as one judgement, both or neither; drag a control = **move**, recalculated **chained** so both halves share the same snapped node; click a control = select → "Remove control" = the joined tramo dashed → Accept is the confirmation §4.5 demands.
-- **Tramo boundaries are re-derived, never stored**: `findVertexForWaypoint()` (25 m default tolerance) re-reads vertex indexes on demand, because every accepted splice changes span lengths and a stored index would lie after the first one. A waypoint beyond tolerance is *detached* → the amber §3 pill (`describeDetached`), not an auto-repair.
-- **`replaceTramoSpan()` re-reads the span's END vertices from the router answer** — the promise is "the control sits on its route", and the test asserts untouched spans stay the SAME objects (`.toBe`), which is the byte-identity §4's "el resto sin cambios" asks for.
-- **"Add anchors" is the re-lay gesture, and its bound is the REGION between the outermost anchors — never the whole span they sit in.** A click near the route splits a span (both halves re-laid) and a click far from it extends an end, so neither can say "keep the first three kilometres and re-lay the next one", which is the edit an imported line usually needs. Anchors are **ordered by where they project onto the route, not by click order** (`orderAnchorsByRoute`, with `order = vertexIndex + t` so two on one segment still order): the recipe's array order is what the server derives `ordinal`/`role` from, so click order would scramble the saved line. The boundaries are cut at the anchors' **projections**, which is what makes the old route meet the chain and leaves everything outside the region as the same objects.
-- **A pending anchor is draggable, and dropping it re-traces the batch in place.** The router snaps an anchor to the road it finds, so one aimed at a side street can come back on a different one — and with the proposal as Accept-or-Reject, correcting that cost the whole batch. The drop hands the new click back to `orderPendingClicks()`, the one function that places anchors, so an anchor dragged somewhere else is re-ordered and re-snapped by the same path as a new one; `bubblingMouseEvents: false` keeps the drag from also placing an anchor underneath it. The dashed offer is dismissed before the re-trace, because a proposal over anchors that no longer exist is worse than no proposal.
-- **Guided mode opens on Anchors, and on Trace only when there is nothing to rectify.** `defaultGuideGesture()` answers from the geometry rather than being a constant, because one control can delimit a stretch and zero controls cannot: a fresh line would answer its first click with "there is no route to rebuild yet" and read as broken. `GUIDE_GESTURES` lists Anchors first because the row's order is the answer's order, and the mode help leads with the same one.
-- **A failed leg names the anchors that bound it and paints them.** `describeFailedSpan(reason, leg)` returns the sentence AND the badge numbers from one derivation, because a marker calling a problem the message never mentioned is the same defect as a button promising a preview it does not offer. Red is the editor's existing "cannot" colour (delete mode, a route's end pin) and the dashed border goes solid, so the signal survives a colour-blind screen. Marks are a report of the LAST preview: `orderPendingClicks()` clears them on any change to the clicks, and a successful preview clears them too, because a mark left behind after the reviewer moved an anchor asserts a problem that may no longer exist. The correction is the anchors gesture's ("move one of these two"), not the trace gesture's ("add a control point"), and a lookup that never answered paints nothing — it says nothing about where the reviewer put anything.
-- **A rebuild refuses rather than half-applies.** A leg that comes back `status: none` ends the batch (accepting the legs that worked would leave the trouble stretch in place looking fixed), and a recipe control standing **inside** the region is named for the reviewer instead of dropped — it would lose its vertex. Anchors are **local to the map** until accepted, so Escape discards them and `waypointsTouched` stays honest. They need no snap call of their own: `anchorSnaps()` reads the router's own origin/destination snaps off the batch, and each leg starts where the previous ended so two answers cannot disagree about which carriageway of a divided road an anchor is on.
-- **The control markers are repainted by `renderMap()`, not only by the waypoint watcher.** The watcher does not fire on mount, so a line opened WITH a saved recipe had its controls cleared by `renderMap`'s `clearLayers()` and never painted again; and any edit that changed the geometry without changing the recipe — an undo, a re-space, a drag — wiped them for the rest of the visit. The map's render owns what is drawn on the map, and a control that disappears when you press Ctrl+Z is a control the reviewer cannot find to delete. Both other repaint points are the two watchers that never reach `renderMap`: the `props.mode` one and the `props.editable` one. Outside guide mode (and outside edit mode) `renderGuidedMarkers()` clears rather than paints — the controls are that mode's UI and are dots whose click handler refuses elsewhere.
-- **In guide mode there are no vertex markers.** A vertex there is inert (drag and selection are bound only in move and delete) and it sits on the exact pixel a control sits on, so an imported line with nine hundred vertices buries the recipe under nine hundred dots that do nothing. With them gone, the dots on the map ARE the controls. A selected control fills **green**: green is what "selected" means everywhere else in this editor, and the amber fill was a third meaning for the same thing.
-- **A control that has drifted off its route is still editable, and that took two separate operations.** `waypointBound()` gives a control its own vertex when it has one and the point it **projects** onto when it does not, so the drag's span can be delimited either way — the machinery is the same region-cut that "Add anchors" uses, which is why it lives in `lib/` and not in the component. Without it the drag refused, and the row's own tooltip was telling the reviewer to drag it.
-- **The drag's two branches are the same rule, and they used to be different ones.** "Behind" looked the bound up at the 25 m detached tolerance and failed for an off-route control; "ahead" looked it up at `Infinity`, so it never failed and replaced a stretch that was not the control's tramo at all. Both go through `waypointBound()` now, and the far bound is re-derived **on the cut geometry** — a projection writes a vertex, and a far bound read before that write points one vertex too far, replacing somebody else's span with nothing on screen saying so.
-- **A drag reconciles its own layer, always.** The live marker is moved directly (`setLatLng`), bypassing the reactive state, so a refusal left it wherever the reviewer let go with the recipe unchanged and nothing to repaint it: a dot on the map that looked like a control being added and was not one. `recalculateMovedWaypoint()` ends with `await nextTick(); renderGuidedMarkers()` in both branches, because a layer mutated outside the state has to be redrawn from the state or it lies.
-- **Removal and re-routing are two meanings, not one button.** The re-route needs both neighbours on the route to delimit a span; that is not a reason to refuse the edit. `startRemovePreview()` falls back to a plain removal — and says so — so a control whose neighbours have drifted is no longer a dead end. The label follows `removeReroutes`: "Remove control" promises the preview, "Remove only" states that there will not be one.
-- **A pending proposal does not freeze the batch; the batch re-traces it.** `handleGuidedClick` refuses a click during a pending offer for **trace** only — there the click *is* the next tramo, and letting it through would put a second proposal over the first. **Anchors** take the click, and `addPendingAnchor` re-runs `previewRectify()`, which **replaces** `guidedOffer` rather than stacking: two proposals are never on screen at once. A batch correctable only by rejecting and rebuilding from scratch is what made one mis-snapped anchor cost four placements.
-- **`dismissPendingPreview()` before the re-order, on every path that mutates the batch.** `previewRectify()` is async (a router call per leg) and `orderPendingClicks()` returns early when the route cannot order the clicks, so a live offer survives as a proposal drawn over anchors that no longer exist, and an `Accept` inside that window runs against the *previous* batch's `anchorClicks`. Five paths need it: `beginAnchorDrag`, `removePendingAnchor`, `undoPendingAnchors`, `redoPendingAnchors` and `addPendingAnchor`. **Nothing detects its absence** — mutation-checked, and 528 Vitest stayed green with the line deleted. It is a race with no failing test, not an untested rule.
-- **The pending batch has its own undo stack, and it is the same `History<T>`.** The anchors are map-local by design (Escape drops them, a guided mode opened and closed leaves the recipe untouched), which meant `Ctrl+Z` while a batch was half placed fell through to the page and unded the last edit the reviewer had **accepted** — the worst possible answer to "take that point back" — while the on-screen Undo button was *greyed out*, which is what made it look broken. The payload is the anchor **clicks**, not the anchors: those are derived (ordered by route, then snapped by the router), so stepping the clicks back re-derives everything after. `update:pending-undo` + `defineExpose` let the page's buttons ask the map, and the undo tooltip names the real destination — a button with two destinations behind it and a tooltip naming only one is the same defect as the mislabelled frontier button.
-- **Both undo handlers stand down on `defaultPrevented`.** Whichever registered first claims `Ctrl+Z`, so the map's claim on a pending batch does not depend on Vue mounting children before parents. The text-field rule moved to `isTextEntryTarget()` in undoStack for the same reason: two handlers answering the same key must agree on when it is not theirs, or a `Ctrl+Z` with the caret in the GeoJSON textarea takes back an anchor instead of undoing text.
-- **Escape is undoable; accepting and leaving the mode are not.** `discardPendingAnchors()` records the batch so "I discarded it, actually leave it" is one keystroke; `clearPendingAnchors()` drops it and its history together, because after an accept the page's composite entry is the edit to take back, and a batch from a previous visit to the mode must not answer a `Ctrl+Z` in this one.
-- **A badge is both draggable and clickable, and the click is handled in the drag's mouseup.** Dragging fixes "this snapped onto the wrong street", clicking takes "this one should not be here" out of the batch, and step undo handles neither without replaying everything placed before. The `!wasMoved` branch is the control markers' own idiom, and it is where the click has to live: a real drag of five pixels can still make the browser synthesise a `click`, and that would delete the very anchor being moved.
-- **`Remove control` is never hidden, and it only refuses what it cannot name.** `describeRemoveControlBlock(selected)` answers one refusal: nothing is selected. It used to answer two — the second claimed "a route's start and end are what the route *is*, not how it was traced", and **that was false**: nothing outside this editor reads a control's `role`, the offline bundle never carries waypoints, and `lines` has no `start`/`end` column, so a route's ends ARE the first and last vertex of its polyline. Dropping an end control changes no geometry, no endpoint and no bundle output — it only stops delimiting that stretch as a tramo, which is the reviewer's call. `removeWaypoint()` follows: any index in range goes, and `null` is reserved for an index naming no control. The correction the old refusal named (drag the control) still works, because the drag handler re-routes an endpoint's single adjacent span. This is the project's own "never hide an action" rule, from the Delete button in delete mode. The removal sits left of Reject/Accept, never beside Accept.
-- **An empty recipe posts as `'[]'`, which is NOT the same as an absent field.** Both pages' `waypointsField` return `null` only when `waypointsTouched` is false; an empty list serialises to `'[]'`, which `WaypointsPayload` accepts and `syncWaypoints([])` consumes by deleting every row. The distinction is the whole feature: absent means "this save used no control points" and leaves the stored recipe alone (a save above the guided mode must not invent one), while `'[]'` means "the reviewer removed them". Returning `null` for an empty list made **deleting the last control silently non-persistent** — the row survived and the control came back on reload. Both halves are guarded: `guidedRouting.test.ts` for the rule and `LineWaypointsTest::test_an_empty_list_clears_the_recipe` for the persistence, sitting next to `test_updating_without_the_field_leaves_the_recipe_alone` which pins the other side.
-- **The guided toolbar is one gesture, not two toggles.** `guideGesture: 'trace' | 'anchors'` replaced `anchoring` and `guidedManual` because both booleans could be true at once — the row then said "draw by hand" while the click handler was pinning anchors, and nothing contradicted it. One field cannot hold a state the row would have to contradict. Hand drawing was then cut from the row entirely: the `add` mode already places a vertex per click, so it was a second button doing a job the mode picker does, and the refusal messages now name the `add` mode instead.
-- **The toolbar row does not wrap, and that is why the map stops lurching.** The map has a fixed height (`h-[clamp(...)]`), so anything that changes the height of the block above it moves the map — a control appearing mid-gesture takes the map out from under the click being judged. `flex-nowrap` + `min-w-0` + `overflow-x-auto` makes a width change stay a width change, and `.no-scrollbar` hides the scrollbar because a visible one is ~15 px tall and reintroduces the shift on the first resize instead of every click. Showing and hiding only changes width, which is what makes `v-if` safe here at all.
-- **Every routed answer is simplified before it is spliced, and every path goes through the same helper.** A router answer has one vertex per graph node and a node is every junction in the imported network, so a straight avenue crossed by twenty side streets came back with twenty vertices carrying no shape; the graph's edges median 39 m (p25 14 m) against the editor's own 100/150/200/300 m re-spacing presets. `simplifyRoutedChain()` is Douglas-Peucker with the split chosen by priority — **pinned index > span > MAX > furthest from the chord > sharpest corner > collapse** — and a chain's two ends are never candidates, so a control cannot go detached. The corner rule is what makes a tolerance safe: two 30 m legs at a right angle deviate ~12 m from their chord, which even a 20 m budget calls free, and a bus route that cuts a corner is wrong whatever it saves.
-- **The span rule is separate from the tolerance, because DP cannot do its job.** A deviation budget measures distance from a chord and says nothing about how long the chord is, so a 400 m straight run deviates *zero* metres and any tolerance authorises collapsing it to two vertices 400 m apart — the shape survives perfectly and the line ends up with gaps nobody drew. `ROUTED_MAX_SPAN_METERS` is `Math.min(...RESAMPLE_SPACING_METERS)`, borrowed rather than invented — **`Math.min`, not `[0]`**: indexed, it followed the list's *order* rather than its lowest entry, so adding a preset below the old first one would have halved the span with no edit here and no failing test, since every assertion on it compares against the constant it would have moved. It is pinned to a literal 100 in `guidedRouting.test.ts` because every other check here is structurally unable to notice it moved. When that rule fires on a collinear range it splits at the **middle** interior vertex: splitting at the first marches along the run keeping all of them, which spends the whole rule to achieve nothing. With the span rule bounding spacing, `ROUTED_SIMPLIFY_TOLERANCE_METERS` (5) only has to govern shape — about 6° of heading change, invisible.
-- **The dropped count and the maximum deviation are always reported** in the preview label; simplification is the one edit in this mode that removes vertices, and a reviewer who cannot see how many cannot tell a clean line from a mangled one. The simplification happens per leg, before stitching: a leg's two ends are an anchor or a join — both control points that must stay vertices — and simplifying the stitched chain would have had to recover that structure from the projections again.
-- **A traced route reports the street it entered and the total, not every street it crossed.** The per-street list was written for a tramo of one or two streets; a rebuilt stretch crosses six and by the fourth the pill wrapped to four lines over the map carrying less than its first word. Unnamed streets drop out whenever anything is named — 71% of the network carries no name, so keeping them is mostly the words "unnamed street", repeated.
+- State machine: `lib/guidedRouting.ts`. The map owns placement and selection; the page owns waypoints.
+- Waypoints are the persisted recipe (`line_waypoints`), admin-only, max 200. The form posts `waypoints` only when the visit actually touched guide mode (`waypointsTouched`); an absent field means "leave the stored recipe alone", while `'[]'` means "clear it" — do not collapse an empty list to `null`.
+- `ordinal`/`role` are derived server-side from array order; client values are ignored. `WaypointsPayload::decode()` casts positions to float.
+- Controls snap to the route; a control with no vertex within 25 m is detached (amber pill), not auto-repaired. `spliceTramo()` drops only the router answer's first point.
+- Routing is simplified per leg by `simplifyRoutedChain()`: Douglas-Peucker with `ROUTED_SIMPLIFY_TOLERANCE_METERS = 5`, plus a span rule `ROUTED_MAX_SPAN_METERS` (= `Math.min(...RESAMPLE_SPACING_METERS)`, currently 100, pinned by a literal test). The preview always reports dropped vertex count and max deviation.
+- Call `dismissPendingPreview()` before any mutation of the pending anchor batch. The batch has its own undo history; `Ctrl+Z` while it is pending steps the clicks, not the page.
+- `renderMap()` repaints control markers (the watcher does not fire on mount). Guide mode draws no vertex markers; a selected control fills green. The toolbar must not wrap (`nowrap` + horizontal scroll) or the fixed-height map jumps mid-gesture.
+- "Remove control" is always shown; it refuses only when nothing is selected. Removing an end control changes no geometry.
 
-## Road graph & turn restrictions
+## Pasting a Cruzero route
 
-- **The `roads` table serves two consumers with different rules.** Snapping refuses `_link` roads at every scan (`NOT LIKE '%\_link'` in all three `RoadsController` queries) — a ramp is a mistake to snap onto. The routing graph needs them (carriageway changes). The exclusion lives in the lookups, not the import; removing one WHERE breaks the editor's snap UX, not the router.
-- **Turn restrictions arrive via `App\Osm\TurnRestriction`** (pure parser, unit-tested): relations with `except=bus/psv/motor_vehicle/motorcar` are **skipped** (buses keep the turn), `via=-`way restrictions are skipped and counted, and the via travels as a **coordinate** because `out geom` carries no node ids — the coordinate is the only join key that exists end to end.
-- **Node identity = exact coordinate** (1e-7 key). Two ways sharing a junction become one node; the graph is built by `roads:build-graph`, never edited by hand. `TRUNCATE ... CASCADE` on import wipes `road_edges` with it — the graph is **derived data, the repair is re-running the command** (~20 s), not editing rows.
-- **Restrictions whose from/to ways fall outside the import bbox bind to nothing** (reported by `build-graph`; ~14 of ~420 after a `--pad=0.05` run — widening the bbox pulls in new restrictions whose own ways can sit outside again, so the residual does not converge to zero). Expected for a bbox-follows-lines import; the router skips them and the report keeps the count visible.
+- Parsed in `lib/cruzeroRoute.ts`. The payload is a GeoJSON `LineString`; the converter wraps it as one part of a MultiLineString.
+- Direction comes from the `_i_`/`_v_` token inside `trip_id`, not from `CLOCKWISE`/`COUNTERCLOCKWISE` — a real pair is traced separately, not reversed.
+- Use the dedicated paste field, not the `geo_json` textarea: their payload has no top-level `.coordinates`, so pasted there the route vanishes with no error.
+- The converter refuses transposed lat/lng via the bounding box and refuses `intermediate[]` (stops) by name. Converting writes nothing, records an undo entry, and leaves the save-time consequences (stale transfers, stale recipe) to Save.
 
-## Router (`POST /roads/route`)
+## Deleting a line
 
-- **`App\Geo\Router` is the A\*, pure and SQLite-testable**: edge-based states `(node, arriving leg)` because turn restrictions speak in from-road/to-road/via terms; costs = `length × classMultiplier` (all 1.0 today, knob declared on the class) + turn penalties (free ≤15°, 20 m for a turn, **500 m for a U-turn**). The multiplier must stay ≥ 1.0 or the haversine heuristic stops being admissible.
-- **The U-turn penalty is 500 m and was chosen empirically, not a taste call**: at 120 m the router "proved" that bouncing 60 m south down a block and back beats a 600 m loop road — the cost model was lying about what a mid-block reversal is worth, and only the `restrictedJunction` fixture caught it. Raise it again only with a failing case behind you.
-- **The corridor query loads edges whose BOTH endpoints sit in the bbox** (padded by max(300 m, 25 %)); an edge crossing the boundary is dropped, so a path that legitimately leaves the box briefly can be cut. The pad is the mitigation; widening it costs latency on long tramos.
-- **Refusals are rich**: 200 with `status: none` + `reason` (`origin-too-far` / `destination-too-far` / `no-path` / `budget`) instead of snap's bare 204, because the editor has to tell the reviewer which fix applies. 404 only when `road_edges` is empty (graph not built).
-- **Origin snapping with a `bearing`** prefers the carriageway whose outgoing heading agrees with the approach: each degree of disagreement costs a metre of equivalent distance, so a carriageway 15 m further but correctly headed wins over a nearer opposite one.
+- `destroy()` deletes one DIRECTION; the counterpart survives with `parent_line_id` NULL. `counterpart()` resolves by code + sense, so that column is only a cache.
+- No manual child cleanup: FKs cascade `line_waypoints`, `favorites`, `reviews` and `line_transfers`, and null `issue_reports.line_id`.
+- The index filters ride the delete request's query string and are intersected in the controller (`request()->query->all()`, never `only()`); `_method` never leaks into the redirect.
+- Dialog copy lives in `lib/lineDeletion.ts` because it is mounted from both the index and the edit page. Deleting does not reach riders until `lines:export-offline --data-version=N --upload` is re-run.
 
-## Architecture
+## Road graph and router
 
-- **Frontend entry**: `resources/js/app.ts` — layout dispatch, theme init, flash toasts. Boots `initializeTheme()` + `initializeFlashToast()` on every page.
-- **Pages**: `resources/js/pages/` auto-discovered by Inertia. Auth under `auth/`, settings under `settings/`.
-- **Layouts**: chosen by page name in `app.ts` — `auth/*` → AuthLayout, `settings/*` → AppLayout + SettingsLayout, `Welcome` → none, else AppLayout.
-- **`@` alias** → `resources/js/`, declared in `vitest.config.ts` as well as tsconfig, because a test runner does not read tsconfig.
-- **`resources/js/lib/`**: pure, framework-free modules — `routeEditing` (geometry + snap decisions), `guidedRouting` (the guided mode's waypoints/tramos state machine), `snapWire`/`snapTransport` (the lat/lng boundary and the street lookups incl. route), `mapView`, `undoStack`, `flashToast`, `utils` (`cn()`).
-- **`resources/js/composables/`**: Vue-aware shared state — `useRouteGeometry` (shared by the create and edit pages), `useSnapPreset`, `usePropagation`, `useResampleSpacing`, `useAppearance`. Several have colocated `.test.ts` siblings and are testable because they touch no DOM.
-- If logic is worth testing, it belongs in one of those two rather than in a component. **A hundred lines of decision logic in a `.vue` is untested by construction**, not by accident: `insertionTarget()` was the decision behind the guided mode's primary gesture and had no test until it moved to `lib/` — the same rule applies to `removalJoin()`, whose two call sites (the button's label and the press itself) used to answer the same question twice.
-- **`app/Geo/`**: pure, framework-free PHP. `GreatCircle` owns the bundle's distance model; `Router` is the guided tramo's A\*.
-- **`app/Concerns/`**: traits, not services — `ProfileValidationRules`, `PasswordValidationRules`, `UploadsBundleToR2`.
-- **Testable geometry belongs in `app/Geo/`, not inside a Command.** A Command's data path is usually PostGIS and therefore unreachable from the SQLite suite; that is why the rounding policy in `walkMeters()` lives on the class.
-- **No service layer**: domain logic lives in Models, Commands, and `app/Geo/`.
-- **DB**: PostgreSQL + PostGIS (dev/prod), SQLite `:memory:` (tests). Two GIST indexes on `lines`: `geom` and `geography(geom)`.
-- **SSR**: enabled, dev server at `127.0.0.1:13714` (`config/inertia.php`).
-- **Auth**: Laravel Fortify — registration, password reset, email verification, 2FA, passkeys.
-- **Gated pages**: `dashboard` requires `auth` + `verified`.
-- **Incomplete**: the `issue_reports` migration exists with no Model or UI.
+- `roads` serves two consumers: snapping refuses `_link` roads (`NOT LIKE '%\_link'` in every `RoadsController` query); the routing graph imports and uses them. Keep those clauses.
+- `roads:build-graph` derives `road_nodes`/`road_edges` from `roads`; node identity is an exact coordinate (1e-7 key). Imports truncate with CASCADE, so rebuild the graph after every import; never hand-edit it.
+- Turn restrictions are parsed by `App\Osm\TurnRestriction`: relations with `except=bus/psv/motor_vehicle/motorcar` are skipped (buses may turn), `via`-way restrictions are skipped and counted, and `via` travels as a coordinate.
+- `App\Geo\Router` is edge-state A*: cost = length x class multiplier + turn penalties (free <=15 degrees, 20 m for a turn, 500 m for a U-turn). Keep the multiplier >= 1.0 or the heuristic stops being admissible. The 500 m U-turn was chosen against a failing fixture — do not lower it without a new failing case.
+- The corridor loads only edges whose BOTH endpoints sit in the bbox (padded by max(300 m, 25%)). Refusals are HTTP 200 `status: none` with `origin-too-far`/`destination-too-far`/`no-path`/`budget`; 404 only when `road_edges` is empty.
+- Origin snapping accepts a `bearing` and prefers the correctly-headed carriageway (1 m penalty per degree of disagreement).
 
-## Testing quirks
+## Offline bundle (`lines:export-offline`)
 
-- **PHPUnit classes, not Pest.** `RefreshDatabase`; `skipUnlessFortifyHas()` for conditional Fortify tests.
-- **Vitest** for `resources/js/**/*.test.ts`, configured in its own `vitest.config.ts` — a `test` block in `vite.config.ts` would start `php artisan pail`. `environment: 'node'`, so there is no jsdom and **component tests are not possible**; anything worth asserting has to live in `lib/` or `composables/`.
-- **PostGIS is untestable on SQLite**: the `roads` table and the snap lookup are PostgreSQL-only, and `ST_DWithin`/`ST_Distance` will fail. `transfers:compute` cannot be tested by the suite at all — it is verified by hand against a real instance (it is deterministic: two runs hash identically). **Except `/roads/route`**: its graph tables are plain columns, so the endpoint runs whole on SQLite — `RouteRoadTest` seeds `road_nodes`/`road_edges` and asserts the search for real; the spatial side (corridor query against real geometry) is `roads:self-test`'s job, including a fixture graph island 1.6 km south of the anchor that proves a restricted turn is never taken.
-- **Pin the vectors you assert against.** The line-230 coordinate array in the bundle tests is a hardcoded copy on purpose. Deriving it from the database would make the test unable to detect the drift it exists to catch.
-- **Assert against a clock you control** when the code stamps two artifacts at different points; two `now()` calls in a sub-second test land in the same second and the test cannot fail. Freeze with `Carbon::setTestNow()` and advance it from an `eloquent.retrieved` listener.
-- **Mutation-check new tests.** Reintroduce the bug and confirm they go red — twice this session, a test passed with the bug present and another shipped a wrong type that only the failing branch reached.
+- Three files: `data.ndjson.gz` (intermediate / contract with the Dart CLI, not uploaded), `data.db.gz` (built only by the Flutter app's `tools/build_offline_db.dart`), and `meta.json` (published manifest). Version chain: `--data-version` -> NDJSON meta -> SQLite `offline_metadata` -> `meta.json`.
+- Needs Dart 3.11+ from a Flutter checkout with `dart pub get` (`OFFLINE_FLUTTER_REPO`). Dart 3.12 needs `--enable-experiment=native-assets` (passed by default via `OFFLINE_DART_RUN_FLAGS`). On Windows set `OFFLINE_DART_BINARY` to the real `dart.bat`; PHP's executable lookup skips `.bat` wrappers.
+- Record order must be total (lines by id, transfers by all four keys). Floats must stay floats (`JSON_PRESERVE_ZERO_FRACTION`, `serialize_precision` -1 or >=17), and PDO numeric strings need `(float)` casts — encode via `LinesExportOffline::writeRecord()`, not `json_encode`.
+- `meta.json` sizes/hashes are of the gzipped `data.db.gz`; do not publish the Dart CLI's manifest directly (`gz_bytes`, string version).
+- `--upload` deletes both R2 objects before uploading either, then uploads the bundle before the manifest. That order is deliberate; a failed upload leaves clients on their cached bundle.
+
+## Artisan commands
+
+| Command | Notes |
+|---|---|
+| `lines:export-offline` | `--data-version=N` (required), `--path=`, `--flutter-repo=`, `--dart=`, `--skip-dart-cli`, `--upload`. See bundle section. |
+| `transfers:compute` | PostGIS `ST_DWithin` 300 m + KNN, deduped on a 100 m grid. **Truncates `line_transfers` unconditionally, even with `--limit`** — `--limit=20` still wipes all rows. Long-running. |
+| `lines:import` | Imports `database/data/rutas_scz.geojson`; `sentido=1` -> OUTBOUND, else RETURN with reversed coordinates; links pairs by code. `--force` requires `--discard-everything` and destroys user data/manual corrections. |
+| `lines:refresh-geometry` | `{code}` restores that line's geometry from the source GeoJSON, discarding manual corrections and clearing `geometry_adjusted`. Import never overwrites geometry on its own. |
+| `lines:backfill-sort-keys` | Recomputes `code_number`; supports `--dry-run`. |
+| `roads:import-overpass` | Drivable ways including `*_link`, plus turn restrictions. `--bbox=`, `--pad=0.02`, `--tile=0.1`, `--truncate`, `--dry-run`. Upserts by `osm_id`; rebuild the graph afterwards. |
+| `roads:build-graph` | Truncate-and-rebuild `road_nodes`/`road_edges`, ~20 s. |
+| `roads:self-test` | Exercises PostGIS snap/relay/continue paths against a real instance and rolls back; needs `--force` outside development. |
+
+## Distance model
+
+`App\Geo\GreatCircle` is the single source: `EARTH_RADIUS_M = 6371000.0` (mean radius, deliberately not WGS84's 6378137), `METRES_PER_DEGREE_LATITUDE`, and `metresPerDegreeLongitude()` (cosine, floored at 1%). Transit consumers assume the mean radius; changing it silently reorders transfers. `TransfersCompute`'s grid cell is deliberately a different, equator-derived quantity.
+
+## Testing
+
+- PHPUnit classes, not Pest. `RefreshDatabase`; `skipUnlessFortifyHas()` for conditional Fortify features.
+- Vitest has its own config (`vitest.config.ts`, `environment: 'node'`) because `vite.config.ts` would spawn `php artisan pail`. No jsdom means component tests are impossible — anything worth asserting must be importable from `lib/`/`composables`.
+- PostGIS paths (`roads` snap lookups, `transfers:compute`) cannot run on SQLite. Exception: `/roads/route` uses plain-column graph tables and is tested end to end by `RouteRoadTest`; the spatial corridor is covered by `roads:self-test`.
+- Pin the vectors you assert against (hardcoded coordinate arrays beat recomputing from the database).
+- When code stamps two artifacts, freeze the clock with `Carbon::setTestNow()`; two `now()` calls in a fast test land in the same second and the test cannot fail.
+- Mutation-check new tests: reintroduce the bug and confirm they go red.
 
 ## Conventions
 
-- **Pint after every PHP change**: `vendor/bin/pint --dirty --format agent` (not `--test`).
-- **Prettier**: 4-space indent, single quotes, semicolons; YAML 2-space. Ignores `resources/js/components/ui/*`, `resources/views/mail/*`.
-- **ESLint**: `1tbs` braces, padding around control statements, sorted imports (builtin → external → internal → parent → sibling → index). Ignores codegen output.
-- **shadcn-vue**: `cn()` from `@/lib/utils` (clsx + tailwind-merge), lucide icons.
-- **Wayfinder**: controllers from `@/actions/`, named routes from `@/routes/`. Generated dirs are gitignored — regenerate, never edit.
-- **`--with-form` is not optional, and running the command without it looks like success.** Seventeen components call `SomeController.method.form()`, which is the `{ action, method }` shape Inertia's `<Form v-bind="…">` takes. Wayfinder emits those helpers only under the `--with-form` flag (`method.blade.ts:77,116`), and without it the generated files come out perfectly well-formed with the helpers simply absent — so the command reports success, and the failure lands later as `vue-tsc` saying `Property 'form' does not exist` in seventeen unrelated-looking files. Measured both directions: without the flag, zero `.form` assignments and 17 type errors; with it, 103 assignments and zero errors. `composer codegen` wraps the flag so the working invocation is the short one.
-- **Cookies excluded from encryption**: `appearance`, `sidebar_state` (`bootstrap/app.php`).
-- **Passkeys**: `PASSKEYS_USER_HANDLE_SECRET`, falling back to `APP_KEY`.
-- **Migrations**: `$table->timestamps()`; `$table->softDeletes()`; `string()` defaults to 255; `foreignId('foo_id')->constrained()` resolves by convention. `numeric` columns come back from PDO as strings — cast at the boundary.
+- Pint after every PHP change: `vendor/bin/pint --dirty --format agent`.
+- Prettier: 4 spaces, single quotes, semicolons, print width 80; YAML 2 spaces. Ignores shadcn `ui/*` and mail views.
+- ESLint: `curly: all`, `1tbs`, blank lines around control statements, sorted imports, top-level type imports.
+- shadcn-vue components with `cn()` from `@/lib/utils` and lucide icons.
+- Wayfinder: import controllers from `@/actions`, routes from `@/routes`; generated dirs are gitignored. `composer codegen` must keep `--with-form` — without it generation succeeds but 18 components fail `vue-tsc` on `Property 'form' does not exist`.
+- Cookies excluded from encryption: `appearance`, `sidebar_state`. Passkeys use `PASSKEYS_USER_HANDLE_SECRET`, falling back to `APP_KEY`.
+- Migrations: `timestamps()`, `softDeletes()` where needed, `string()` defaults to 255, `foreignId()->constrained()` by convention. `numeric` columns arrive from PDO as strings — cast at the boundary.
 
 ## MCP
 
-`opencode.json` runs the **laravel-boost** MCP server (`php artisan boost:mcp`). Use it for DB schema, application and browser error logs, and version-specific docs. `boost.json` scopes it to opencode.
+`opencode.json` runs the laravel-boost MCP server (`php artisan boost:mcp`); use it for DB schema, application/browser logs, and version-specific docs. `boost.json` scopes it to opencode.

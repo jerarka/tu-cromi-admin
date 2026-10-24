@@ -3802,12 +3802,61 @@ describe('describeModeHelp', () => {
         expect(describeModeHelp('add')).toContain('10 m');
     });
 
-    test('points delete at the button rather than at a position', () => {
+    test('points delete at the key, which now exists', () => {
+        // The name of this one used to say "the button" while the assertion
+        // looked for 'press Delete' — a key. That was the shape of the bug this
+        // editor had: the help promised a shortcut that no listener answered,
+        // and the test that should have noticed was named after something else.
+        // The shortcut exists now, and the sentence is load-bearing rather than
+        // decorative, which is why it is asserted and not assumed.
         expect(describeModeHelp('delete')).toContain('press Delete');
     });
 
     test('keeps Alt in move, where a drop is what skips the snap', () => {
         expect(describeModeHelp('move')).toContain('Alt');
+    });
+
+    test('ends every mode with the keys that are live in it', () => {
+        // Pinned as whole strings because the sentence is assembled from the
+        // shortcut table, and a drift between the two would read as a help text
+        // promising something the editor does not do — which is the exact
+        // failure this editor shipped once already.
+        expect(
+            describeModeHelp('move').endsWith(
+                'Keys: 1-4 switch mode · E open or close the editor.',
+            ),
+        ).toBe(true);
+
+        expect(
+            describeModeHelp('guide').endsWith(
+                'Keys: 1-4 switch mode · E open or close the editor · Enter accept the offered tramo.',
+            ),
+        ).toBe(true);
+
+        expect(
+            describeModeHelp('delete').endsWith(
+                'Keys: 1-4 switch mode · E open or close the editor · Delete delete the selected vertices.',
+            ),
+        ).toBe(true);
+
+        expect(
+            describeModeHelp('add').endsWith(
+                'Keys: 1-4 switch mode · E open or close the editor.',
+            ),
+        ).toBe(true);
+    });
+
+    test('no mode offers a key that belongs to another one', () => {
+        // Accept exists in guide mode because that is the only mode with an
+        // Accept button; Delete exists in delete mode because that is the only
+        // mode with a Delete button. A shortcut printed in a mode whose button
+        // is not on screen is an action the reviewer cannot account for.
+        for (const mode of ['move', 'add'] as const) {
+            expect(describeModeHelp(mode)).not.toContain('accept the offered');
+            expect(describeModeHelp(mode)).not.toContain('Delete the selected');
+        }
+
+        expect(describeModeHelp('guide')).not.toContain('Delete the selected');
     });
 });
 

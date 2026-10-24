@@ -12,6 +12,9 @@
  * exactly one place, toLatLngs(), which is the single conversion boundary.
  */
 
+import { describeShortcuts } from '@/lib/shortcuts';
+import type { EditorMode } from '@/lib/shortcuts';
+
 export type Position = [number, number];
 
 export type Coordinates = number[][][];
@@ -2752,15 +2755,23 @@ export function describePropagationTooltip(threshold: number): string {
  * who has used the editor twice already knows it. Someone who does not is the
  * audience a help button exists for.
  *
- * The mode is spelled as a literal union rather than imported from the composable
- * that defines `EditMode`, because that type is a Vue-adjacent concern and this
- * module has no business importing it. The two are structurally identical, so a
- * new mode fails to compile at the call site rather than quietly falling through
- * to the default branch below.
+ * The mode is `EditorMode`, imported rather than spelled out a third time: the
+ * union lives in `lib/shortcuts` next to the table that binds keys to modes, so
+ * the help, the resolver and the mode picker are all reading one definition.
+ * Adding a mode is one edit there and one entry in each of the two branches
+ * below — and a new mode that reaches the default branch instead of a branch of
+ * its own still compiles, which is why every branch here names its mode.
  */
-export function describeModeHelp(
-    mode: 'move' | 'add' | 'delete' | 'guide',
-): string {
+export function describeModeHelp(mode: EditorMode): string {
+    // Every branch ends in the same line, built from the shortcut table rather
+    // than written by hand. It is here because a shortcut nobody can find is
+    // not a shortcut — this help is the one place a reviewer looks for what the
+    // editor answers to, and it already cost this editor once by promising a
+    // Delete key that did not exist. `shortcuts.test.ts` asserts that every
+    // binding in that table is findable here, so the sentence cannot fall
+    // behind the resolver.
+    const keys = ` ${describeShortcuts(mode)}`;
+
     if (mode === 'guide') {
         return (
             'Anchors re-lays part of a route that already exists: pin two or ' +
@@ -2774,7 +2785,8 @@ export function describeModeHelp(
             'map are your control points: drag one to move it, click one to ' +
             'select it, then Remove control takes it away. Where the router ' +
             'cannot find a way, place the vertex in Add mode. Escape cancels a ' +
-            'pending proposal and discards anchors.'
+            'pending proposal and discards anchors.' +
+            keys
         );
     }
 
@@ -2782,7 +2794,8 @@ export function describeModeHelp(
         return (
             'Click on the route to add a vertex. A click within about 10 m of one ' +
             'already there is ignored, so a second click on the same spot does ' +
-            'nothing.'
+            'nothing.' +
+            keys
         );
     }
 
@@ -2790,7 +2803,8 @@ export function describeModeHelp(
         return (
             'Click a vertex to delete just that one. To delete several, Shift-click ' +
             'two vertices to take everything between them, or Shift-drag on the map ' +
-            'to box a set out, then press Delete.'
+            'to box a set out, then press Delete.' +
+            keys
         );
     }
 
@@ -2798,7 +2812,8 @@ export function describeModeHelp(
         'Drag a vertex to move it. Click a vertex, then Shift-click another to ' +
         'grab everything between them, or Shift-drag on the map to box a set ' +
         'out, then drag any of them to move the whole stretch together. A drop ' +
-        'snaps onto the nearest street — hold Alt to place it off the centreline.'
+        'snaps onto the nearest street — hold Alt to place it off the centreline.' +
+        keys
     );
 }
 

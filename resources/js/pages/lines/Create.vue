@@ -11,6 +11,13 @@ import RouteStats from '@/components/lines/RouteStats.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 import { useRouteGeometry } from '@/composables/useRouteGeometry';
 import type { Waypoint } from '@/lib/guidedRouting';
 import type { Coordinates } from '@/lib/routeEditing';
@@ -28,6 +35,39 @@ const {
     toggleEditing,
     confirmDiscard,
 } = useRouteGeometry();
+
+/**
+ * The direction chosen, or null when nothing has been chosen yet.
+ *
+ * Null rather than `''` because that is what this control now means by
+ * "nothing chosen": shadcn's Select refuses an item whose value is an empty
+ * string (reka-ui throws on it), so the empty option this form used to carry
+ * became the trigger's PLACEHOLDER. The value that actually reaches the server
+ * is unchanged — reka-ui renders a `<option value="">` into the hidden native
+ * select it keeps for form submission whenever the model is null — so an
+ * untouched form still posts `sense=''` and still fails `required` the same way.
+ */
+const sense = ref<string | null>(null);
+
+/**
+ * The two directions, and the only place their wording lives.
+ *
+ * The trigger's label is read from here rather than left to SelectValue, for
+ * the reason documented on the control: reka-ui keeps an option's text in a
+ * registry its own item components clear when the dropdown's portal unmounts,
+ * so a trigger taking its label from there reads blank after every pick.
+ */
+const SENSE_OPTIONS = [
+    { value: 'OUTBOUND', label: 'OUTBOUND (Ida)' },
+    { value: 'RETURN', label: 'RETURN (Vuelta)' },
+] as const;
+
+function senseLabelFor(value: string | null): string {
+    return (
+        SENSE_OPTIONS.find((option) => option.value === value)?.label ??
+        'Select direction...'
+    );
+}
 
 /**
  * The control points the guided mode accepted, owned here for the same
@@ -139,18 +179,42 @@ function onGuidedUpdate(payload: {
                     </p>
                 </div>
 
+                <!--
+                    `name` is what puts this control into the form at all.
+
+                    shadcn's Select is a button, not a field, so without a name
+                    reka-ui would not render the hidden native `<select>` it
+                    keeps for exactly this purpose and the form would post no
+                    `sense` at all. With it, the selection rides along on a
+                    visually hidden control the browser submits like any other.
+
+                    `w-full` because the trigger sizes to its content otherwise,
+                    and this field shares a two-column grid row with Code — a
+                    select narrower than the input beside it reads as two
+                    different controls.
+                -->
                 <div class="grid gap-1">
                     <Label for="sense">Direction</Label>
-                    <select
-                        id="sense"
+                    <Select
+                        v-model="sense"
                         name="sense"
-                        class="h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
-                        @change="markDirty"
+                        @update:model-value="markDirty"
                     >
-                        <option value="">Select direction...</option>
-                        <option value="OUTBOUND">OUTBOUND (Ida)</option>
-                        <option value="RETURN">RETURN (Vuelta)</option>
-                    </select>
+                        <SelectTrigger id="sense" class="w-full">
+                            <SelectValue>{{
+                                senseLabelFor(sense)
+                            }}</SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                            <SelectItem
+                                v-for="option in SENSE_OPTIONS"
+                                :key="option.value"
+                                :value="option.value"
+                            >
+                                {{ option.label }}
+                            </SelectItem>
+                        </SelectContent>
+                    </Select>
                     <InputError :message="errors.sense" />
                 </div>
 

@@ -6,6 +6,13 @@ import DeleteLineDialog from '@/components/lines/DeleteLineDialog.vue';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 // Aliased because this page already has a `lines` prop from defineProps,
 // and vue/no-dupe-keys rejects the collision.
 import lineRoutes from '@/routes/lines';
@@ -31,14 +38,54 @@ const props = defineProps<{
 }>();
 
 const search = ref(props.filters.search ?? '');
-const sense = ref(props.filters.sense ?? '');
+
+/**
+ * "Both directions" as something the control can actually be set to.
+ *
+ * It was `''` and now it cannot be: shadcn's Select renders one item per choice
+ * and reka-ui throws on an item whose value is an empty string, reserving that
+ * value for "no selection" so it can show the placeholder. This filter has a
+ * real third state — not a placeholder, a choice the reviewer picks — so it
+ * needs a value of its own, and the query builder below translates it back into
+ * the absence the server expects.
+ *
+ * `'all'` rather than the empty string or a made-up enum, so reading the ref in
+ * a future edit says what it means.
+ */
+const SENSE_ALL = 'all';
+
+/**
+ * The filter's choices, and the only place their wording lives.
+ *
+ * One list rather than markup plus a lookup, because the trigger's label and
+ * the options below it have to be the same words. See `SENSE_ALL` for why the
+ * label cannot simply be left to SelectValue to find.
+ */
+const SENSE_OPTIONS = [
+    { value: SENSE_ALL, label: 'All' },
+    { value: 'OUTBOUND', label: 'OUTBOUND (Ida)' },
+    { value: 'RETURN', label: 'RETURN (Vuelta)' },
+] as const;
+
+function senseLabelFor(value: string): string {
+    return (
+        SENSE_OPTIONS.find((option) => option.value === value)?.label ?? 'All'
+    );
+}
+
+const sense = ref<string>(props.filters.sense || SENSE_ALL);
 
 function applyFilters(): void {
     router.get(
         lineRoutes.index.url(),
         {
             search: search.value || undefined,
-            sense: sense.value || undefined,
+            // Absent, not blank. `?sense=` is not the same as no sense filter,
+            // and a redirect built from it would carry a filter nobody set.
+            sense:
+                sense.value === SENSE_ALL
+                    ? undefined
+                    : sense.value || undefined,
         },
         {
             preserveState: true,
@@ -120,23 +167,27 @@ const senseLabel = (sense: string): string => {
 
         <div class="grid gap-2">
             <Label for="sense">Direction</Label>
-            <select
-                id="sense"
-                v-model="sense"
-                class="h-9 w-40 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs"
-                @change="applyFilters"
-            >
-                <option value="">All</option>
-                <option value="OUTBOUND">OUTBOUND (Ida)</option>
-                <option value="RETURN">RETURN (Vuelta)</option>
-            </select>
+            <Select v-model="sense" @update:model-value="applyFilters">
+                <SelectTrigger id="sense" class="w-40">
+                    <SelectValue>{{ senseLabelFor(sense) }}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                    <SelectItem
+                        v-for="option in SENSE_OPTIONS"
+                        :key="option.value"
+                        :value="option.value"
+                    >
+                        {{ option.label }}
+                    </SelectItem>
+                </SelectContent>
+            </Select>
         </div>
 
         <Button
             variant="secondary"
             @click="
                 search = '';
-                sense = '';
+                sense = SENSE_ALL;
                 applyFilters();
             "
         >

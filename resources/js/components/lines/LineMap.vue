@@ -18,6 +18,13 @@ import {
     CollapsibleContent,
     CollapsibleTrigger,
 } from '@/components/ui/collapsible';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
 import {
     Tooltip,
@@ -277,13 +284,32 @@ const emit = defineEmits<{
 }>();
 
 /**
- * The two methods the page's undo and redo buttons need.
+ * What the page's undo and redo buttons need, and what its keyboard shortcuts
+ * need.
  *
- * Exposed rather than emitted because a button has to ASK â€” it cannot take the
+ * Exposed rather than emitted because a button has to ASK — it cannot take the
  * batch back by wishing, and a boolean told it whether to press would be a
  * second source of truth about what undo will do.
+ *
+ * The four shortcut members are the same argument about the same two actions.
+ * Whether a guided offer is on screen, and whether anything is selected, are
+ * facts about this map and about nothing else: pushing them up as events would
+ * make the page hold a copy that could be one keystroke stale at the moment it
+ * decided whether Enter was safe, and a shortcut that fires on stale state is
+ * exactly the failure the shortcuts are meant to remove. Asked at the moment
+ * they are needed, they cannot be stale.
+ *
+ * Both questions answer their own button's `:disabled`, so the key and the
+ * control cannot disagree about whether an action is available.
  */
-defineExpose({ undoPendingAnchors, redoPendingAnchors });
+defineExpose({
+    undoPendingAnchors,
+    redoPendingAnchors,
+    hasSelection: () => selection.value.length > 0,
+    hasGuidedOffer: () => guidedOffer.value !== null,
+    acceptGuidedOffer: acceptPreview,
+    deleteSelection,
+});
 
 /**
  * Whether a snap may also pull the vertices around the dropped one onto the same
@@ -3695,13 +3721,25 @@ function clearLayers(): void {
  *
  * Ctrl/Cmd+Z is claimed here for the same reason it is claimed by the page for
  * the line: while a batch is half placed, undo means taking the batch back.
- * Letting it through would undo the last edit the reviewer ACCEPTED â€” the worst
+ * Letting it through would undo the last edit the reviewer ACCEPTED — the worst
  * possible answer to "take that point back". `stopImmediatePropagation` because
  * the page's own handler is on the same node, and it stands down anyway on the
  * `defaultPrevented` it leaves behind: whichever of the two runs first wins, so
  * this does not depend on which registered its listener first.
+ *
+ * The text-entry guard comes BEFORE the Escape branch, and that ordering is the
+ * fix rather than an accident. It used to sit below, under the Ctrl+Z half,
+ * which meant Escape in the GeoJSON textarea dropped the selection, cancelled a
+ * proposal and threw away a batch of anchors — three destructive answers to a
+ * keystroke whose job inside a text field is to move the caret out of it. The
+ * guard is a question about focus and nothing about which key was pressed, so
+ * it answers every branch; there is no reason for one branch to skip it.
  */
 function handleKeydown(e: KeyboardEvent): void {
+    if (isTextEntryTarget(e.target)) {
+        return;
+    }
+
     if (e.key === 'Escape') {
         clearSelection();
         selectedWaypoint.value = null;
@@ -3720,10 +3758,6 @@ function handleKeydown(e: KeyboardEvent): void {
     }
 
     if (props.mode !== 'guide' || (!e.metaKey && !e.ctrlKey)) {
-        return;
-    }
-
-    if (isTextEntryTarget(e.target)) {
         return;
     }
 
@@ -3979,7 +4013,25 @@ onUnmounted(() => {
                 -->
                 <div class="flex-1" />
 
-                <div class="flex flex-wrap items-center gap-2">
+                <!--
+                    `min-h-9`, and it is the same reservation the settings box
+                    makes in the mode picker for the same reason. This row's
+                    height is a function of which mode's actions are rendered,
+                    and add mode renders none — so the row collapsed to nothing
+                    and the map below it jumped a whole control's height every
+                    time the reviewer pressed 2 or 3. Nothing here says add mode
+                    has nothing to act on; it says add mode does not use this
+                    row, and the height is the difference between those two
+                    things being indistinguishable on screen.
+
+                    `min-h-9` because the tallest thing any mode puts here is the
+                    re-space interval Select's trigger, which is `h-9`. The other
+                    modes are one step shorter and now sit at this floor rather
+                    than at their own height, so all four agree — which is the
+                    only version of "the height does not depend on the mode" that
+                    does not have to be maintained by hand.
+                -->
+                <div class="flex min-h-9 flex-wrap items-center gap-2">
                     <template v-if="mode === 'move'">
                         <!--
                             The trigger is a span around the button rather than
@@ -4041,28 +4093,47 @@ onUnmounted(() => {
                                     </TooltipContent>
                                 </Tooltip>
                             </TooltipProvider>
-                            <select
-                                :value="resampleInterval"
-                                aria-label="Re-space interval"
-                                class="h-9 rounded-md border border-input bg-transparent px-2 py-1 text-sm shadow-xs"
-                                @change="
+                            <!--
+                                The label is handed to SelectValue rather than
+                                left to the component, and the reason is the same
+                                one the edit page's snap control has: reka-ui
+                                reads an option's text from a registry its own
+                                `SelectItemText` fills on mount and clears on
+                                unmount, and those items live inside the
+                                dropdown's portal — which unmounts when the
+                                dropdown closes. A trigger that took its label
+                                from there would read blank on load and blank
+                                again after every pick, which for a control whose
+                                whole job is naming an interval is the one
+                                failure this toolbar cannot have.
+                            -->
+                            <Select
+                                :model-value="resampleInterval"
+                                @update:model-value="
                                     emit(
                                         'update:resampleSpacing',
-                                        Number(
-                                            ($event.target as HTMLSelectElement)
-                                                .value,
-                                        ) as ResampleSpacing,
+                                        $event as ResampleSpacing,
                                     )
                                 "
                             >
-                                <option
-                                    v-for="spacing in RESAMPLE_SPACING_METERS"
-                                    :key="spacing"
-                                    :value="spacing"
+                                <SelectTrigger
+                                    aria-label="Re-space interval"
+                                    class="px-2"
                                 >
-                                    {{ spacing }} m
-                                </option>
-                            </select>
+                                    <SelectValue
+                                        >{{ resampleInterval }} m</SelectValue
+                                    >
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem
+                                        v-for="spacing in RESAMPLE_SPACING_METERS"
+                                        :key="spacing"
+                                        :value="spacing"
+                                    >
+                                        {{ spacing }} m
+                                    </SelectItem>
+                                </SelectContent>
+                            </Select>
                         </div>
                     </template>
 
@@ -4282,6 +4353,11 @@ onUnmounted(() => {
                                         ? 'Accept rebuild'
                                         : 'Accept tramo'
                                 }}
+                                <kbd
+                                    class="ml-1 rounded border px-1 font-mono text-xs opacity-60"
+                                >
+                                    Enter
+                                </kbd>
                             </Button>
                         </template>
                     </template>
@@ -4336,6 +4412,14 @@ onUnmounted(() => {
                                         stretch left with fewer than two points
                                         is dropped rather than kept as a stub.
                                     </p>
+                                    <!--
+                                        The key, on the button's own tooltip,
+                                        because this mode's help has said
+                                        "press Delete" for as long as there has
+                                        been help text — and until now nothing on
+                                        screen answered what it meant.
+                                    -->
+                                    <p class="mt-1">Delete or Backspace.</p>
                                 </TooltipContent>
                             </Tooltip>
                         </TooltipProvider>
